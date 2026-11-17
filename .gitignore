@@ -1,0 +1,20 @@
+# build output
+/build/
+/out/
+*.obj
+*.pdb
+*.ilk
+*.exp
+
+# fetched third-party binaries
+/third_party/pdfium/
+
+# generated test corpus (regenerate with tests/corpus/scripts/run_corpus.ps1)
+/tests/corpus/generated/
+/tests/corpus/local/
+
+# editor / tooling
+/.vs/
+/.vscode/
+*.user
+*.log
