@@ -67,9 +67,20 @@ typedef struct ctx {
     volatile const int* cancel;
     abt_status st;
     int ticks;
+    int approx; /* visible adjustment layers or layer effects present (not rendered) */
 } ctx;
 
 /* ------------------------------------------------------------------ parsing */
+
+/* Adjustment layers and layer effects that the compositor does not render. */
+static int is_unrendered_key(const uint8_t* k) {
+    static const char* keys[] = {"levl", "curv", "brit", "blnc", "hue2", "hue ", "selc", "mixr", "grdm", "thrs",
+                                 "nvrt", "post", "phfl", "vibA", "expA", "clrL", "blwh", "lrFX", "lfx2", "lmfx",
+                                 "GdFl", "PtFl"};
+    for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); ++i)
+        if (memcmp(k, keys[i], 4) == 0) return 1;
+    return 0;
+}
 
 static int key_is_big(const uint8_t* k) {
     static const char* big[] = {"LMsk", "Lr16", "Lr32", "Layr", "Mt16", "Mt32", "Mtrn", "Alph", "FMsk",
@@ -124,6 +135,7 @@ static void parse_extra(ctx* c, abt_rd* x, size_t extra_end, layer* L) {
             L->fill = data[0];
         else if (memcmp(key, "SoCo", 4) == 0) { L->soco_off = (size_t)(data - c->d); L->soco_len = (size_t)len; }
         else if (memcmp(key, "vmsk", 4) == 0 || memcmp(key, "vsms", 4) == 0) { L->vmsk_off = (size_t)(data - c->d); L->vmsk_len = (size_t)len; }
+        else if (!(L->flags & 2) && is_unrendered_key(key)) c->approx = 1;
         abt_rd_skip(x, len);
         /* tolerate even / 4-byte padding of the block length */
         for (int pad = 0; pad < 4 && abt_rd_left(x) >= 12; ++pad) {
@@ -981,6 +993,7 @@ abt_status abt_psd_composite_layers(const uint8_t* d, size_t n, const abt_probe*
                 if (alpha) px[i * (size_t)S + (size_t)nc] = (uint8_t)(clamp01(a) * 255.0f + 0.5f);
             }
             out->w = c.dw; out->h = c.dh; out->nch = nc; out->alpha = alpha; out->cs = c.cs; out->px = px;
+            out->approx = c.approx;
         }
     }
     fbuf_free(B);

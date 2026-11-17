@@ -185,14 +185,21 @@ void cmyk_xform_destroy(CmykXform* x) {
 extern "C" int cmyk_xform_fn(void* ctx, const uint8_t* cmyk, uint8_t* rgb, size_t n) {
     CmykXform* x = (CmykXform*)ctx;
     if (!x || n > 0x7FFFFFFF) return 0;
-    // BM_CMYKQUADS is 4 bytes per pixel; output BM_RGBTRIPLETS is B,G,R order in ICM terms.
-    // Translate in a single row of n pixels.
+    // ICM's BM_CMYKQUADS is a little-endian DWORD 0xCCMMYYKK, i.e. bytes K,Y,M,C in memory, and
+    // BM_RGBTRIPLETS is B,G,R in memory (both verified with pure ink patches: `abthumb cmyktest`).
     uint8_t* bgr = (uint8_t*)mem_alloc(n * 3);
-    if (!bgr) return 0;
-    BOOL ok = TranslateBitmapBits(x->xf, (PVOID)cmyk, BM_CMYKQUADS, (DWORD)n, 1, (DWORD)(n * 4), bgr, BM_RGBTRIPLETS,
+    uint8_t* kymc = (uint8_t*)mem_alloc(n * 4);
+    if (!bgr || !kymc) { mem_free(bgr); mem_free(kymc); return 0; }
+    for (size_t i = 0; i < n; ++i) {
+        kymc[i * 4 + 0] = cmyk[i * 4 + 3];
+        kymc[i * 4 + 1] = cmyk[i * 4 + 2];
+        kymc[i * 4 + 2] = cmyk[i * 4 + 1];
+        kymc[i * 4 + 3] = cmyk[i * 4 + 0];
+    }
+    BOOL ok = TranslateBitmapBits(x->xf, kymc, BM_CMYKQUADS, (DWORD)n, 1, (DWORD)(n * 4), bgr, BM_RGBTRIPLETS,
                                   (DWORD)(n * 3), nullptr, 0);
+    mem_free(kymc);
     if (ok) {
-        // BM_RGBTRIPLETS is stored as R,G,B bytes? ICM defines RGBTRIPLET as {B,G,R} in memory (like GDI).
         for (size_t i = 0; i < n; ++i) {
             rgb[i * 3 + 0] = bgr[i * 3 + 2];
             rgb[i * 3 + 1] = bgr[i * 3 + 1];

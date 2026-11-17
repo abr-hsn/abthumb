@@ -52,6 +52,6 @@ bool ghostscript_available();
 
 // PSD / PSB composite or layer fallback.
 HRESULT render_psd(const uint8_t* data, size_t size, const abt_probe& pr, const RenderRequest& rq, abt_image* out,
-                   char* reason, size_t reason_cap);
+                   char* reason, size_t reason_cap, bool* approx);
 
 }  // namespace abt

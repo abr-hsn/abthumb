@@ -17,6 +17,7 @@ typedef struct abt_pixbuf {
     /* CMYK is "standard" (0 = no ink). Lab: L 0..255 = 0..100, a/b 0..255 = -128..127.
        When alpha=1, colour values are premultiplied by alpha. */
     uint8_t* px; /* w*h*(nch+alpha) bytes, malloc'd */
+    int approx;  /* layer composite skipped visible adjustment layers / effects (colours may differ) */
 } abt_pixbuf;
 
 void abt_pixbuf_free(abt_pixbuf* pb);

@@ -733,7 +733,9 @@ static void test_robustness(void) {
         }
         /* byte flips in the structural region and in data */
         size_t region = n < 200000 ? n : 200000;
-        for (int it = 0; it < 150; ++it) {
+        const char* fz = getenv("ABT_PSD_FUZZ");
+        int iters = fz ? atoi(fz) : 150;
+        for (int it = 0; it < iters; ++it) {
             unsigned char* c = (unsigned char*)malloc(n);
             memcpy(c, d, n);
             int flips = 1 + (int)(rnd() % 8);

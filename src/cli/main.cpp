@@ -4,9 +4,13 @@
 #include "abt_wic.h"
 #include "abt_proto.h"
 #include "render.h"
+#include "abt_decode.h"
 #include <shobjidl.h>
 #include <thumbcache.h>
 #include <shlwapi.h>
+#include <exdisp.h>
+#include <shlguid.h>
+#include <shellapi.h>
 #include <stdio.h>
 
 static void usage() {
@@ -258,6 +262,73 @@ static int cmd_render(int argc, wchar_t** argv) {
     return fails ? 1 : 0;
 }
 
+// ---------------------------------------------------------------- explorer-view (experiment helper)
+// Opens an Explorer window on DIR, switches it to each icon size given, waits, then closes it.
+// Used to measure which thumbnail sizes Explorer requests per view (DLL log shows cx).
+static IFolderView2* find_view(const wchar_t* dir, IWebBrowser2** browser_out) {
+    IShellWindows* sw = nullptr;
+    if (FAILED(CoCreateInstance(CLSID_ShellWindows, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&sw)))) return nullptr;
+    long n = 0;
+    sw->get_Count(&n);
+    IFolderView2* found = nullptr;
+    for (long i = 0; i < n && !found; ++i) {
+        VARIANT v;
+        V_VT(&v) = VT_I4;
+        V_I4(&v) = i;
+        IDispatch* d = nullptr;
+        if (FAILED(sw->Item(v, &d)) || !d) continue;
+        IWebBrowser2* wb = nullptr;
+        IServiceProvider* sp = nullptr;
+        IShellBrowser* sb = nullptr;
+        IShellView* sv = nullptr;
+        IFolderView2* fv = nullptr;
+        if (SUCCEEDED(d->QueryInterface(IID_PPV_ARGS(&wb))) && SUCCEEDED(wb->QueryInterface(IID_PPV_ARGS(&sp))) &&
+            SUCCEEDED(sp->QueryService(SID_STopLevelBrowser, IID_PPV_ARGS(&sb))) &&
+            SUCCEEDED(sb->QueryActiveShellView(&sv)) && SUCCEEDED(sv->QueryInterface(IID_PPV_ARGS(&fv)))) {
+            IShellItem* folder = nullptr;
+            if (SUCCEEDED(fv->GetFolder(IID_PPV_ARGS(&folder)))) {
+                PWSTR p = nullptr;
+                if (SUCCEEDED(folder->GetDisplayName(SIGDN_FILESYSPATH, &p)) && !lstrcmpiW(p, dir)) {
+                    found = fv;
+                    fv = nullptr;
+                    *browser_out = wb;
+                    wb = nullptr;
+                }
+                CoTaskMemFree(p);
+                folder->Release();
+            }
+        }
+        if (fv) fv->Release();
+        if (sv) sv->Release();
+        if (sb) sb->Release();
+        if (sp) sp->Release();
+        if (wb) wb->Release();
+        d->Release();
+    }
+    sw->Release();
+    return found;
+}
+
+static int cmd_explorer_view(int argc, wchar_t** argv) {
+    if (argc < 2) { usage(); return 2; }
+    wchar_t dir[MAX_PATH];
+    GetFullPathNameW(argv[0], MAX_PATH, dir, nullptr);
+    ShellExecuteW(nullptr, L"open", L"explorer.exe", dir, nullptr, SW_SHOWNORMAL);
+    IFolderView2* fv = nullptr;
+    IWebBrowser2* wb = nullptr;
+    for (int t = 0; t < 50 && !fv; ++t) { Sleep(200); fv = find_view(dir, &wb); }
+    if (!fv) { printf("explorer window not found\n"); return 1; }
+    for (int i = 1; i < argc; ++i) {
+        int size = _wtoi(argv[i]);
+        HRESULT hr = fv->SetViewModeAndIconSize(size <= 16 ? FVM_DETAILS : FVM_ICON, size);
+        printf("icon size %d: 0x%08lx\n", size, hr);
+        Sleep(3000);
+    }
+    fv->Release();
+    if (wb) { wb->Quit(); wb->Release(); }
+    return 0;
+}
+
 static LRESULT CALLBACK host_wndproc(HWND h, UINT m, WPARAM w, LPARAM l) { return DefWindowProcW(h, m, w, l); }
 
 // Hosts our preview handler like Explorer's preview pane does (out of process via the
@@ -358,6 +429,19 @@ int wmain(int argc, wchar_t** argv) {
     else if (arg_is(cmd, L"shelltest")) rc = cmd_shelltest(argc - 2, argv + 2);
     else if (arg_is(cmd, L"previewtest")) rc = cmd_previewtest(argc - 2, argv + 2);
     else if (arg_is(cmd, L"render")) rc = cmd_render(argc - 2, argv + 2);
+    else if (arg_is(cmd, L"explorer-view")) rc = cmd_explorer_view(argc - 2, argv + 2);
+    else if (arg_is(cmd, L"cmyktest")) {  // prints sRGB for pure C, M, Y, K, white through the ICM transform
+        abt::CmykXform* x = abt::cmyk_xform_create(nullptr, 0);
+        const uint8_t in[5][4] = {{255, 0, 0, 0}, {0, 255, 0, 0}, {0, 0, 255, 0}, {0, 0, 0, 255}, {0, 0, 0, 0}};
+        const char* names[5] = {"C", "M", "Y", "K", "white"};
+        for (int i = 0; i < 5; ++i) {
+            uint8_t rgb[3] = {};
+            int ok = x ? abt::cmyk_xform_fn(x, in[i], rgb, 1) : 0;
+            printf("%-5s -> ok=%d R=%3u G=%3u B=%3u\n", names[i], ok, rgb[0], rgb[1], rgb[2]);
+        }
+        abt::cmyk_xform_destroy(x);
+        rc = 0;
+    }
     else if (arg_is(cmd, L"stats") || arg_is(cmd, L"stop-agent") || arg_is(cmd, L"ping")) {
         abt_req req;
         abt::init_req(&req, arg_is(cmd, L"stats") ? ABT_MSG_STATS : arg_is(cmd, L"ping") ? ABT_MSG_PING : ABT_MSG_QUIT, 0);

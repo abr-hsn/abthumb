@@ -168,9 +168,31 @@ static void render_inner(const RenderRequest& rq, const MappedFile& mf, RenderRe
         break;
     }
     case ABT_FAM_PSD:
-    case ABT_FAM_PSB:
-        hr = render_psd(mf.data, mf.size, pr, rq, &rr->img, rr->reason, sizeof(rr->reason));
+    case ABT_FAM_PSB: {
+        bool approx = false;
+        hr = render_psd(mf.data, mf.size, pr, rq, &rr->img, rr->reason, sizeof(rr->reason), &approx);
+        // Our layer composite skips adjustment layers and effects, so its colours can be off.
+        // Photoshop's own thumbnail (resource 1036, ~160 px) has the right colours: prefer it for
+        // thumbnails it can serve with at most 2x enlargement (D-022).
+        if (SUCCEEDED(hr) && approx && allow_embedded && best >= 0) {
+            const abt_preview& pv = pr.previews[best];
+            uint32_t pl = pv.width > pv.height ? pv.width : pv.height;
+            abt_image em = {};
+            if (pl && (uint32_t)edge <= pl * 2 && SUCCEEDED(decode_preview(mf, pv, bw, bh, &em))) {
+                if (fit_image(&em, bw, bh, true) == S_OK) {
+                    abt_image_free(&rr->img);
+                    rr->img = em;
+                    rr->hr = S_OK;
+                    rr->source = ABT_SRC_EMBEDDED | ABT_SRC_SCALED;
+                    set_reason(rr, "Photoshop thumbnail (layers use effects/adjustments)");
+                    return;
+                }
+                abt_image_free(&em);
+            }
+        }
+        if (SUCCEEDED(hr) && approx) set_reason(rr, "layer composite (adjustment layers/effects not applied)");
         break;
+    }
     case ABT_FAM_EPS:
     case ABT_FAM_AI_PS:
         hr = render_ghostscript(rq.path, pr, rq, &rr->img);
@@ -236,7 +258,8 @@ void render_result_free(RenderResult* rr) { abt_image_free(&rr->img); }
 // ------------------------------------------------------------------ PSD
 
 HRESULT render_psd(const uint8_t* data, size_t size, const abt_probe& pr, const RenderRequest& rq, abt_image* out,
-                   char* reason, size_t reason_cap) {
+                   char* reason, size_t reason_cap, bool* approx) {
+    *approx = false;
     int bw = rq.cx > 0 ? rq.cx : 256, bh = rq.cy > 0 ? rq.cy : bw;
     abt_psd_opts o = {};
     fit_box((int)pr.info.px_width, (int)pr.info.px_height, bw, bh, false, &o.dst_w, &o.dst_h);
@@ -246,6 +269,7 @@ HRESULT render_psd(const uint8_t* data, size_t size, const abt_probe& pr, const 
     if (st == ABT_E_NOTFOUND) {
         st = abt_psd_composite_layers(data, size, &pr, &o, &pb);
         if (st == ABT_OK) lstrcpynA(reason, "composited from layers (no merged image)", (int)reason_cap);
+        *approx = st == ABT_OK && pb.approx;
     }
     if (st != ABT_OK) {
         _snprintf_s(reason, reason_cap, _TRUNCATE, "psd: %s", abt_status_str(st));

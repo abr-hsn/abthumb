@@ -58,6 +58,12 @@ Note: our handler runs in-process inside the agent for these calls and is answer
 ## D-020 Multi-artboard Illustrator files: thumbnail = first artboard (decided)
 Illustrator's XMP thumbnail shows all artboards side by side, while the PDF content has one page per artboard. We show the first artboard everywhere (thumbnail and preview page 1) so sizes are consistent; the XMP preview is used only when its aspect ratio matches the first artboard (`stDim` in XMP), otherwise PDFium renders page 1 (2-4 ms at 256 px).
 
+## D-022 PSD without merged image: layer composite, but Photoshop's thumbnail when it is more truthful (decided)
+When "Maximize Compatibility" was off we composite the layers ourselves at output resolution (normal and 25 blend modes, opacity, fill, masks, clipping, groups, solid-colour shape layers). Adjustment layers and layer effects are not rendered; when visible ones are present the composite is flagged approximate. For thumbnails up to 2x the size of Photoshop's embedded thumbnail (resource 1036, ~160 px) we then use that thumbnail, which has the correct colours; larger sizes (preview pane) use the composite and say so in the info strip. Measured on the corpus: composite vs Photoshop's own merged image differs by 0.2-1.0 levels on documents without adjustments.
+
+## D-023 Explorer needs a machine-wide registration (decided after experiment E3, 2026-11-18)
+E3: with our handler registered per-user, Explorer itself still produced FastPictureViewer's thumbnails. Explorer extracts thumbnails inside `dllhost.exe /Processid:{AB8902B4-09CA-4BB6-B78D-A8F59079A8D5}` (the Thumbnail Cache out-of-process server), which, like prevhost, ignores per-user COM classes on this build. Only in-process callers (our CLI, apps that call the shell in-proc) saw the per-user handler. Therefore the real install is machine-wide (HKLM, admin once), and it must back up and restore the HKLM handler entries it replaces (Photo Thumbnail Provider/FastPictureViewer, Illustrator's and Acrobat's preview handlers). The per-user mode stays only as a developer/test mode.
+
 ## D-021 Antivirus friction (observed)
 Bitdefender on this PC quarantined a freshly built `abthumb.exe` once (unsigned binary that writes COM registrations). Mitigations: machine-wide install through an installer (standard pattern, D-015), code-signing before any public release, and keeping registration code minimal. During development, rebuilding fixed it; no AV settings were changed.
 
