@@ -18,3 +18,7 @@
 /.vscode/
 *.user
 *.log
+
+# test output images
+*.pam
+*.ppm
