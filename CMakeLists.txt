@@ -46,8 +46,17 @@ endif()
 # ---------------------------------------------------------------- core (C11, portable)
 add_library(abt_core STATIC
   src/core/abt_core.c
+  src/core/abt_image.c
+  src/core/abt_probe.c
+  src/core/abt_eps.c
+  src/core/abt_psd.c
+  src/core/abt_psd_layers.c
+  src/core/abt_pixbuf.c
+  third_party/miniz/miniz.c
 )
-target_include_directories(abt_core PUBLIC src/core)
+target_compile_definitions(abt_core PRIVATE MINIZ_NO_STDIO MINIZ_NO_ARCHIVE_APIS MINIZ_NO_TIME)
+set_source_files_properties(third_party/miniz/miniz.c PROPERTIES COMPILE_OPTIONS "/W0")
+target_include_directories(abt_core PUBLIC src/core PRIVATE third_party/miniz)
 
 # ---------------------------------------------------------------- Windows helpers (C++)
 add_library(abt_win STATIC
@@ -55,26 +64,50 @@ add_library(abt_win STATIC
   src/win/abt_paths.cpp
   src/win/abt_registry.cpp
   src/win/abt_wic.cpp
+  src/win/abt_proto.cpp
+  src/win/abt_decode.cpp
 )
 target_include_directories(abt_win PUBLIC src/win)
-target_link_libraries(abt_win PUBLIC abt_core windowscodecs shlwapi ole32 oleaut32 uuid advapi32 shell32 propsys)
+target_link_libraries(abt_win PUBLIC abt_core windowscodecs shlwapi ole32 oleaut32 uuid advapi32 shell32 propsys mscms gdi32 user32)
+
+include(cmake/pdfium.cmake)
+
+# ---------------------------------------------------------------- render pipeline (worker + CLI)
+add_library(abt_render STATIC
+  src/render/render.cpp
+  src/render/render_pdf.cpp
+  src/render/render_gs.cpp
+)
+target_include_directories(abt_render PUBLIC src/render)
+target_link_libraries(abt_render PUBLIC abt_win pdfium)
+
+# ---------------------------------------------------------------- render worker
+add_executable(abthumb_render
+  src/worker/worker_main.cpp
+)
+set_target_properties(abthumb_render PROPERTIES OUTPUT_NAME abthumb-render)
+target_link_libraries(abthumb_render PRIVATE abt_render)
+add_custom_command(TARGET abthumb_render POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different "${ABT_PDFIUM_DIR}/bin/pdfium.dll" "$<TARGET_FILE_DIR:abthumb_render>")
 
 # ---------------------------------------------------------------- shell extension DLL
 add_library(abthumb SHARED
   src/shellext/dllmain.cpp
   src/shellext/thumbnail.cpp
+  src/shellext/client.cpp
   src/shellext/preview.cpp
   src/shellext/abthumb.def
   src/shellext/abthumb.rc
 )
-target_link_libraries(abthumb PRIVATE abt_win gdi32 user32)
+target_link_libraries(abthumb PRIVATE abt_win gdi32 user32 msimg32)
 
 # ---------------------------------------------------------------- CLI
 add_executable(abthumb_cli
   src/cli/main.cpp
 )
 set_target_properties(abthumb_cli PROPERTIES OUTPUT_NAME abthumb PDB_NAME abthumb_cli)
-target_link_libraries(abthumb_cli PRIVATE abt_win gdi32 user32)
+target_link_libraries(abthumb_cli PRIVATE abt_render delayimp)
+target_link_options(abthumb_cli PRIVATE /DELAYLOAD:pdfium.dll)
 
 # ---------------------------------------------------------------- per-user preview host (COM local server)
 add_executable(abthumb_preview WIN32
@@ -83,3 +116,27 @@ add_executable(abthumb_preview WIN32
 set_target_properties(abthumb_preview PROPERTIES OUTPUT_NAME abthumb-preview)
 target_link_libraries(abthumb_preview PRIVATE abt_win user32)
 add_dependencies(abthumb_preview abthumb)
+
+# ---------------------------------------------------------------- unit tests
+add_executable(abt_tests
+  tests/unit/test_main.c
+  tests/unit/test_core.c
+  tests/unit/test_eps.c
+  tests/unit/test_psd.c
+)
+target_include_directories(abt_tests PRIVATE tests/unit)
+target_compile_definitions(abt_tests PRIVATE ABT_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+target_link_libraries(abt_tests PRIVATE abt_core)
+
+# ---------------------------------------------------------------- agent
+add_executable(abthumb_agent WIN32
+  src/agent/agent_main.cpp
+  src/agent/cache.cpp
+  src/agent/filekey.cpp
+  src/agent/pool.cpp
+  src/agent/prewarm.cpp
+  src/agent/server.cpp
+)
+set_target_properties(abthumb_agent PROPERTIES OUTPUT_NAME abthumb-agent)
+target_link_libraries(abthumb_agent PRIVATE abt_win)
+add_dependencies(abthumb_agent abthumb_render abthumb)

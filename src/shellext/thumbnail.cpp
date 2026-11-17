@@ -1,6 +1,7 @@
 // IThumbnailProvider. Step 2: placeholder output + experiment-E1 logging.
 #include "shellext.h"
 #include "abt_wic.h"
+#include "abt_proto.h"
 #include <thumbcache.h>
 #include <propsys.h>
 #include <shobjidl.h>
@@ -92,24 +93,24 @@ public:
         return hr;
     }
 
-    // IThumbnailProvider
+    // IThumbnailProvider: one round trip to the agent, then copy into a DIB section.
     IFACEMETHODIMP GetThumbnail(UINT cx, HBITMAP* out, WTS_ALPHATYPE* alpha) override {
         uint64_t t0 = abt::qpc();
         *out = nullptr;
         *alpha = WTSAT_UNKNOWN;
-        wchar_t exe[MAX_PATH] = L"";
-        GetModuleFileNameW(nullptr, exe, MAX_PATH);
-        void* bits = nullptr;
-        HBITMAP bmp = abt::create_dib32((int)cx, (int)cx, &bits);
-        if (!bmp) return E_OUTOFMEMORY;
-        wchar_t line2[96];
-        _snwprintf_s(line2, _countof(line2), _TRUNCATE, L"%u px  %hs", cx, m_init);
-        draw_placeholder(bits, (int)cx, (int)cx, m_path ? m_path : L"stream", line2);
-        *out = bmp;
-        *alpha = WTSAT_RGB;
-        abt::logf("thumb GetThumbnail cx=%u init=%s host=%ls %.3f ms", cx, m_init, PathFindFileNameW(exe),
-                  abt::qpc_ms(t0, abt::qpc()));
-        return S_OK;
+        if (!m_path || !cx || cx > 4096) return E_INVALIDARG;
+        abt_resp resp;
+        uint8_t* px = nullptr;
+        HRESULT hr = request_image(ABT_MSG_THUMB, m_path, cx, cx, 0, &resp, &px);
+        if (SUCCEEDED(hr) && px) {
+            hr = make_bitmap(px, (int)resp.width, (int)resp.height, out, alpha);
+        } else if (SUCCEEDED(hr)) {
+            hr = E_FAIL;
+        }
+        abt::mem_free(px);
+        abt::logf("thumb cx=%u %ls -> 0x%08lx %ux%u src=0x%x %.2f ms (%s)", cx, PathFindFileNameW(m_path), hr,
+                  resp.width, resp.height, resp.source, abt::qpc_ms(t0, abt::qpc()), resp.reason);
+        return hr;
     }
 };
 

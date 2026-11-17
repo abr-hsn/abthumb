@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 #include "abt_core.h"
 
 // Class IDs (D-008). Strings must match the GUID values.

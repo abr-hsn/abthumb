@@ -16,3 +16,10 @@ HRESULT create_preview_handler(REFIID riid, void** ppv);
 
 // Draws the step-2 placeholder: label + size on a colour keyed by extension. BGRA, alpha 255.
 void draw_placeholder(void* bits, int w, int h, const wchar_t* path, const wchar_t* line2);
+
+#include <thumbcache.h>
+struct abt_resp;
+// One request to the agent (starts it on demand). *px is mem_alloc'd BGRA premultiplied.
+HRESULT request_image(uint16_t msg, const wchar_t* path, UINT cx, UINT cy, UINT page, abt_resp* resp, uint8_t** px);
+// Premultiplied BGRA -> DIB section for the shell (straight alpha when transparent).
+HRESULT make_bitmap(const uint8_t* px, int w, int h, HBITMAP* out, WTS_ALPHATYPE* alpha);

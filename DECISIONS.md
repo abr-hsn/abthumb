@@ -50,8 +50,16 @@ Register under `HKCU\Software\Classes` (`.ext\ShellEx\{IID}` and `SystemFileAsso
 ## D-009 File types (decided)
 Illustrator: `.ai`, `.ait`. EPS: `.eps`, `.epsf`, `.epsi`. Photoshop: `.psd`, `.psdt`, `.pdd`, `.psb`. PDF: `.pdf`. Each type can be switched off in config.
 
-## D-010 Pre-warm writes into Explorer's own thumbnail cache (pending experiment E2)
-The agent calls `IThumbnailCache::GetThumbnail` (CLSID_LocalThumbnailCache, `WTS_EXTRACT`, `WTS_FORCEEXTRACTION` for upgrades) for every supported file of a folder the user opens, at the sizes Explorer was seen requesting, so scrolling hits Explorer's cache. E2 confirms Explorer picks those entries up and how to refresh an upgraded item (`SHChangeNotify(SHCNE_UPDATEITEM)`).
+## D-010 Pre-warm writes into Explorer's own thumbnail cache (decided, confirmed by E2)
+The agent calls `IThumbnailCache::GetThumbnail` (CLSID_LocalThumbnailCache, `WTS_EXTRACT`, `WTS_FORCEEXTRACTION` for upgrades) for every supported file of a folder the user opens, at the sizes Explorer was seen requesting, so scrolling hits Explorer's cache.
+E2 (2026-11-18): after `shelltest` touched 4 files of the 110-file AI corpus folder, the agent pre-warmed the folder in the background; querying files nobody had requested with `WTS_INCACHEONLY` (cache lookup only, the handler is never called) returned their thumbnails with `WTS_CACHED`. So entries written from the agent process land in the per-user cache Explorer reads.
+Note: our handler runs in-process inside the agent for these calls and is answered from our own cache (the DLL flags them `FROM_PREWARM` so they do not re-trigger pre-warm).
+
+## D-020 Multi-artboard Illustrator files: thumbnail = first artboard (decided)
+Illustrator's XMP thumbnail shows all artboards side by side, while the PDF content has one page per artboard. We show the first artboard everywhere (thumbnail and preview page 1) so sizes are consistent; the XMP preview is used only when its aspect ratio matches the first artboard (`stDim` in XMP), otherwise PDFium renders page 1 (2-4 ms at 256 px).
+
+## D-021 Antivirus friction (observed)
+Bitdefender on this PC quarantined a freshly built `abthumb.exe` once (unsigned binary that writes COM registrations). Mitigations: machine-wide install through an installer (standard pattern, D-015), code-signing before any public release, and keeping registration code minimal. During development, rebuilding fixed it; no AV settings were changed.
 
 ## D-011 Embedded preview vs render policy (decided)
 Use an embedded preview only when its long edge is at least the requested long edge, or when nothing better is possible. Otherwise render. If a render would miss the foreground deadline and a smaller preview exists, return the preview now, finish the render in the background, update both caches (progressive upgrade).
