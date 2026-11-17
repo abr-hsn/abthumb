@@ -31,8 +31,18 @@ Fallback: if the agent is not running, the DLL starts it and retries once within
 Append-only segment files + in-memory open-addressing hash index (Bitcask style), persisted index snapshot for instant start, per-record checksum, rebuild-by-scan if the snapshot is bad. Payload = QOI-compressed premultiplied BGRA rendition + small metadata record (format, version, page count, dimensions, colour mode). Key = volume serial + 128-bit NTFS file ID (path hash on file systems without stable IDs); validators = size, last-write time, renderer version. Larger renditions serve smaller requests by downscaling. Negative entries for files that failed or timed out (same validators) so a bad file is never retried until it changes.
 Why: survives Explorer cache purges and Windows upgrades (Icaros lesson), lossless (accuracy), QOI decodes 256 px in well under a millisecond, one writer (the agent) so no cross-process locking, few large files instead of thousands of small ones (less antivirus and file-system overhead).
 
-## D-007 Shell initialization interface (pending experiment E1)
-Default plan: implement `IInitializeWithItem` (to get the real path) with `DisableProcessIsolation=1`, which is acceptable because the DLL is a thin pipe client (D-005). Also implement `IInitializeWithStream` so the handler still works for non-file items. E1 measures what the shell actually calls, whether a stream exposes the path, and the per-call overhead of the isolated surrogate vs in-proc.
+## D-007 Shell initialization interface (decided after experiment E1, 2026-11-18)
+**Thumbnail provider: in-process (`DisableProcessIsolation=1`), `IInitializeWithItem` + `IInitializeWithFile`, no `IInitializeWithStream`.**
+E1 results on this PC (Windows 11 build 26300), measured with `abthumb shelltest --force` / `previewtest`:
+* When offered, the shell always picks `IInitializeWithStream` first; `IStream::Stat` returns only the file name (`dummy.ai`), never the directory. With the stream interface hidden, the shell falls back to `IInitializeWithItem` and we get the full path.
+* `DisableProcessIsolation=1` is honoured: the handler runs in the calling process (Explorer, file dialogs, our agent).
+* Isolated mode (no `DisableProcessIsolation`) with a per-user (HKCU) registration fails with `REGDB_E_CLASSNOTREG`: Windows' thumbnail surrogate does not see per-user classes.
+* Per-user out-of-process COM activation is ignored entirely on this build: `CoCreateInstance(CLSCTX_LOCAL_SERVER)` returns `REGDB_E_CLASSNOTREG` for a per-user class whether it uses prevhost's AppID, our own AppID with `DllSurrogate`, or a plain `LocalServer32` exe (a fresh test GUID pointing at our exe was never launched).
+* Cost: whole `IThumbnailCache` force-extraction round trip about 5.5-6 ms per file (mostly the shell's own cache write); our `GetThumbnail` placeholder 0.25 ms.
+Consequence for the preview pane: Explorer activates preview handlers out of process, so the preview handler's CLSID must be registered machine-wide (HKLM, admin once). See D-015.
+
+## D-019 Preview handler hosting (decided)
+Machine-wide registration of the preview CLSID with Windows' `prevhost.exe` AppID (`{6d2b5079-...}`), low integrity (default). The handler is a thin pipe client like the thumbnail provider; the pipe carries a low-integrity mandatory label so prevhost can connect. `abthumb-preview.exe` (our own STA local server) stays in the tree for a future per-machine `LocalServer32` option and for tests.
 
 ## D-008 Registration: per-user (HKCU), override, clean restore (decided)
 Register under `HKCU\Software\Classes` (`.ext\ShellEx\{IID}` and `SystemFileAssociations\.ext\ShellEx\{IID}`), plus the HKCU `PreviewHandlers` list. HKCU entries override the current HKLM ones (Windows Photo Thumbnail Provider driven by FastPictureViewer's WIC codecs, Illustrator's and Acrobat's preview handlers). Uninstall deletes only our keys, so the previous handlers come back automatically. No admin rights needed.
@@ -56,8 +66,8 @@ Area-average (box with fractional coverage) on premultiplied BGRA in encoded (ga
 ## D-014 Build and toolchain (decided)
 CMake + Ninja + MSVC (Visual Studio 2026), Windows SDK 10.0.26100, x64 first. A 32-bit build of the thin DLL comes later so 32-bit apps' file dialogs also get thumbnails. `/O2 /GL /Gy`, LTCG, `/guard:cf`, `/Qspectre-` off by default.
 
-## D-015 Installer: per-user, built into abthumb.exe (decided)
-No WiX/.NET/Inno on this PC, and per-user install needs no admin. `abthumb.exe install` copies to `%LOCALAPPDATA%\Programs\abthumb`, registers, adds the agent to `HKCU\...\Run`, adds an Add/Remove Programs entry; `uninstall` reverses everything. A WiX/MSI package can be added later for managed deployment.
+## D-015 Installer: built into abthumb.exe, machine-wide by default (revised after E1)
+No WiX/.NET/Inno on this PC. `abthumb.exe install` (elevated, default) copies to `%ProgramFiles%\abthumb`, registers the COM classes in HKLM (thumbnail in-process, preview via prevhost), registers the agent in `HKLM\...\Run` so it starts in every user session, and adds an Add/Remove Programs entry. `abthumb.exe install --user` (no admin) installs to `%LOCALAPPDATA%\Programs\abthumb` with HKCU registration: thumbnails and pre-warm work, the preview pane does not (Windows ignores per-user out-of-process COM, D-007). `uninstall` reverses everything and removes only keys that still point at our CLSIDs.
 
 ## D-016 When nothing can be rendered, show Explorer's icon (decided)
 No fake "AI" badge tiles: if a file has no usable preview and cannot be rendered (AI saved without PDF content and without an XMP thumbnail, EPS without preview and no Ghostscript), the handler fails and Explorer shows the normal file icon. The reason is logged and visible via `abthumb.exe info <file>`.
