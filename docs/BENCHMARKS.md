@@ -6,10 +6,15 @@ PC: i7-14700, NVMe, Windows 11 build 26300. `abthumb bench <corpus dirs> --size 
 
 | Path | n | mean | p50 | p95 | max |
 |---|---|---|---|---|---|
-| abthumb auto (what Explorer gets) | 171 | 3.29 ms | 1.14 ms | 8.70 ms | 95.8 ms |
-| abthumb forced full render | 119 | 4.86 ms | 2.33 ms | 14.65 ms | 97.3 ms |
-| abthumb embedded preview only | 159 | 0.84 ms | 0.59 ms | 2.60 ms | 3.6 ms |
-| WIC codec path (FastPictureViewer, baseline) | 153 | 1.70 ms | 1.60 ms | 2.83 ms | 4.5 ms |
+| abthumb auto (what Explorer gets) | 171 | 2.65 ms | 1.06 ms | 8.45 ms | 50.9 ms |
+| abthumb forced full render | 119 | 4.61 ms | 2.31 ms | 12.57 ms | 96.1 ms |
+| abthumb embedded preview only | 159 | 0.82 ms | 0.56 ms | 2.60 ms | 3.6 ms |
+| WIC codec path (FastPictureViewer, baseline) | 153 | 1.64 ms | 1.59 ms | 2.61 ms | 3.4 ms |
+| **agent end to end, cache miss** (pipe + worker + store) | 171 | 5.90 ms | 1.71 ms | 13.35 ms | 282 ms |
+| **agent end to end, cache hit** (pipe + QOI decode) | 171 | 0.35 ms | 0.35 ms | 0.54 ms | 1.1 ms |
+
+The cache-miss maximum (282 ms) is the first request after the agent started (worker process
+start + PDFium/WIC initialisation); later misses stay in the render times above.
 
 Failures: abthumb 20 (PostScript-only AI 3/8 and EPS without previews: need Ghostscript, not
 installed here); FastPictureViewer path 38 (no PSB codec, no render fallback).
@@ -22,5 +27,10 @@ Notes:
   PDFium renders of Illustrator files at 1024 px in 2-18 ms; an Explorer-cache round trip
   through `IThumbnailCache` about 5-6 ms of which our handler is about 0.3 ms on a cache hit.
 
-To do: agent cache-miss/hit percentiles (`--agent`), a run over a sample of real-world files,
-and end-to-end Explorer timings after the machine-wide install.
+## Robustness
+libFuzzer + ASan, about 4 minutes per target (`tests/fuzz`): `fuzz_probe` 11.9 M executions,
+`fuzz_qoi` 41.8 M, `fuzz_psd` 68.6 k (large seeds, low coverage: worth a longer run). One bug found
+and fixed (QOI header claiming more pixels than its payload could encode forced a multi-GB
+allocation); all targets clean afterwards.
+
+To do: end-to-end Explorer timings after the machine-wide install.

@@ -19,8 +19,7 @@ static void usage() {
         "usage:\n"
         "  (install/uninstall: run install.cmd / uninstall.cmd, which use regsvr32)\n"
         "  abthumb stats | ping | stop-agent             talk to the running agent\n"
-        "  abthumb register [--machine] [--isolated] [--dll PATH]   developer registration\n"
-        "  abthumb unregister [--machine]\n"
+        "  (developer registration: regsvr32 abthumb.dll  /  regsvr32 /u abthumb.dll)\n"
         "  abthumb status                               show handler registration per extension\n"
         "  abthumb shelltest PATH... [--size N] [--force] [--repeat N] [--out DIR]\n"
         "        drive the real shell thumbnail pipeline (IShellItemImageFactory, or\n"
@@ -37,28 +36,9 @@ static void usage() {
 static bool arg_is(const wchar_t* a, const wchar_t* b) { return lstrcmpiW(a, b) == 0; }
 
 
-static int cmd_register(int argc, wchar_t** argv) {
-    abt::RegisterOptions opt = {true, false};
-    wchar_t dll[MAX_PATH] = L"";
-    for (int i = 0; i < argc; ++i) {
-        if (arg_is(argv[i], L"--isolated")) opt.in_process = false;
-        else if (arg_is(argv[i], L"--machine")) opt.machine = true;
-        else if (arg_is(argv[i], L"--dll") && i + 1 < argc) GetFullPathNameW(argv[++i], MAX_PATH, dll, nullptr);
-    }
-    if (!dll[0]) {
-        wchar_t dir[MAX_PATH];
-        abt::module_dir(nullptr, dir, MAX_PATH);
-        _snwprintf_s(dll, MAX_PATH, _TRUNCATE, L"%s\\abthumb.dll", dir);
-    }
-    if (GetFileAttributesW(dll) == INVALID_FILE_ATTRIBUTES) {
-        fprintf(stderr, "DLL not found: %ls\n", dll);
-        return 2;
-    }
-    HRESULT hr = abt::shell_register(dll, opt);
-    printf("register %ls (%s, %s): 0x%08lx\n", dll, opt.in_process ? "in-process" : "isolated",
-           opt.machine ? "machine-wide" : "per-user dev mode: Explorer will not use it (D-023)", hr);
-    return SUCCEEDED(hr) ? 0 : 1;
-}
+// Registration is deliberately not in this tool: use `regsvr32 abthumb.dll` (machine-wide when
+// elevated, per-user developer mode otherwise) or install.cmd. Unsigned tools that write COM class
+// registrations get quarantined by antivirus heuristics (D-021).
 
 static int cmd_status() {
     char buf[4096];
@@ -551,14 +531,7 @@ int wmain(int argc, wchar_t** argv) {
     if (FAILED(hr)) return 3;
     int rc = 2;
     const wchar_t* cmd = argv[1];
-    if (arg_is(cmd, L"register")) rc = cmd_register(argc - 2, argv + 2);
-    else if (arg_is(cmd, L"unregister")) {
-        bool machine = argc > 2 && arg_is(argv[2], L"--machine");
-        hr = abt::shell_unregister(machine);
-        printf("unregister (%s): 0x%08lx\n", machine ? "machine-wide" : "per-user", hr);
-        rc = 0;
-    }
-    else if (arg_is(cmd, L"status")) rc = cmd_status();
+    if (arg_is(cmd, L"status")) rc = cmd_status();
     else if (arg_is(cmd, L"shelltest")) rc = cmd_shelltest(argc - 2, argv + 2);
     else if (arg_is(cmd, L"previewtest")) rc = cmd_previewtest(argc - 2, argv + 2);
     else if (arg_is(cmd, L"render")) rc = cmd_render(argc - 2, argv + 2);
@@ -620,16 +593,6 @@ int wmain(int argc, wchar_t** argv) {
         else if (px) printf("%.*s", (int)resp.pixel_len, (const char*)px);
         else printf("ok (%.2f ms)\n", abt::qpc_ms(t0, abt::qpc()));
         abt::mem_free(px);
-        rc = SUCCEEDED(hr) ? 0 : 1;
-    }
-    else if (arg_is(cmd, L"comtest") && argc > 2) {
-        CLSID clsid;
-        hr = CLSIDFromString(argv[2], &clsid);
-        IUnknown* unk = nullptr;
-        uint64_t t0 = abt::qpc();
-        if (SUCCEEDED(hr)) hr = CoCreateInstance(clsid, nullptr, CLSCTX_LOCAL_SERVER, IID_IUnknown, (void**)&unk);
-        printf("CoCreateInstance(LOCAL_SERVER, %ls): 0x%08lx  %.1f ms\n", argv[2], hr, abt::qpc_ms(t0, abt::qpc()));
-        if (unk) unk->Release();
         rc = SUCCEEDED(hr) ? 0 : 1;
     }
     else usage();
