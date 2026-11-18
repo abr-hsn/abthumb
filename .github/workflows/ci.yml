@@ -54,10 +54,13 @@ jobs:
       - name: Run each fuzzer for 60 s
         shell: pwsh
         run: |
-          $asan = Get-ChildItem "${env:ProgramFiles}\Microsoft Visual Studio" -Recurse -Filter clang_rt.asan_dynamic-x86_64.dll -ErrorAction SilentlyContinue |
-                  Select-Object -First 1
-          if (-not $asan) { throw "ASan runtime not found" }
-          $env:PATH = "$($asan.DirectoryName);$env:PATH"
+          # The ASan runtime must come from the same MSVC toolset that built the fuzzers.
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * `
+                  -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          $ver = (Get-Content "$vs\VC\Auxiliary\Build\Microsoft.VCToolsVersion.default.txt").Trim()
+          $bin = "$vs\VC\Tools\MSVC\$ver\bin\Hostx64\x64"
+          if (-not (Test-Path "$bin\clang_rt.asan_dynamic-x86_64.dll")) { throw "ASan runtime not found in $bin" }
+          $env:PATH = "$bin;$env:PATH"
           New-Item -ItemType Directory -Force build\fuzz\art | Out-Null
           foreach ($t in "probe", "psd", "qoi") {
             New-Item -ItemType Directory -Force "build\fuzz\corp\$t" | Out-Null

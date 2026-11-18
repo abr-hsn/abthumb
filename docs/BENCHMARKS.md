@@ -48,7 +48,9 @@ files, PostScript-only files without Ghostscript), FastPictureViewer 39.
 `abt_core` (only the harness was instrumented, 56 counters), so libFuzzer was mutating almost
 blind and the execution counts overstate what was tested. With `/fsanitize-coverage` on
 `abt_core` the targets expose 1440 (probe), 2800 (psd) and 200 (qoi) counters. 2-minute
-instrumented runs of all three targets were clean. Longer runs are still to do.
+instrumented runs of all three targets were clean, and so were 10-minute runs of `fuzz_psd`
+(3.6 k executions, large seeds) and `fuzz_probe` (823 k). `fuzz_psd` is slow on big inputs and
+deserves an overnight run.
 
 Original (uninstrumented) runs:
 libFuzzer + ASan, about 4 minutes per target (`tests/fuzz`): `fuzz_probe` 11.9 M executions,

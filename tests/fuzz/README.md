@@ -10,8 +10,8 @@ Inputs over 4 MB are skipped.
 ## Seeds (kept out of git, under build\fuzz\seeds)
     sh tests/fuzz/make_seeds.sh     (needs tests/corpus/generated; files > 300 KB are truncated to 256 KB)
 
-## Run (ASan DLL must be on PATH)
-    set PATH=%ProgramFiles%\Microsoft Visual Studio\18\Community\VC\Tools\MSVC\<ver>\bin\Hostx64\x64;%PATH%
+## Run (ASan DLL of the same MSVC toolset must be on PATH; a mismatched one fails with 0xC0000139)
+    set PATH=%VCToolsInstallDir%bin\Hostx64\x64;%PATH%      (in a VS developer prompt)
     mkdir build\fuzz\corp\psd build\fuzz\art
     build\fuzz\bin\fuzz_psd.exe -max_total_time=240 -max_len=2000000 -timeout=10 -rss_limit_mb=2048 ^
         -artifact_prefix=build\fuzz\art\psd_ build\fuzz\corp\psd build\fuzz\seeds\psd
