@@ -29,7 +29,7 @@ Settings > Apps: it stops abthumb, gives the file types back to whatever handled
 deletes the thumbnail cache. Silent: `abthumb-setup-<version>-x64.exe /VERYSILENT /TASKS=resetcache`.
 Checksums of every shipped file are in `SHA256SUMS.txt`.
 
-Optional: install [Ghostscript](https://ghostscript.com) if you have EPS or Illustrator 3-8 files
+Optional: install [Ghostscript](https://ghostscript.com) if you have EPS files
 without embedded previews; abthumb uses it automatically when present.
 
 ## How it works

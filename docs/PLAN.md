@@ -40,7 +40,7 @@ Owner decisions are recorded in [`DECISIONS.md`](../DECISIONS.md).
               |- PDFium: PDF, and AI files with PDF content
               |- PSD/PSB composite decoder (streaming, row-subsampled downscale) + basic
               |  layer compositor when no merged image exists
-              |- Ghostscript delegate (EPS / PostScript AI without preview), only if the
+              |- Ghostscript delegate (EPS without preview), only if the
                  user has Ghostscript installed (never bundled, keeps the project MIT-clean)
 ```
 

@@ -35,7 +35,8 @@
 
     // ---- compatibility enum probe ------------------------------------------------------------
     var COMPAT = [];   // [name, value] for every value the DOM exposes
-    var cand = ["ILLUSTRATOR3", "JAPANESEVERSION3", "ILLUSTRATOR8", "ILLUSTRATOR9", "ILLUSTRATOR10", "ILLUSTRATOR11",
+    // Illustrator 8 and older (PostScript-based .ai) are out of scope (DECISIONS D-026).
+    var cand = ["ILLUSTRATOR9", "ILLUSTRATOR10", "ILLUSTRATOR11",
         "ILLUSTRATOR12", "ILLUSTRATOR13", "ILLUSTRATOR14", "ILLUSTRATOR15", "ILLUSTRATOR16", "ILLUSTRATOR17",
         "ILLUSTRATOR18", "ILLUSTRATOR19", "ILLUSTRATOR20", "ILLUSTRATOR21", "ILLUSTRATOR22", "ILLUSTRATOR23",
         "ILLUSTRATOR24", "ILLUSTRATOR25", "ILLUSTRATOR26", "ILLUSTRATOR27", "ILLUSTRATOR28", "ILLUSTRATOR29",

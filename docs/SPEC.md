@@ -10,7 +10,7 @@ Detection is by content, never by extension alone (`.ai` files can be PostScript
 |---|---|
 | `%PDF-` (within first 1 KB) | PDF. It is **AI** if it has an `/Illustrator` dictionary, `AIPrivateData` streams, or XMP `xmp:CreatorTool` containing "Illustrator". |
 | `C5 D0 D3 C6` | DOS-binary EPS (PostScript + optional TIFF/WMF preview sections) |
-| `%!PS-Adobe-` | PostScript: legacy AI (AI 1-8, `%%Creator: Adobe Illustrator`, `%AI5_FileFormat`) or EPS (`EPSF-` in the first line) |
+| `%!PS-Adobe-` | PostScript: EPS (`EPSF-` in the first line), or legacy AI 1-8 (`%%Creator: Adobe Illustrator`, `%AI5_FileFormat`), which is detected only to be declined (D-026) |
 | `8BPS` + version 1 / 2 | PSD / PSB |
 
 ### Pipeline per request (inside a render worker)
@@ -23,7 +23,7 @@ Detection is by content, never by extension alone (`.ai` files can be PostScript
 |---|---|---|
 | AI 9 – 2026 with PDF content | XMP `xmpGImg:image` JPEG (about 256 px) | PDFium page 1 (= artboard 1), white background, CropBox |
 | AI 9 – 2026 without PDF content | XMP JPEG only | none (Illustrator private data); detected by placeholder page + no thumbnail |
-| AI 1-8 (PostScript) | EPSI `%%BeginPreview`, DOS-EPS TIFF if wrapped | Ghostscript if installed (works only when procsets are embedded) |
+| AI 1-8 (PostScript) | not supported (D-026): fails fast, Explorer shows its icon | none |
 | EPS (Illustrator / generic) | DOS header TIFF (WIC) or WMF (GDI), EPSI, XMP JPEG | Ghostscript if installed, `-dEPSCrop` |
 | Photoshop EPS | DOS TIFF, Photoshop resource 1036 JPEG, XMP | Ghostscript if installed |
 | PSD / PSB / PSDT / PDD | resource 1036 JFIF (about 160 px), 1033 (old, BGR JPEG) | merged composite (raw/RLE; all depths and modes; lcms2 colour) if resource 1057 says `hasRealMergedData`; otherwise layer compositor |

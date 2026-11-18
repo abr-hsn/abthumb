@@ -16,7 +16,7 @@ PC: i7-14700, NVMe, Windows 11 build 26300. `abthumb bench <corpus dirs> --size 
 The cache-miss maximum (282 ms) is the first request after the agent started (worker process
 start + PDFium/WIC initialisation); later misses stay in the render times above.
 
-Failures: abthumb 20 (PostScript-only AI 3/8 and EPS without previews: need Ghostscript, not
+Failures: abthumb 20 (Illustrator 3/8 files, out of scope since D-026, and EPS without previews, which need Ghostscript, not
 installed here); FastPictureViewer path 38 (no PSB codec, no render fallback).
 
 Notes:

@@ -83,6 +83,12 @@ Area-average (box with fractional coverage) on premultiplied BGRA in encoded (ga
 ## D-014 Build and toolchain (decided)
 CMake + Ninja + MSVC (Visual Studio 2026), Windows SDK 10.0.26100, x64 first. A 32-bit build of the thin DLL comes later so 32-bit apps' file dialogs also get thumbnails. `/O2 /GL /Gy`, LTCG, `/guard:cf`, `/Qspectre-` off by default.
 
+## D-026 Illustrator 8 and older are out of scope (decided by the owner, 2026-11-18)
+PostScript-based `.ai` files (Illustrator 1-8 and "Save as Illustrator 3/8" output) are still detected, but only so they can be declined quickly: no preview search, no Ghostscript call, Explorer shows its normal icon and the failure is negative-cached. The corpus generator no longer saves these versions. EPS files are unaffected (any producer, any version): embedded previews always, Ghostscript for preview-less EPS when installed. Supersedes the legacy-AI part of D-004.
+
+## D-027 Source on GitHub, always synced (decided by the owner, 2026-11-18)
+Private repository `abr-hsn/abthumb` (private until the owner decides to open-source it). Every commit is pushed right after it is made. No `Co-Authored-By` trailers (D-018).
+
 ## D-025 Installer package: Inno Setup 6 (decided 2026-11-18, supersedes the script installer below)
 The owner asked for a robust and safe installer and uninstaller. Inno Setup (free, no runtime, single signed-able `setup.exe`, ~5 MB) over WiX/MSI because MSI needs the .NET SDK + WiX toolchain and the target is a single designer's PC; an MSI can follow for managed deployment. Behaviour (`installer/abthumb.iss`): machine-wide with one UAC prompt; COM registration only through `DllRegisterServer`/`DllUnregisterServer` (backup and restore of replaced handlers); stops our agent/workers before copying; a DLL still loaded by Explorer is renamed aside and deleted at the next reboot, so Explorer is never closed or restarted unless the user ticks "clear thumbnail cache" (which runs as the signed-in user, not elevated); re-running repairs the registration; uninstall stops all agents, restores the previous handlers, removes the Run key and the uninstalling user's cache and settings. `scripts/package.ps1` builds the release, the installer and `SHA256SUMS.txt`. Inno Setup was installed per-user from winget (hash-verified) as a build tool.
 

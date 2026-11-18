@@ -128,6 +128,13 @@ static void render_inner(const RenderRequest& rq, const MappedFile& mf, RenderRe
     if (rq.mode == ABT_MODE_PROBE) { rr->hr = S_OK; set_reason(rr, "probe"); return; }
 
     abt_family fam = (abt_family)pr.info.family;
+    // Illustrator 8 and older (PostScript-based .ai) are out of scope (D-026): fail fast so
+    // Explorer shows its icon; the failure is negative-cached and never retried.
+    if (fam == ABT_FAM_AI_PS) {
+        rr->hr = HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
+        set_reason(rr, "Illustrator 8 and older files are not supported");
+        return;
+    }
     int bw = rq.cx > 0 ? rq.cx : 256, bh = rq.cy > 0 ? rq.cy : bw;
     bool allow_embedded = !(rq.flags & ABT_RF_NO_EMBEDDED) && rq.mode != ABT_MODE_RENDER && rq.page == 0;
     int edge = bw > bh ? bw : bh;
@@ -197,7 +204,6 @@ static void render_inner(const RenderRequest& rq, const MappedFile& mf, RenderRe
         break;
     }
     case ABT_FAM_EPS:
-    case ABT_FAM_AI_PS:
         hr = render_ghostscript(rq.path, pr, rq, &rr->img);
         if (hr == E_NOTIMPL) set_reason(rr, "no PostScript renderer (Ghostscript not installed)");
         break;
