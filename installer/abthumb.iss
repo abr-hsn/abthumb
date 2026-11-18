@@ -71,7 +71,7 @@ Source: "reset-thumbcache.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Root: HKLM; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "abthumb"; ValueData: """{app}\abthumb-agent.exe"""; Flags: uninsdeletevalue
 
 [Run]
-Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ""{app}\reset-thumbcache.ps1"""; Flags: runasoriginaluser runhidden waituntilterminated; Tasks: resetcache; StatusMsg: "Clearing Explorer's thumbnail cache..."
+Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ""{app}\reset-thumbcache.ps1"""; Flags: runasoriginaluser runhidden waituntilterminated; Tasks: resetcache; StatusMsg: "Clearing Explorer's thumbnail cache..."
 Filename: "{app}\abthumb-agent.exe"; Flags: runasoriginaluser nowait; StatusMsg: "Starting abthumb..."
 
 [UninstallRun]

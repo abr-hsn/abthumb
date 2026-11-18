@@ -79,7 +79,7 @@ Lanes in strict priority: `FOREGROUND` (Explorer waiting) > `PREVIEW` > `VISIBLE
 * `PreviewHandler` (`IPreviewHandler`, `IInitializeWithItem/File/Stream`, `IObjectWithSite`, `IOleWindow`, `IPreviewHandlerVisuals`): child window, render request at pane device pixels on a background thread, re-request on resize (debounced 120 ms) when the pane grows past the current image, page navigation with arrow keys / wheel, info strip (format, version, size, colour mode, artboards/pages).
 * Fallback if the stream path is used (non-file items): the DLL copies the stream into a temporary file under `%LOCALAPPDATA%\abthumb\tmp` and sends that path (rare; such items are not cached).
 
-## 5. Performance budgets (this PC: i7-14700, NVMe)
+## 5. Performance budgets (development PC: i7-14700, NVMe)
 
 | Path | Budget |
 |---|---|

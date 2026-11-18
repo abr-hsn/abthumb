@@ -7,7 +7,7 @@ Fast, accurate Windows Explorer thumbnails and preview pane for Adobe Illustrato
   the tile; otherwise the file is really rendered: PDFium for PDF and Illustrator 9-2026,
   a streaming composite decoder for every PSD/PSB depth and colour mode (ICC-managed CMYK),
   a layer compositor for PSDs saved without "Maximize Compatibility", optional Ghostscript for
-  PostScript-only EPS/AI.
+  EPS files without an embedded preview. (PostScript-era Illustrator 8 and older is not supported.)
 * **Fast.** Typical 256 px thumbnails take 0.5-10 ms to produce; a 32,000 x 20,000 PSB about
   45 ms; a cached thumbnail well under a millisecond. See [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 * **No blank tiles while scrolling.** When you open a folder, a background agent renders the rest
@@ -64,7 +64,8 @@ at `gswin64c.exe` or be `off`.
 
 ## Build
 
-Visual Studio 2026 (C++ workload), CMake 3.28+, Ninja.
+Visual Studio 2022 or newer (C++ workload), CMake 3.28+, Ninja. See
+[CONTRIBUTING.md](CONTRIBUTING.md) for tests, fuzzing and code style.
 
 ```
 build.cmd release                  :: build\release\bin
@@ -74,6 +75,9 @@ powershell -File scripts\package.ps1   :: dist\abthumb-<version>-x64 + .zip
 
 PDFium binaries are fetched at configure time (pinned by SHA-256). The test corpus is generated
 from Illustrator and Photoshop: see [tests/corpus/scripts/README.md](tests/corpus/scripts/README.md).
+
+## Security
+Please report vulnerabilities privately, see [SECURITY.md](SECURITY.md).
 
 ## Licence
 MIT. Bundled third-party components are permissively licensed, see

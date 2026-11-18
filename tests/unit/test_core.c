@@ -1,6 +1,7 @@
 #include "abt_test.h"
 #include "abt_image.h"
 #include "abt_probe.h"
+#include "abt_psd.h"
 #include "abt_reader.h"
 
 static void test_qoi_roundtrip(void) {
@@ -150,10 +151,79 @@ static void test_detect(void) {
     ABT_CHECK(abt_detect((const uint8_t*)"hello", 5) == ABT_FAM_UNKNOWN);
 }
 
+static void test_detect_precedence(void) {
+    const char* ps_pdf = "%!PS-Adobe-3.0 EPSF-3.0\n%%Title: x\n%PDF-1.4 embedded\n";
+    ABT_CHECK(abt_detect((const uint8_t*)ps_pdf, strlen(ps_pdf)) == ABT_FAM_EPS);
+    const uint8_t dos_pdf[] = {0xC5, 0xD0, 0xD3, 0xC6, 0, 0, 0, 0, '%', 'P', 'D', 'F', '-', '1'};
+    ABT_CHECK(abt_detect(dos_pdf, sizeof(dos_pdf)) == ABT_FAM_EPS);
+    ABT_CHECK(abt_detect((const uint8_t*)"\n%PDF-1.7\n", 10) == ABT_FAM_PDF);
+}
+
+static void test_xmp_thumbnails(void) {
+    abt_probe p;
+    /* unterminated element form: must stop after the first hit */
+    size_t cap = 1 << 16;
+    char* b = (char*)malloc(cap);
+    ABT_CHECK(b != NULL);
+    if (!b) return;
+    size_t n = 0;
+    while (n + 20 < cap) { memcpy(b + n, "<xmpGImg:image>AAAA", 19); n += 19; }
+    memset(&p, 0, sizeof(p));
+    ABT_CHECK(abt_xmp_find_thumbnails((const uint8_t*)b, n, 0, n, &p) == 0);
+    ABT_CHECK(p.n_previews == 0);
+    /* many terminated hits: capped at 64 */
+    n = 0;
+    for (int i = 0; i < 100; ++i) { memcpy(b + n, "<xmpGImg:image>QUFB</xmpGImg:image>", 35); n += 35; }
+    memset(&p, 0, sizeof(p));
+    ABT_CHECK(abt_xmp_find_thumbnails((const uint8_t*)b, n, 0, n, &p) == 64);
+    ABT_CHECK(p.n_previews == ABT_MAX_PREVIEWS);
+    free(b);
+}
+
+static void test_pixbuf_validation(void) {
+    uint8_t px[16 * 4] = {0};
+    abt_pixbuf pb;
+    abt_image img;
+    memset(&pb, 0, sizeof(pb));
+    pb.w = 2; pb.h = 2; pb.px = px;
+    pb.cs = ABT_CM_RGB; pb.nch = 3; pb.alpha = 0;
+    ABT_CHECK(abt_pixbuf_to_bgra(&pb, NULL, NULL, &img) == ABT_OK);
+    abt_image_free(&img);
+    pb.cs = ABT_CM_GRAY; /* gray with 3 channels: inconsistent */
+    ABT_CHECK(abt_pixbuf_to_bgra(&pb, NULL, NULL, &img) != ABT_OK);
+    pb.cs = ABT_CM_CMYK; pb.nch = 3;
+    ABT_CHECK(abt_pixbuf_to_bgra(&pb, NULL, NULL, &img) != ABT_OK);
+    pb.cs = ABT_CM_CMYK; pb.nch = 4; pb.alpha = 1;
+    ABT_CHECK(abt_pixbuf_to_bgra(&pb, NULL, NULL, &img) == ABT_OK);
+    abt_image_free(&img);
+    pb.alpha = 2;
+    ABT_CHECK(abt_pixbuf_to_bgra(&pb, NULL, NULL, &img) != ABT_OK);
+    pb.alpha = 0; pb.cs = ABT_CM_INDEXED; pb.nch = 3;
+    ABT_CHECK(abt_pixbuf_to_bgra(&pb, NULL, NULL, &img) != ABT_OK);
+    pb.cs = ABT_CM_RGB; pb.px = NULL;
+    ABT_CHECK(abt_pixbuf_to_bgra(&pb, NULL, NULL, &img) != ABT_OK);
+}
+
+static void test_qoi_encode_limits(void) {
+    uint8_t px[4] = {0, 0, 0, 255};
+    uint8_t* out = (uint8_t*)1;
+    ABT_CHECK(abt_qoi_encode(px, ABT_MAX_DIM + 1, 1, &out) == 0 && out == NULL);
+    out = (uint8_t*)1;
+    ABT_CHECK(abt_qoi_encode(px, 1, ABT_MAX_DIM + 1, &out) == 0 && out == NULL);
+    ABT_CHECK(abt_qoi_encode(px, 0, 1, &out) == 0 && out == NULL);
+    ABT_CHECK(abt_qoi_encode(px, 1, -1, &out) == 0 && out == NULL);
+    ABT_CHECK(abt_qoi_encode(px, 1, 1, &out) > 0 && out != NULL);
+    free(out);
+}
+
 void suite_core(void) {
     test_qoi_roundtrip();
     test_resampler();
     test_base64();
     test_detect();
+    test_detect_precedence();
+    test_xmp_thumbnails();
+    test_pixbuf_validation();
+    test_qoi_encode_limits();
     test_ai_probe();
 }

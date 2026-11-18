@@ -27,7 +27,7 @@ Notes:
   PDFium renders of Illustrator files at 1024 px in 2-18 ms; an Explorer-cache round trip
   through `IThumbnailCache` about 5-6 ms of which our handler is about 0.3 ms on a cache hit.
 
-## Real-world files (sample from this PC)
+## Real-world files (sample from the development PC)
 320 randomly sampled local files (120 .ai, 120 .psd, 40 .eps, 40 .pdf; 8.7 GB; cloud placeholders
 excluded), 256 px, in-process pipeline, warm OS file cache. Aggregates only; no file names recorded.
 

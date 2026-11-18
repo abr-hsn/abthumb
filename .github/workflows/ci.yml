@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache PDFium binaries (pinned by SHA-256 in cmake/pdfium.cmake)
+        uses: actions/cache@v4
+        with:
+          path: third_party/pdfium
+          key: pdfium-${{ hashFiles('cmake/pdfium.cmake') }}
+
+      - name: Build (release)
+        shell: cmd
+        run: build.cmd release
+
+      - name: Unit tests
+        shell: pwsh
+        run: |
+          Push-Location $env:RUNNER_TEMP
+          & "$env:GITHUB_WORKSPACE\build\release\bin\abt_tests.exe"
+          $code = $LASTEXITCODE
+          Pop-Location
+          exit $code
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: abthumb-x64-unsigned
+          path: |
+            build/release/bin/*.exe
+            build/release/bin/*.dll
+          retention-days: 14
+
+  fuzz-smoke:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build fuzzers (libFuzzer + ASan)
+        shell: cmd
+        run: build.cmd fuzz
+
+      - name: Run each fuzzer for 60 s
+        shell: pwsh
+        run: |
+          $asan = Get-ChildItem "${env:ProgramFiles}\Microsoft Visual Studio" -Recurse -Filter clang_rt.asan_dynamic-x86_64.dll -ErrorAction SilentlyContinue |
+                  Select-Object -First 1
+          if (-not $asan) { throw "ASan runtime not found" }
+          $env:PATH = "$($asan.DirectoryName);$env:PATH"
+          New-Item -ItemType Directory -Force build\fuzz\art | Out-Null
+          foreach ($t in "probe", "psd", "qoi") {
+            New-Item -ItemType Directory -Force "build\fuzz\corp\$t" | Out-Null
+            & "build\fuzz\bin\fuzz_$t.exe" -max_total_time=60 -max_len=1000000 -timeout=10 -rss_limit_mb=2048 `
+              "-artifact_prefix=build\fuzz\art\${t}_" "build\fuzz\corp\$t"
+            if ($LASTEXITCODE) { throw "fuzz_$t found a crash" }
+          }
+
+      - name: Upload crash inputs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: build/fuzz/art

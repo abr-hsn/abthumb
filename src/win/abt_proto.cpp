@@ -105,6 +105,30 @@ void init_resp(abt_resp* r, abt_msg msg) {
     r->hr = E_FAIL;
 }
 
+// Anyone can create a pipe with our (predictable) name before the agent does. Only talk to a
+// server running as our user at medium integrity or above. A low-integrity caller (prevhost)
+// cannot open the server process; it then relies on the reply validation below.
+static bool server_trusted(HANDLE pipe) {
+    ULONG pid = 0;
+    if (!GetNamedPipeServerProcessId(pipe, &pid)) return false;
+    if (pid == GetCurrentProcessId()) return true;
+    HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!proc) return is_below_medium_integrity();
+    bool ok = false;
+    HANDLE stok = nullptr, mtok = nullptr;
+    if (OpenProcessToken(proc, TOKEN_QUERY, &stok) && OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mtok)) {
+        uint8_t sb[128], mb[128];
+        DWORD len = 0;
+        ok = !token_below_medium_integrity(stok) && GetTokenInformation(stok, TokenUser, sb, sizeof(sb), &len) &&
+             GetTokenInformation(mtok, TokenUser, mb, sizeof(mb), &len) &&
+             EqualSid(((TOKEN_USER*)sb)->User.Sid, ((TOKEN_USER*)mb)->User.Sid);
+    }
+    if (stok) CloseHandle(stok);
+    if (mtok) CloseHandle(mtok);
+    CloseHandle(proc);
+    return ok;
+}
+
 HRESULT pipe_call(const abt_req& req, const wchar_t* path, DWORD timeout_ms, abt_resp* resp, uint8_t** pixels) {
     *pixels = nullptr;
     wchar_t name[128];
@@ -121,6 +145,10 @@ HRESULT pipe_call(const abt_req& req, const wchar_t* path, DWORD timeout_ms, abt
         if (now >= deadline) return HRESULT_FROM_WIN32(ERROR_TIMEOUT);
         WaitNamedPipeW(name, (DWORD)(deadline - now));
     }
+    if (!server_trusted(h)) {
+        CloseHandle(h);
+        return HRESULT_FROM_WIN32(ERROR_ACCESS_DENIED);
+    }
     HANDLE ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     HRESULT hr = E_FAIL;
     auto left = [&]() -> DWORD {
@@ -136,9 +164,13 @@ HRESULT pipe_call(const abt_req& req, const wchar_t* path, DWORD timeout_ms, abt
         if (plen) memcpy(msg + sizeof(req), path, plen);
         if (write_all_timeout(h, msg, sizeof(req) + plen, left(), ev) &&
             read_all_timeout(h, resp, sizeof(*resp), left(), ev)) {
+            // The response may come from anything that managed to open a pipe with our name, and
+            // callers turn width/height into DIB sizes, so validate in 64-bit with a hard cap.
+            const uint64_t want = (uint64_t)resp->width * resp->height * 4u;
             if (resp->magic != ABT_MAGIC || resp->version != ABT_PROTO_VERSION ||
-                resp->pixel_len > ABT_MAX_PIXEL_BYTES ||
-                (resp->pixel_len && resp->pixel_len != resp->width * resp->height * 4u)) {
+                resp->pixel_len > ABT_MAX_PIXEL_BYTES || resp->width > ABT_MAX_REPLY_DIM ||
+                resp->height > ABT_MAX_REPLY_DIM ||
+                (resp->pixel_len && (resp->pixel_len != want || !resp->width || !resp->height))) {
                 hr = HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
             } else if (resp->pixel_len) {
                 uint8_t* px = (uint8_t*)mem_alloc(resp->pixel_len);

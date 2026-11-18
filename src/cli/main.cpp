@@ -17,7 +17,7 @@ static void usage() {
     fputs(
         "abthumb " ABT_VERSION_STR "\n"
         "usage:\n"
-        "  (install/uninstall: run install.cmd / uninstall.cmd, which use regsvr32)\n"
+        "  (install/uninstall: run abthumb-setup.exe / Settings > Apps)\n"
         "  abthumb stats | ping | stop-agent             talk to the running agent\n"
         "  (developer registration: regsvr32 abthumb.dll  /  regsvr32 /u abthumb.dll)\n"
         "  abthumb status                               show handler registration per extension\n"
@@ -37,7 +37,7 @@ static bool arg_is(const wchar_t* a, const wchar_t* b) { return lstrcmpiW(a, b) 
 
 
 // Registration is deliberately not in this tool: use `regsvr32 abthumb.dll` (machine-wide when
-// elevated, per-user developer mode otherwise) or install.cmd. Unsigned tools that write COM class
+// elevated, per-user developer mode otherwise) or the setup package. Unsigned tools that write COM class
 // registrations get quarantined by antivirus heuristics (D-021).
 
 static int cmd_status() {

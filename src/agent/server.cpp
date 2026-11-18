@@ -33,7 +33,8 @@ static bool make_sd() {
 
 static HANDLE create_instance(bool first) {
     SECURITY_ATTRIBUTES sa = {sizeof(sa), g_sd, FALSE};
-    return CreateNamedPipeW(g_name, PIPE_ACCESS_DUPLEX | (first ? FILE_FLAG_FIRST_PIPE_INSTANCE : 0),
+    return CreateNamedPipeW(g_name,
+                            PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | (first ? FILE_FLAG_FIRST_PIPE_INSTANCE : 0),
                             PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
                             PIPE_UNLIMITED_INSTANCES, 1 << 16, 1 << 16, 0, g_sd ? &sa : nullptr);
 }
@@ -109,7 +110,7 @@ static void serve_image(const abt_req& req, const wchar_t* path, abt_resp* resp,
                 if (!done) {
                     Job* fast = job_submit(path, k, req.page, edge, edge, ABT_MODE_FAST, req.flags | ABT_RF_NO_CACHE,
                                            LANE_FOREGROUND);
-                    JobResult fr;
+                    JobResult fr = {};  // untouched when job_wait times out
                     if (fast && job_wait(fast, 1500, &fr) && SUCCEEDED(fr.hr) && fr.img.px) {
                         resp->hr = S_OK;
                         resp->info = fr.info;
@@ -146,7 +147,7 @@ finish:
         fit_to_box(img, bw, bh);
         resp->width = (uint32_t)img->w;
         resp->height = (uint32_t)img->h;
-        resp->pixel_len = resp->width * resp->height * 4;
+        resp->pixel_len = resp->width * resp->height * 4;  // <= 16384^2*4 after fit_to_box: no wrap
     } else {
         abt_image_free(img);
     }
@@ -156,15 +157,69 @@ finish:
     if (req.msg == ABT_MSG_THUMB && !(req.flags & ABT_RF_FROM_PREWARM)) prewarm_hint_file(path, edge);
 }
 
-static void handle_client(HANDLE p, wchar_t* path) {
+// Who is on the other end. Low-integrity callers (prevhost, sandboxed apps) may only ask for
+// images; anything that steers the agent (quit, folder pre-warm, cache bypass) needs medium IL.
+struct Caller {
+    bool low;   // below medium integrity, or unknown
+    bool self;  // our own process (pre-warm calls through IThumbnailCache)
+};
+
+static Caller identify_caller(HANDLE p) {
+    Caller c = {true, false};
+    ULONG pid = 0;
+    if (GetNamedPipeClientProcessId(p, &pid)) c.self = pid == GetCurrentProcessId();
+    // Clients connect with SECURITY_IDENTIFICATION: enough to read their token, not to act as them.
+    if (ImpersonateNamedPipeClient(p)) {
+        HANDLE tok = nullptr;
+        if (OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, TRUE, &tok)) {
+            c.low = token_below_medium_integrity(tok);
+            CloseHandle(tok);
+        }
+        if (!RevertToSelf()) ExitProcess(1);  // never keep running under a client's identity
+    }
+    return c;
+}
+
+// Paths must be plain drive-letter or UNC paths: no device namespace (\\.\, \\?\GLOBALROOT, \??\),
+// no embedded NULs.
+static bool acceptable_path(const wchar_t* path, uint32_t chars) {
+    if (chars < 3 || wcslen(path) != chars) return false;
+    if (!wcsncmp(path, L"\\\\?\\", 4)) {
+        path += 4;  // long-path prefix: allow \\?\X:\ and \\?\UNC\ only
+        if (!_wcsnicmp(path, L"UNC\\", 4)) return true;
+    } else if (!wcsncmp(path, L"\\\\", 2)) {
+        return path[2] != L'.' && path[2] != L'?';
+    }
+    return iswalpha(path[0]) && path[1] == L':' && path[2] == L'\\';
+}
+
+static const DWORD kIoTimeoutMs = 5000;
+
+static void handle_client(HANDLE p, wchar_t* path, HANDLE ev) {
     abt_req req;
-    if (!read_all(p, &req, sizeof(req)) || req.magic != ABT_MAGIC || req.version != ABT_PROTO_VERSION ||
-        req.path_chars > ABT_MAX_PATH_CHARS)
+    if (!read_all_timeout(p, &req, sizeof(req), kIoTimeoutMs, ev) || req.magic != ABT_MAGIC ||
+        req.version != ABT_PROTO_VERSION || req.path_chars > ABT_MAX_PATH_CHARS ||
+        req.total_len != sizeof(req) + req.path_chars * sizeof(wchar_t))
         return;
-    if (req.path_chars && !read_all(p, path, req.path_chars * sizeof(wchar_t))) return;
+    if (req.path_chars && !read_all_timeout(p, path, req.path_chars * sizeof(wchar_t), kIoTimeoutMs, ev)) return;
     path[req.path_chars] = 0;
+    const Caller caller = identify_caller(p);
     abt_resp resp;
     init_resp(&resp, (abt_msg)req.msg);
+    if (caller.low) {
+        req.flags = 0;
+        if (req.msg != ABT_MSG_THUMB && req.msg != ABT_MSG_PREVIEW && req.msg != ABT_MSG_INFO && req.msg != ABT_MSG_PING)
+            req.msg = 0;  // -> E_INVALIDARG below
+    }
+    if (!caller.self) req.flags &= ~ABT_RF_FROM_PREWARM;
+    bool image = req.msg == ABT_MSG_THUMB || req.msg == ABT_MSG_PREVIEW || req.msg == ABT_MSG_INFO;
+    if ((image || req.msg == ABT_MSG_HINT) &&
+        (!acceptable_path(path, req.path_chars) || req.cx > ABT_MAX_REPLY_DIM || req.cy > ABT_MAX_REPLY_DIM ||
+         req.page > 0xFFFF)) {
+        resp.hr = E_INVALIDARG;
+        write_all_timeout(p, &resp, sizeof(resp), kIoTimeoutMs, ev);
+        return;
+    }
     abt_image img = {};
     char* text = nullptr;
     size_t text_len = 0;
@@ -215,33 +270,60 @@ static void handle_client(HANDLE p, wchar_t* path) {
         resp.hr = E_INVALIDARG;
         break;
     }
-    if (write_all(p, &resp, sizeof(resp)) && resp.pixel_len) write_all(p, text ? (void*)text : (void*)img.px, resp.pixel_len);
+    // Bounded writes: a client that stops reading cannot park this thread.
+    const DWORD out_timeout = kIoTimeoutMs + resp.pixel_len / 4096;  // ~4 MB/s floor for big previews
+    if (write_all_timeout(p, &resp, sizeof(resp), kIoTimeoutMs, ev) && resp.pixel_len)
+        write_all_timeout(p, text ? (void*)text : (void*)img.px, resp.pixel_len, out_timeout, ev);
     mem_free(text);
     abt_image_free(&img);
 }
 
+// The client closes its end once it has read the whole reply; wait for that (bounded) so that
+// DisconnectNamedPipe does not discard unread bytes. Replaces an unbounded FlushFileBuffers.
+static void wait_client_close(HANDLE p, HANDLE ev) {
+    uint8_t b;
+    read_all_timeout(p, &b, 1, kIoTimeoutMs, ev);
+}
+
+static bool connect_client(HANDLE p, HANDLE ev) {
+    OVERLAPPED ov = {};
+    ov.hEvent = ev;
+    ResetEvent(ev);
+    if (ConnectNamedPipe(p, &ov)) return true;
+    DWORD e = GetLastError();
+    if (e == ERROR_PIPE_CONNECTED) return true;
+    if (e != ERROR_IO_PENDING) return false;
+    DWORD n = 0;
+    return GetOverlappedResult(p, &ov, &n, TRUE) != 0;  // server_stop connects once per thread
+}
+
 static DWORD WINAPI server_thread(void* arg) {
     wchar_t* path = (wchar_t*)mem_alloc((ABT_MAX_PATH_CHARS + 1) * sizeof(wchar_t));
+    HANDLE ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     HANDLE p = (HANDLE)arg;  // thread 0 receives the first instance
-    while (!g_stop && path) {
+    while (!g_stop && path && ev) {
         if (p == INVALID_HANDLE_VALUE || !p) p = create_instance(false);
         if (p == INVALID_HANDLE_VALUE) { Sleep(100); continue; }
-        BOOL connected = ConnectNamedPipe(p, nullptr) || GetLastError() == ERROR_PIPE_CONNECTED;
-        if (connected && !g_stop) {
-            handle_client(p, path);
-            FlushFileBuffers(p);  // the client must read everything before we disconnect
+        if (connect_client(p, ev) && !g_stop) {
+            handle_client(p, path, ev);
+            wait_client_close(p, ev);
         }
         DisconnectNamedPipe(p);
         CloseHandle(p);
         p = INVALID_HANDLE_VALUE;
     }
+    if (p != INVALID_HANDLE_VALUE && p) CloseHandle(p);
+    if (ev) CloseHandle(ev);
     mem_free(path);
     return 0;
 }
 
 bool server_start(int threads) {
     pipe_name(g_name, _countof(g_name));
-    if (!make_sd()) logf("pipe security descriptor failed: %lu", GetLastError());
+    if (!make_sd()) {  // never fall back to the default DACL
+        logf("pipe security descriptor failed: %lu", GetLastError());
+        return false;
+    }
     g_first = create_instance(true);
     if (g_first == INVALID_HANDLE_VALUE) {
         logf("pipe %ls unavailable (%lu): another agent is running?", g_name, GetLastError());

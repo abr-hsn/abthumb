@@ -103,7 +103,9 @@ DWORD WINAPI request_thread(void* arg) {
     }
     CoUninitialize();
     shared_release(s);
-    return 0;
+    // The thread can outlive every COM object, so DllCanUnloadNow may already say yes: drop the
+    // module reference taken in DoPreview and exit without returning into unloaded code.
+    FreeLibraryAndExitThread(g_dll, 0);
 }
 
 class PreviewHandler final : public IPreviewHandler,
@@ -342,6 +344,13 @@ class PreviewHandler final : public IPreviewHandler,
         SetEvent(m_shared->wake);
         shared_release(m_shared);  // the thread holds its own reference
         m_shared = nullptr;
+        // Free results that were posted before notify was cleared but never delivered.
+        MSG m;
+        while (m_wnd && PeekMessageW(&m, m_wnd, WM_APP_RESULT, WM_APP_RESULT, PM_REMOVE)) {
+            Result* r = (Result*)m.lParam;
+            abt::mem_free(r->px);
+            abt::mem_free(r);
+        }
     }
 
     void reset_file() {
@@ -426,9 +435,17 @@ public:
             InitializeSRWLock(&m_shared->lock);
             m_shared->wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
             m_shared->notify = m_wnd;
-            HANDLE t = CreateThread(nullptr, 0, request_thread, m_shared, 0, nullptr);
+            HMODULE pin = nullptr;  // released by the thread (FreeLibraryAndExitThread)
+            bool pinned = GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, (LPCWSTR)&request_thread, &pin) != 0;
+            HANDLE t = m_shared->wake && pinned ? CreateThread(nullptr, 0, request_thread, m_shared, 0, nullptr) : nullptr;
             if (t) CloseHandle(t);
-            else { shared_release(m_shared); shared_release(m_shared); m_shared = nullptr; return E_FAIL; }
+            else {
+                if (pin) FreeLibrary(pin);
+                shared_release(m_shared);
+                shared_release(m_shared);
+                m_shared = nullptr;
+                return E_FAIL;
+            }
         }
         request(true);
         return S_OK;

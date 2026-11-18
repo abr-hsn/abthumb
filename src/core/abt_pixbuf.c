@@ -43,7 +43,13 @@ static void lab_to_rgb(uint8_t L8, uint8_t a8, uint8_t b8, uint8_t* r, uint8_t* 
 
 abt_status abt_pixbuf_to_bgra(const abt_pixbuf* pb, abt_cmyk_to_rgb_fn cmyk, void* ctx, abt_image* out) {
     if (!pb || !pb->px || !out || pb->w < 1 || pb->h < 1) return ABT_E_FORMAT;
-    if (pb->nch != 1 && pb->nch != 3 && pb->nch != 4) return ABT_E_FORMAT;
+    if (pb->alpha != 0 && pb->alpha != 1) return ABT_E_FORMAT;
+    switch (pb->cs) {
+    case ABT_CM_GRAY: if (pb->nch != 1) return ABT_E_FORMAT; break;
+    case ABT_CM_RGB: case ABT_CM_LAB: if (pb->nch != 3) return ABT_E_FORMAT; break;
+    case ABT_CM_CMYK: if (pb->nch != 4) return ABT_E_FORMAT; break;
+    default: return ABT_E_UNSUPPORTED;
+    }
     abt_status st = abt_image_alloc(out, pb->w, pb->h);
     if (st != ABT_OK) return st;
     size_t npx = (size_t)pb->w * (size_t)pb->h;

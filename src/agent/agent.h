@@ -50,6 +50,7 @@ struct JobResult {
     uint32_t source;
     uint32_t elapsed_us;
     char reason[100];
+    bool transient;  // failure not caused by the file (spawn, OOM, foreground timeout): never negative-cached
 };
 
 // Submits (or joins an identical in-flight) job and returns a referenced handle.

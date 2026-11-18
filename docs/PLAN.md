@@ -89,14 +89,14 @@ DECISIONS.md
 3d. PDF: PDFium render, /Thumb and XMP fast paths, encrypted files.
 3e. Pre-warm: folder hints, Explorer watcher, Explorer thumbcache population, adaptive sizes, change watcher, throttling (EcoQoS, battery, full-screen, load).
 3f. Preview pane: fit-to-pane render at device pixels, re-render on resize, artboard/page navigation, info strip.
-* **Done when:** the generated corpus renders through the shell for every format with the accuracy thresholds met, and the perf budgets in section 0 hold on this PC.
+* **Done when:** the generated corpus renders through the shell for every format with the accuracy thresholds met, and the perf budgets in section 0 hold on the development PC.
 
 ### Step 4: Hardening
 * Corpus generator (Illustrator 2026 / Photoshop 2026 automation saving every legacy version and option combo) + reference PNG exports for accuracy tests.
 * Fuzzing (libFuzzer + ASan) for every parser; malformed/truncated corpus; deadline and memory-cap tests.
 * Benchmarks vs the installed FastPictureViewer Codec Pack: latency percentiles per path, cold/warm, CPU/RAM of agent and workers. `docs/BENCHMARKS.md`.
 * Per-user installer (no admin): copies to `%LOCALAPPDATA%\Programs\abthumb`, registers, starts the agent at logon, Add/Remove Programs entry, clean uninstall that restores previous handlers.
-* **Done when:** zero crashes in fuzzing runs, all tests green, installer round-trips cleanly on this PC, and abthumb is left installed and working.
+* **Done when:** zero crashes in fuzzing runs, all tests green, installer round-trips cleanly on the development PC, and abthumb is left installed and working.
 
 ## 4. Performance techniques (applied throughout)
 * Read the minimum: embedded previews are found by bounded scans of the file head/tail; PSD composites are decoded row-subsampled (only the rows needed for the target size, using the RLE row table to seek).

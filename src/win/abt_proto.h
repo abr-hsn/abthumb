@@ -75,6 +75,7 @@ static_assert(sizeof(abt_resp) % 8 == 0, "abt_resp layout");
 
 #define ABT_MAX_PATH_CHARS 32767
 #define ABT_MAX_PIXEL_BYTES (512u << 20)
+#define ABT_MAX_REPLY_DIM 16384u  // longest edge any reply image may have
 
 namespace abt {
 

@@ -27,7 +27,8 @@ struct Slot {
     bool background;
     HANDLE proc, in_w, out_r;
     DWORD pid;
-    volatile LONG64 deadline;  // GetTickCount64 value, 0 = idle
+    volatile LONG64 deadline;  // GetTickCount64 value, 0 = idle, -1 = killed by the watchdog
+    SRWLOCK proc_lock;         // guards proc against the watchdog (zero-initialised = SRWLOCK_INIT)
     Job* job;
     HANDLE thread;
     uint64_t jobs_done;
@@ -185,8 +186,11 @@ static void finish(Job* j) {
 static void slot_close(Slot* s) {
     if (s->in_w) CloseHandle(s->in_w);
     if (s->out_r) CloseHandle(s->out_r);
+    AcquireSRWLockExclusive(&s->proc_lock);
     if (s->proc) CloseHandle(s->proc);
-    s->in_w = s->out_r = s->proc = nullptr;
+    s->proc = nullptr;
+    ReleaseSRWLockExclusive(&s->proc_lock);
+    s->in_w = s->out_r = nullptr;
     s->pid = 0;
 }
 
@@ -227,7 +231,15 @@ static bool slot_spawn(Slot* s) {
     CloseHandle(child_in);
     CloseHandle(child_out);
     if (!ok) { logf("worker spawn failed: %lu", GetLastError()); slot_close(s); return false; }
-    if (g_job_obj) AssignProcessToJobObject(g_job_obj, pi.hProcess);
+    // Never run a worker outside the job (memory cap, kill-on-close).
+    if (!g_job_obj || !AssignProcessToJobObject(g_job_obj, pi.hProcess)) {
+        logf("worker job assignment failed: %lu", GetLastError());
+        TerminateProcess(pi.hProcess, 1);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        slot_close(s);
+        return false;
+    }
     ResumeThread(pi.hThread);
     CloseHandle(pi.hThread);
     s->proc = pi.hProcess;
@@ -242,6 +254,7 @@ static void run_job(Slot* s, Job* j) {
     r.hr = E_FAIL;
     if (!s->proc && !slot_spawn(s)) {
         lstrcpynA(r.reason, "cannot start render worker", sizeof(r.reason));
+        r.transient = true;
         return;
     }
     size_t plen = (size_t)lstrlenW(j->path);
@@ -258,13 +271,15 @@ static void run_job(Slot* s, Job* j) {
     bool ok = write_all(s->in_w, &req, sizeof(req)) && write_all(s->in_w, j->path, plen * sizeof(wchar_t)) &&
               read_all(s->out_r, &resp, sizeof(resp)) && resp.magic == ABT_MAGIC &&
               resp.pixel_len <= ABT_MAX_PIXEL_BYTES &&
-              (!resp.pixel_len || resp.pixel_len == resp.width * resp.height * 4u);
+              (!resp.pixel_len || resp.pixel_len == (uint64_t)resp.width * resp.height * 4u);
     if (ok && resp.pixel_len) {
         if (abt_image_alloc(&r.img, (int)resp.width, (int)resp.height) != ABT_OK) ok = false;
         else if (!read_all(s->out_r, r.img.px, resp.pixel_len)) { abt_image_free(&r.img); ok = false; }
         else abt_image_scan_alpha(&r.img);
     }
     LONG64 dl = InterlockedExchange64(&s->deadline, 0);
+    // A worker the watchdog killed is never reused, even if its reply had already arrived.
+    if (dl == -1 && ok) { ok = false; abt_image_free(&r.img); }
     if (!ok) {
         bool killed = dl == -1;  // watchdog marks with -1 after terminating
         DWORD code = 0;
@@ -273,13 +288,19 @@ static void run_job(Slot* s, Job* j) {
         if (killed) InterlockedIncrement64(&g_kills); else InterlockedIncrement64(&g_crashes);
         if (s->proc) TerminateProcess(s->proc, 1);
         slot_close(s);
+        r.transient = killed && j->lane == LANE_FOREGROUND;  // may only mean a busy machine
         r.hr = killed ? HRESULT_FROM_WIN32(ERROR_TIMEOUT) : HRESULT_FROM_WIN32(ERROR_FILE_CORRUPT);
         lstrcpynA(r.reason, killed ? "render timed out" : "render worker crashed", sizeof(r.reason));
         return;
     }
     s->jobs_done++;
+    // The worker parses untrusted files, so its reply is untrusted too.
     r.hr = resp.hr;
+    if (SUCCEEDED(r.hr) && !r.img.px && j->mode != ABT_MODE_PROBE) r.hr = E_FAIL;
+    if (r.hr == E_OUTOFMEMORY) r.transient = true;
     r.info = resp.info;
+    r.info.creator[sizeof(r.info.creator) - 1] = 0;
+    r.info.version[sizeof(r.info.version) - 1] = 0;
     r.source = resp.source;
     r.elapsed_us = resp.elapsed_us;
     memcpy(r.reason, resp.reason, sizeof(r.reason));
@@ -295,7 +316,7 @@ static void store_result(Job* j) {
         if (r.source & ABT_SRC_RENDERED) f |= CF_RENDERED;
         if (r.source & ABT_SRC_SCALED) f |= CF_SCALED;
         cache_put(j->key, j->page, j->tier, &r.img, f, r.info);
-    } else if (j->mode == ABT_MODE_AUTO && FAILED(r.hr)) {
+    } else if (j->mode == ABT_MODE_AUTO && FAILED(r.hr) && !r.transient) {
         cache_put(j->key, j->page, j->tier, nullptr, CF_NEGATIVE, r.info);  // never retry until the file changes
     }
 }
@@ -359,8 +380,9 @@ static DWORD WINAPI watchdog_thread(void*) {
             Slot* s = &g_slots[i];
             LONG64 dl = s->deadline;
             if (dl > 0 && now > (ULONGLONG)dl && InterlockedCompareExchange64(&s->deadline, -1, dl) == dl) {
-                HANDLE h = s->proc;
-                if (h) TerminateProcess(h, 0xAB7);
+                AcquireSRWLockShared(&s->proc_lock);
+                if (s->proc) TerminateProcess(s->proc, 0xAB7);
+                ReleaseSRWLockShared(&s->proc_lock);
             }
         }
     }

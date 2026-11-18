@@ -238,14 +238,6 @@ static void parse_resources(const uint8_t* d, size_t n, size_t start, size_t end
     }
 }
 
-static int key_is_big(const uint8_t* k) {
-    static const char* big[] = {"LMsk", "Lr16", "Lr32", "Layr", "Mt16", "Mt32", "Mtrn", "Alph", "FMsk",
-                                "lnk2", "FEid", "FXid", "PxSD"};
-    for (size_t i = 0; i < sizeof(big) / sizeof(big[0]); ++i)
-        if (memcmp(k, big[i], 4) == 0) return 1;
-    return 0;
-}
-
 /* Finds the Lr16/Lr32/Layr tagged block following the Layer Info; returns its data offset+length. */
 static int find_layer_block(const uint8_t* d, size_t n, size_t after_info, size_t end, int psb, size_t* off, size_t* len) {
     if (end > n) end = n;
@@ -261,7 +253,7 @@ static int find_layer_block(const uint8_t* d, size_t n, size_t after_info, size_
         const uint8_t* key = d + p + 4;
         size_t hl = 8;
         uint64_t l;
-        if (psb && (sig8 || key_is_big(key))) {
+        if (psb && (sig8 || abt_psd_key_is_big(key))) {
             if (p + 16 > end) break;
             l = ((uint64_t)abt_load_u32be(d + p + 8) << 32) | abt_load_u32be(d + p + 12);
             hl = 16;
@@ -364,8 +356,8 @@ abt_status abt_probe_psd(const uint8_t* d, size_t n, abt_probe* out) {
         if (!lr.err && lil >= 2 && lil <= abt_rd_left(&lr)) {
             count = (int16_t)abt_rd_u16be(&lr);
         }
-        if (count == 0 && !lr.err) {
-            size_t after = info_start + (size_t)(lil <= lend - info_start ? lil : 0);
+        if (count == 0 && !lr.err && lil <= lend - info_start) {
+            size_t after = info_start + (size_t)lil;
             size_t boff, blen;
             if (find_layer_block(d, n, after, lend, H.psb, &boff, &blen) && blen >= 2)
                 count = (int16_t)abt_load_u16be(d + boff);
@@ -418,10 +410,11 @@ static abt_status src_init(chan_src* s, size_t total_channels) {
         }
     } else if (s->comp == 2 || s->comp == 3) {
         size_t total = s->rb * (size_t)s->h * (size_t)s->nneed;
-        if (total > ((size_t)1 << 30)) return ABT_E_LIMIT;
+        size_t avail = s->base <= s->n ? s->n - s->base : 0;
+        /* deflate expands at most ~1032:1 */
+        if (total > ((size_t)256 << 20) || total > (uint64_t)avail * 1032 + ((uint64_t)1 << 20)) return ABT_E_LIMIT;
         s->zip = (uint8_t*)malloc(total ? total : 1);
         if (!s->zip) return ABT_E_NOMEM;
-        size_t avail = s->base <= s->n ? s->n - s->base : 0;
         abt_psd_inflate(s->d + s->base, avail, s->zip, total);
         if (s->comp == 3) abt_psd_unpredict(s->zip, (size_t)s->h * (size_t)s->nneed, s->w, s->depth);
     }
@@ -528,10 +521,9 @@ abt_status abt_psd_decode_composite(const uint8_t* d, size_t n, const abt_probe*
     uint8_t mat255[256], mat128[256];
     for (int a = 0; a < 256; ++a) { mat255[a] = (uint8_t)(255 - a); mat128[a] = (uint8_t)((128 * (255 - a) + 127) / 255); }
 
-    int rows_done = 0;
     st = ABT_OK;
     for (int y = abt_rs_next_needed(rs, 0); y < h; y = abt_rs_next_needed(rs, y + 1)) {
-        if ((rows_done++ & 63) == 0 && o->cancel && *o->cancel) { st = ABT_E_CANCELLED; break; }
+        if (o->cancel && *o->cancel) { st = ABT_E_CANCELLED; break; }
         for (int c = 0; c < nneed; ++c) {
             const uint8_t* src = src_row(&s, c, y);
             int is_alpha = c == acol;
@@ -597,7 +589,8 @@ int abt_psd_layer_info(const uint8_t* d, size_t n, const abt_probe* pr, size_t* 
     if (lil >= 2 && lil <= lend - is) {
         if ((int16_t)abt_load_u16be(d + is) != 0) { *off = is; *len = (size_t)lil; return 1; }
     }
-    size_t after = is + (size_t)(lil <= lend - is ? lil : 0);
+    if (lil > lend - is) return 0;
+    size_t after = is + (size_t)lil;
     size_t boff, blen;
     if (find_layer_block(d, n, after, lend, psb, &boff, &blen) && blen >= 2) { *off = boff; *len = blen; return 1; }
     return 0;

@@ -101,28 +101,54 @@ HRESULT render_ghostscript(const wchar_t* path, const abt_probe& pr, const Rende
     if (dpi > 2400) dpi = 2400;
 
     wchar_t cmd[MAX_PATH * 3];
-    _snwprintf_s(cmd, _countof(cmd), _TRUNCATE,
-                 L"\"%s\" -q -dSAFER -dBATCH -dNOPAUSE -dNOPROMPT -dEPSCrop -sDEVICE=ppmraw -r%.3f "
-                 L"-dTextAlphaBits=4 -dGraphicsAlphaBits=4 -sOutputFile=- -f \"%s\"",
-                 g_gs, dpi, path);
+    // Refuse rather than truncate: a cut-off command line would name a different file.
+    if (_snwprintf_s(cmd, _countof(cmd), _TRUNCATE,
+                     L"\"%s\" -q -dSAFER -dBATCH -dNOPAUSE -dNOPROMPT -dEPSCrop -sDEVICE=ppmraw -r%.3f "
+                     L"-dTextAlphaBits=4 -dGraphicsAlphaBits=4 -sOutputFile=- -f \"%s\"",
+                     g_gs, dpi, path) < 0)
+        return E_INVALIDARG;
 
+    // gs dies with this worker (nested job), and inherits only its own stdio: if it inherited
+    // the worker's agent pipes it could keep them open after a deadline kill and stall the agent.
+    static HANDLE s_gs_job = nullptr;
+    if (!s_gs_job) {
+        s_gs_job = CreateJobObjectW(nullptr, nullptr);
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION li = {};
+        li.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
+        if (s_gs_job) SetInformationJobObject(s_gs_job, JobObjectExtendedLimitInformation, &li, sizeof(li));
+    }
     SECURITY_ATTRIBUTES sa = {sizeof(sa), nullptr, TRUE};
     HANDLE rd = nullptr, wr = nullptr;
     if (!CreatePipe(&rd, &wr, &sa, 1 << 20)) return E_FAIL;
     SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
     HANDLE nul = CreateFileW(L"NUL", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa,
                              OPEN_EXISTING, 0, nullptr);
-    STARTUPINFOW si = {sizeof(si)};
-    si.dwFlags = STARTF_USESTDHANDLES;
-    si.hStdInput = nul;
-    si.hStdOutput = wr;
-    si.hStdError = nul;
+    if (nul == INVALID_HANDLE_VALUE) { CloseHandle(rd); CloseHandle(wr); return E_FAIL; }
+    SIZE_T attr_size = 0;
+    InitializeProcThreadAttributeList(nullptr, 1, 0, &attr_size);
+    LPPROC_THREAD_ATTRIBUTE_LIST attrs = (LPPROC_THREAD_ATTRIBUTE_LIST)malloc(attr_size);
+    HANDLE inherit[2] = {nul, wr};
+    BOOL ok = attrs && InitializeProcThreadAttributeList(attrs, 1, 0, &attr_size) &&
+              UpdateProcThreadAttribute(attrs, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherit, sizeof(inherit), nullptr,
+                                        nullptr);
+    STARTUPINFOEXW si = {};
+    si.StartupInfo.cb = sizeof(si);
+    si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    si.StartupInfo.hStdInput = nul;
+    si.StartupInfo.hStdOutput = wr;
+    si.StartupInfo.hStdError = nul;
+    si.lpAttributeList = attrs;
     PROCESS_INFORMATION pi = {};
-    BOOL ok = CreateProcessW(nullptr, cmd, nullptr, nullptr, TRUE, CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS,
-                             nullptr, nullptr, &si, &pi);
+    if (ok)
+        ok = CreateProcessW(nullptr, cmd, nullptr, nullptr, TRUE,
+                            CREATE_NO_WINDOW | CREATE_SUSPENDED | BELOW_NORMAL_PRIORITY_CLASS | EXTENDED_STARTUPINFO_PRESENT,
+                            nullptr, nullptr, &si.StartupInfo, &pi);
+    if (attrs) { DeleteProcThreadAttributeList(attrs); free(attrs); }
     CloseHandle(wr);
-    if (nul != INVALID_HANDLE_VALUE) CloseHandle(nul);
+    CloseHandle(nul);
     if (!ok) { CloseHandle(rd); return E_FAIL; }
+    if (s_gs_job) AssignProcessToJobObject(s_gs_job, pi.hProcess);
+    ResumeThread(pi.hThread);
 
     // Read all output (synchronous pipe; the agent's deadline kills us if gs hangs, and the
     // child is in our job object so it dies with us).

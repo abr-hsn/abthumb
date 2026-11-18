@@ -9,4 +9,4 @@ Get-CimInstance Win32_Process -Filter "Name='explorer.exe'" | Where-Object {
 } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
 Start-Sleep -Milliseconds 800
 Get-ChildItem $dir -Filter "thumbcache_*.db" | ForEach-Object { Remove-Item $_.FullName -Force }
-Start-Process explorer.exe
+Start-Process (Join-Path $env:SystemRoot "explorer.exe")

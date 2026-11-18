@@ -50,10 +50,6 @@ DWORD reg_get_dword(HKEY root, const wchar_t* key, const wchar_t* name, DWORD de
     return def;
 }
 
-}  // namespace abt
-
-namespace abt {
-
 bool is_elevated() {
     HANDLE tok = nullptr;
     if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) return false;
@@ -62,6 +58,23 @@ bool is_elevated() {
     bool r = GetTokenInformation(tok, TokenElevation, &el, sizeof(el), &len) && el.TokenIsElevated;
     CloseHandle(tok);
     return r;
+}
+
+bool token_below_medium_integrity(HANDLE tok) {
+    uint8_t buf[64];  // TOKEN_MANDATORY_LABEL + one SID with a single sub-authority
+    DWORD len = 0;
+    if (!GetTokenInformation(tok, TokenIntegrityLevel, buf, sizeof(buf), &len)) return true;
+    PSID sid = ((TOKEN_MANDATORY_LABEL*)buf)->Label.Sid;
+    UCHAR n = *GetSidSubAuthorityCount(sid);
+    return n == 0 || *GetSidSubAuthority(sid, n - 1) < SECURITY_MANDATORY_MEDIUM_RID;
+}
+
+bool is_below_medium_integrity() {
+    HANDLE tok = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) return true;
+    bool low = token_below_medium_integrity(tok);
+    CloseHandle(tok);
+    return low;
 }
 
 }  // namespace abt

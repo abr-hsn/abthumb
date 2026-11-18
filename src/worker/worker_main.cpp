@@ -59,9 +59,15 @@ int wmain(int argc, wchar_t** argv) {
         resp.elapsed_us = rr.elapsed_us;
         lstrcpynA(resp.reason, rr.reason, sizeof(resp.reason));
         if (SUCCEEDED(rr.hr) && rr.img.px) {
-            resp.width = (uint32_t)rr.img.w;
-            resp.height = (uint32_t)rr.img.h;
-            resp.pixel_len = resp.width * resp.height * 4;
+            const uint64_t bytes = (uint64_t)rr.img.w * rr.img.h * 4;
+            if (bytes > ABT_MAX_PIXEL_BYTES) {
+                resp.hr = E_OUTOFMEMORY;
+                lstrcpynA(resp.reason, "image too large to send", sizeof(resp.reason));
+            } else {
+                resp.width = (uint32_t)rr.img.w;
+                resp.height = (uint32_t)rr.img.h;
+                resp.pixel_len = (uint32_t)bytes;
+            }
         }
         resp.total_len = sizeof(resp) + resp.pixel_len;
         bool ok = abt::write_all(out, &resp, sizeof(resp)) &&

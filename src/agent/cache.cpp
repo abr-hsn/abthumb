@@ -10,6 +10,7 @@ static const uint32_t kRendererVersion = 1;  // bump when output changes: invali
 static const uint32_t kRecMagic = 0x52544241u;  // "ABTR"
 static const uint32_t kIdxMagic = 0x49544241u;  // "ABTI"
 static const uint64_t kSegMax = 64ull << 20;
+static const uint32_t kMaxRec = 256u << 20;  // a 4096 px QOI can exceed kSegMax (then it gets its own segment)
 static const int kTiers[] = {256, 512, 1024, 2048, 4096};
 static const uint32_t kNegTier = 0xFFFFu;
 static const int kMaxSegs = 4096;
@@ -326,6 +327,10 @@ static bool snapshot_load(uint64_t* seg_sizes_out_ids, uint64_t* seg_sizes, int*
                     Entry e;
                     memcpy(&e, p, sizeof(Entry));
                     p += sizeof(Entry);
+                    // A CRC-valid snapshot can still be stale or hand-edited: keep only sane entries.
+                    if (e.tier == 0 || e.tier == kTomb || e.rec_len < sizeof(RecHdr) || e.rec_len > kMaxRec ||
+                        e.offset > kSegMax)
+                        continue;
                     Entry* s = insert_slot(e.key_hi, e.key_lo, e.page, e.tier);
                     if (s) *s = e;
                 }
@@ -434,12 +439,16 @@ bool cache_get(const FileKey& k, uint32_t page, int edge, abt_image* img, CacheE
         e = find(k.hi, k.lo, page, (uint32_t)t);
         if (!e || e->file_size != k.size || e->mtime != k.mtime) continue;
         Seg* s = seg_by_id(e->seg);
-        if (!s) continue;
+        if (!s || e->rec_len < sizeof(RecHdr) || e->rec_len > kMaxRec) continue;
         body = (uint8_t*)mem_alloc(e->rec_len);
         if (body && pread(s->h, e->offset, body, e->rec_len)) {
             memcpy(&h, body, sizeof(h));
+            // The CRC covers the body only, so check every header field we rely on against the
+            // index entry and the record length before using it.
             if (h.magic == kRecMagic && h.rec_len == e->rec_len &&
-                crc32(0, body + sizeof(h), h.rec_len - sizeof(h)) == h.crc) {
+                (uint64_t)h.info_len + h.payload_len == h.rec_len - sizeof(h) && h.key_hi == e->key_hi &&
+                h.key_lo == e->key_lo && h.page == e->page && h.tier == e->tier && h.mtime == e->mtime &&
+                h.file_size == e->file_size && crc32(0, body + sizeof(h), h.rec_len - sizeof(h)) == h.crc) {
                 found = true;
                 InterlockedExchange(&e->last_access, now_minutes());
                 g_dirty = true;

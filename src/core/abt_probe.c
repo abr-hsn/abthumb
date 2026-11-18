@@ -41,8 +41,6 @@ abt_family abt_detect(const uint8_t* d, size_t n) {
         return ABT_FAM_UNKNOWN;
     }
     if (n >= 4 && d[0] == 0xC5 && d[1] == 0xD0 && d[2] == 0xD3 && d[3] == 0xC6) return ABT_FAM_EPS;
-    size_t head = n < 1024 ? n : 1024;
-    if (abt_memmem(d, head, "%PDF-", 5)) return ABT_FAM_PDF; /* refined to AI by abt_probe_pdf */
     if (n >= 11 && memcmp(d, "%!PS-Adobe-", 11) == 0) {
         size_t lim = n < 8192 ? n : 8192;
         /* first line: "%!PS-Adobe-3.0 EPSF-3.0" marks EPS; Illustrator 1-8 files say Creator: Adobe Illustrator */
@@ -54,6 +52,8 @@ abt_family abt_detect(const uint8_t* d, size_t n) {
         if (ai && !epsf) return ABT_FAM_AI_PS;
         return ABT_FAM_EPS;
     }
+    size_t head = n < 1024 ? n : 1024;
+    if (abt_memmem(d, head, "%PDF-", 5)) return ABT_FAM_PDF; /* refined to AI by abt_probe_pdf */
     return ABT_FAM_UNKNOWN;
 }
 
@@ -157,7 +157,7 @@ int abt_xmp_find_thumbnails(const uint8_t* file, size_t fsize, size_t off, size_
     const uint8_t* p = base;
     int added = 0;
     static const char kImg[] = "xmpGImg:image";
-    while (p < end) {
+    while (p < end && added < 64) {
         const uint8_t* hit = abt_memmem(p, (size_t)(end - p), kImg, sizeof(kImg) - 1);
         if (!hit) break;
         const uint8_t* q = hit + sizeof(kImg) - 1;
@@ -171,7 +171,8 @@ int abt_xmp_find_thumbnails(const uint8_t* file, size_t fsize, size_t off, size_
             data = q + 2;
             data_end = (const uint8_t*)memchr(data, quote, (size_t)(end - data));
         }
-        if (data && data_end && data_end > data) {
+        if (data && !data_end) break; /* unterminated: rescanning from the next hit would be quadratic */
+        if (data && data_end > data) {
             /* width/height are siblings written before the image in Adobe's XMP; search a window around it */
             const uint8_t* lo = hit - 1024 > base ? hit - 1024 : base;
             abt_preview pv;
@@ -258,8 +259,9 @@ abt_status abt_probe_pdf(const uint8_t* d, size_t n, abt_probe* out) {
     size_t head = n < ABT_PDF_HEAD_SCAN ? n : ABT_PDF_HEAD_SCAN;
     /* XMP packet in the head: find its extent so we only scan the packet itself */
     const uint8_t* xmp = abt_memmem(d, head, "<x:xmpmeta", 10);
+    const uint8_t* xend = NULL;
     if (xmp) {
-        const uint8_t* xend = abt_memmem(xmp, (size_t)(d + n - xmp), "</x:xmpmeta>", 12);
+        xend = abt_memmem(xmp, (size_t)(d + n - xmp), "</x:xmpmeta>", 12);
         size_t xlen = xend ? (size_t)(xend - xmp) + 12 : (size_t)(d + head - xmp);
         abt_xmp_find_thumbnails(d, n, (size_t)(xmp - d), xlen, out);
         abt_xmp_creator_tool(xmp, xlen, out->info.creator, sizeof(out->info.creator));
@@ -297,7 +299,6 @@ abt_status abt_probe_pdf(const uint8_t* d, size_t n, abt_probe* out) {
        first artboard. Thumbnails are the first artboard (= PDF page 1, like the preview pane), so a
        preview whose aspect ratio differs from stDim is only a fallback. */
     if (xmp) {
-        const uint8_t* xend = abt_memmem(xmp, (size_t)(d + n - xmp), "</x:xmpmeta>", 12);
         size_t xlen = xend ? (size_t)(xend - xmp) : (size_t)(d + head - xmp);
         float w = abt_xmp_float(xmp, xlen, "stDim:w"), h = abt_xmp_float(xmp, xlen, "stDim:h");
         if (w > 0 && h > 0) {

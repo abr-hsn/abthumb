@@ -84,13 +84,13 @@ HRESULT shell_register(const wchar_t* dll_path, const RegisterOptions& opt) {
         for (const Pair& pr : kPairs) {
             _snwprintf_s(key, _countof(key), _TRUNCATE, L"%s\\%s\\ShellEx\\%s", kClasses, kExtensions[i], pr.iid);
             if (opt.machine) {
-                wchar_t old[64];
+                // Back up whatever we are about to replace. A slot that is already ours (repair,
+                // upgrade) keeps its backup; a slot another program took over since is backed up anew.
+                wchar_t old[256];
                 if (get_sz(root, key, nullptr, old, sizeof(old)) && old[0] && lstrcmpiW(old, pr.clsid) != 0) {
                     wchar_t name[96];
                     _snwprintf_s(name, _countof(name), _TRUNCATE, L"%s|%s", kExtensions[i], pr.iid);
-                    wchar_t existing[64];
-                    if (!get_sz(root, kBackupKey, name, existing, sizeof(existing)))  // keep the first backup
-                        e |= set_sz(root, kBackupKey, name, old);
+                    e |= set_sz(root, kBackupKey, name, old);
                 }
             }
             e |= set_sz(root, key, nullptr, pr.clsid);
@@ -115,9 +115,9 @@ HRESULT shell_unregister(bool machine) {
             const wchar_t* bases[2] = {L"", L"SystemFileAssociations\\"};
             for (int b = 0; b < 2; ++b) {
                 _snwprintf_s(key, _countof(key), _TRUNCATE, L"%s\\%s%s\\ShellEx\\%s", kClasses, bases[b], ext, pr.iid);
-                wchar_t cur[64];
+                wchar_t cur[256];
                 if (!get_sz(root, key, nullptr, cur, sizeof(cur)) || lstrcmpiW(cur, pr.clsid) != 0) continue;
-                wchar_t name[96], old[64];
+                wchar_t name[96], old[256];
                 _snwprintf_s(name, _countof(name), _TRUNCATE, L"%s|%s", ext, pr.iid);
                 if (b == 0 && machine && get_sz(root, kBackupKey, name, old, sizeof(old)) && old[0]) {
                     set_sz(root, key, nullptr, old);  // give the slot back to the previous handler

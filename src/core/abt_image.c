@@ -28,21 +28,6 @@ void abt_image_fill(abt_image* img, uint8_t b, uint8_t g, uint8_t r, uint8_t a) 
     img->has_alpha = a != 255;
 }
 
-void abt_image_flatten(abt_image* img, uint8_t b, uint8_t g, uint8_t r) {
-    size_t n = (size_t)img->w * img->h;
-    uint8_t* p = img->px;
-    for (size_t i = 0; i < n; ++i, p += 4) {
-        unsigned ia = 255u - p[3];
-        if (ia) {
-            p[0] = (uint8_t)(p[0] + (b * ia + 127) / 255);
-            p[1] = (uint8_t)(p[1] + (g * ia + 127) / 255);
-            p[2] = (uint8_t)(p[2] + (r * ia + 127) / 255);
-            p[3] = 255;
-        }
-    }
-    img->has_alpha = 0;
-}
-
 int abt_image_scan_alpha(abt_image* img) {
     size_t n = (size_t)img->w * img->h;
     const uint8_t* p = img->px + 3;
@@ -50,16 +35,6 @@ int abt_image_scan_alpha(abt_image* img) {
     for (size_t i = 0; i < n; ++i, p += 4) if (*p != 255) { any = 1; break; }
     img->has_alpha = any;
     return any;
-}
-
-void abt_premultiply_bgra(uint8_t* p, size_t npx) {
-    for (size_t i = 0; i < npx; ++i, p += 4) {
-        unsigned a = p[3];
-        if (a == 255) continue;
-        p[0] = (uint8_t)((p[0] * a + 127) / 255);
-        p[1] = (uint8_t)((p[1] * a + 127) / 255);
-        p[2] = (uint8_t)((p[2] * a + 127) / 255);
-    }
 }
 
 void abt_fit(int sw, int sh, int edge, int allow_up, int* dw, int* dh) {
@@ -337,8 +312,8 @@ static void put32(uint8_t* p, uint32_t v) {
 
 size_t abt_qoi_encode(const uint8_t* px, int w, int h, uint8_t** out) {
     *out = NULL;
-    if (w <= 0 || h <= 0) return 0;
-    size_t npx = (size_t)w * h;
+    if (w <= 0 || h <= 0 || w > ABT_MAX_DIM || h > ABT_MAX_DIM) return 0;
+    size_t npx = (size_t)w * (size_t)h;
     size_t cap = 14 + npx * 5 + 8;
     uint8_t* b = (uint8_t*)malloc(cap);
     if (!b) return 0;

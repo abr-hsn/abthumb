@@ -23,15 +23,10 @@
 #include <stdlib.h>
 #include <string.h>
 
-void abt_psd_unpackbits(const uint8_t* src, size_t n, uint8_t* dst, size_t want);
-int abt_psd_inflate(const uint8_t* src, size_t n, uint8_t* dst, size_t want);
-void abt_psd_unpredict(uint8_t* buf, size_t rows, int w, int depth);
-void abt_psd_row_to8(const uint8_t* src, int w, int depth, int srgb, uint8_t* dst, int step);
-int abt_psd_layer_info(const uint8_t* d, size_t n, const abt_probe* pr, size_t* off, size_t* len);
-
 #define MAX_LAYERS 8192
 #define MAX_DEPTH 16
-#define ZIP_LIMIT ((size_t)256 << 20)
+#define ZIP_LIMIT ((size_t)32 << 20) /* per channel */
+#define MAX_EDGES 50000
 
 enum { SLOT_A = 4, SLOT_MASK = 5, NSLOT = 6 };
 
@@ -82,14 +77,6 @@ static int is_unrendered_key(const uint8_t* k) {
     return 0;
 }
 
-static int key_is_big(const uint8_t* k) {
-    static const char* big[] = {"LMsk", "Lr16", "Lr32", "Layr", "Mt16", "Mt32", "Mtrn", "Alph", "FMsk",
-                                "lnk2", "FEid", "FXid", "PxSD"};
-    for (size_t i = 0; i < sizeof(big) / sizeof(big[0]); ++i)
-        if (memcmp(k, big[i], 4) == 0) return 1;
-    return 0;
-}
-
 static int is_sig(const uint8_t* p, size_t left) {
     return left >= 4 && (memcmp(p, "8BIM", 4) == 0 || memcmp(p, "8B64", 4) == 0);
 }
@@ -126,7 +113,7 @@ static void parse_extra(ctx* c, abt_rd* x, size_t extra_end, layer* L) {
         uint8_t key[4];
         memcpy(key, p + 4, 4);
         abt_rd_skip(x, 8);
-        uint64_t len = (c->psb && (sig8 || key_is_big(key))) ? abt_rd_u64be(x) : abt_rd_u32be(x);
+        uint64_t len = (c->psb && (sig8 || abt_psd_key_is_big(key))) ? abt_rd_u64be(x) : abt_rd_u32be(x);
         if (x->err || len > abt_rd_left(x)) break;
         const uint8_t* data = abt_rd_ptr(x);
         if ((memcmp(key, "lsct", 4) == 0 || memcmp(key, "lsdk", 4) == 0) && len >= 4)
@@ -174,7 +161,9 @@ static abt_status parse_layers(ctx* c, const abt_probe* pr) {
             uint64_t l = c->psb ? abt_rd_u64be(&r) : abt_rd_u32be(&r);
             int slot = (id >= 0 && id <= 3) ? id : id == -1 ? SLOT_A : id == -2 ? SLOT_MASK : -1;
             if (slot >= 0) { L->ch[slot].len = l; L->ch[slot].off = (size_t)data_rel; }
-            data_rel += l;
+            /* saturate past the file end: such channels are dropped below, and no wrap is possible */
+            if (l > c->n || data_rel > c->n) data_rel = (uint64_t)c->n + 1;
+            else data_rel += l;
         }
         const uint8_t* sig = abt_rd_take(&r, 4);
         if (!sig || memcmp(sig, "8BIM", 4) != 0) break;
@@ -194,8 +183,8 @@ static abt_status parse_layers(ctx* c, const abt_probe* pr) {
         parse_extra(c, &x, extra_end, L);
         abt_rd_seek(&r, extra_end);
     }
-    if (i == 0) return ABT_E_FORMAT;
-    c->count = i; /* layers parsed completely */
+    if (i < cnt) return ABT_E_FORMAT; /* truncated records: the channel data position is unknown */
+    c->count = i;
     size_t base = r.pos;
     for (int k = 0; k < c->count; ++k) {
         layer* L = &c->L[k];
@@ -258,6 +247,9 @@ static int csrc_init(csrc* s, const ctx* c, const lchan* ch, int w, int h) {
     s->base = ch->off + 2;
     s->rb = ((size_t)w * (size_t)c->depth + 7) / 8;
     if (s->comp > 3) return 0;
+    /* a declared length too short for the pixel data would only make us decode zeros */
+    if (s->comp == 0 && (uint64_t)ch->len < 2 + (uint64_t)s->rb * (uint64_t)h) return 0;
+    if (s->comp == 1 && (uint64_t)ch->len < 2 + (uint64_t)h * (c->psb ? 4u : 2u)) return 0;
     s->scratch = (uint8_t*)malloc(s->rb + 8);
     if (!s->scratch) return 0;
     if (s->comp == 1) {
@@ -266,10 +258,12 @@ static int csrc_init(csrc* s, const ctx* c, const lchan* ch, int w, int h) {
         s->data_off = s->base + (size_t)h * (size_t)s->cs;
     } else if (s->comp >= 2) {
         size_t total = s->rb * (size_t)h;
-        if (total > ZIP_LIMIT) { csrc_free(s); return 0; }
+        size_t clen = s->end > s->base ? s->end - s->base : 0;
+        /* deflate expands at most ~1032:1 */
+        if (total > ZIP_LIMIT || total > (uint64_t)clen * 1032 + ((uint64_t)1 << 20)) { csrc_free(s); return 0; }
         s->zip = (uint8_t*)malloc(total);
         if (!s->zip) { csrc_free(s); return 0; }
-        abt_psd_inflate(c->d + s->base, s->end > s->base ? s->end - s->base : 0, s->zip, total);
+        abt_psd_inflate(c->d + s->base, clen, s->zip, total);
         if (s->comp == 3) abt_psd_unpredict(s->zip, (size_t)h, w, s->depth);
     }
     s->valid = 1;
@@ -369,6 +363,7 @@ static float* make_mask_plane(ctx* c, const layer* L, int rx0, int ry0, int rx1,
     if (rs && row && out) {
         int bps = c->depth / 8;
         for (int y = abt_rs_next_needed(rs, 0); y < chh; y = abt_rs_next_needed(rs, y + 1)) {
+            if (cancelled(c)) break;
             const uint8_t* src = csrc_row(&s, g.st + y);
             abt_psd_row_to8(src + (size_t)g.sl * (size_t)bps, cw, c->depth, 0, row, 1);
             abt_rs_push(rs, y, row);
@@ -418,10 +413,10 @@ static fbuf* render_layer(ctx* c, const layer* L) {
     out = (uint8_t*)malloc((size_t)vw * (size_t)vh * (size_t)comps);
     if (!rs || !c8 || !a8 || !row || !out) { c->st = ABT_E_NOMEM; goto done; }
     {
-        int bps = c->depth / 8, ticks = 0;
+        int bps = c->depth / 8;
         int fill_missing = (c->cs == ABT_CM_CMYK) ? 255 : 0;
         for (int y = abt_rs_next_needed(rs, 0); y < chh; y = abt_rs_next_needed(rs, y + 1)) {
-            if ((++ticks & 63) == 0 && cancelled(c)) goto done;
+            if (cancelled(c)) goto done;
             int sy = g.st + y;
             if (ha) {
                 abt_psd_row_to8(csrc_row(&as, sy) + (size_t)g.sl * (size_t)bps, cw, c->depth, 0, a8, 1);
@@ -695,21 +690,24 @@ static int soco_color(const ctx* c, const layer* L, float* col) {
 typedef struct pt { float x, y; } pt;
 typedef struct edge { float x0, y0, x1, y1; } edge;
 
-static void add_edge(edge** e, size_t* n, size_t* cap, pt a, pt b) {
-    if (a.y == b.y) return;
+/* Returns 0 when the edge budget is exhausted or memory ran out. */
+static int add_edge(edge** e, size_t* n, size_t* cap, pt a, pt b) {
+    if (a.y == b.y) return 1;
+    if (*n >= MAX_EDGES) return 0;
     if (*n == *cap) {
         size_t nc = *cap ? *cap * 2 : 256;
         edge* ne = (edge*)realloc(*e, nc * sizeof(edge));
-        if (!ne) return;
+        if (!ne) return 0;
         *e = ne; *cap = nc;
     }
     edge* t = &(*e)[(*n)++];
     t->x0 = a.x; t->y0 = a.y; t->x1 = b.x; t->y1 = b.y;
+    return 1;
 }
 
 /* Parses the vector mask path records into polygon edges in canvas pixel coordinates (closed subpaths only). */
-static edge* vmsk_edges(const ctx* c, const layer* L, size_t* ne, int* invert) {
-    *ne = 0; *invert = 0;
+static edge* vmsk_edges(const ctx* c, const layer* L, size_t* ne, int* invert, int* bad) {
+    *ne = 0; *invert = 0; *bad = 0;
     if (L->vmsk_off >= c->n || L->vmsk_len > c->n - L->vmsk_off || L->vmsk_len < 8 + 26) return NULL;
     const uint8_t* d = c->d + L->vmsk_off;
     size_t n = L->vmsk_len;
@@ -759,12 +757,11 @@ static edge* vmsk_edges(const ctx* c, const layer* L, size_t* ne, int* invert) {
                         float t = (float)s / (float)steps, u = 1.0f - t;
                         float b0 = u * u * u, b1 = 3 * u * u * t, b2 = 3 * u * t * t, b3 = t * t * t;
                         pt cur = {b0 * p0.x + b1 * p1.x + b2 * p2.x + b3 * p3.x, b0 * p0.y + b1 * p1.y + b2 * p2.y + b3 * p3.y};
-                        add_edge(&edges, &cnt, &cap, prev, cur);
+                        if (!add_edge(&edges, &cnt, &cap, prev, cur)) { free(edges); *bad = 1; return NULL; }
                         prev = cur;
                     }
                 }
             }
-            if (cnt > 200000) break;
         } else {
             pos += 26; /* fill rule / clipboard / initial fill records */
         }
@@ -774,11 +771,20 @@ static edge* vmsk_edges(const ctx* c, const layer* L, size_t* ne, int* invert) {
 }
 
 /* Non-zero winding fill with 4 vertical sub-scanlines and exact horizontal coverage, into cov[w*h] over rows [y0,y1). */
-static void raster_edges(const edge* e, size_t ne, int w, int h, float* cov) {
+typedef struct xcross { float x, dir; } xcross;
+
+static int cmp_xcross(const void* a, const void* b) {
+    float x = ((const xcross*)a)->x, y = ((const xcross*)b)->x;
+    return (x > y) - (x < y);
+}
+
+/* Sets c->st on cancel or out of memory. */
+static void raster_edges(ctx* c, const edge* e, size_t ne, int w, int h, float* cov) {
     enum { SS = 4 };
-    float* xs = (float*)malloc(ne * 2 * sizeof(float));
-    if (!xs) return;
+    xcross* xs = (xcross*)malloc(ne * sizeof(xcross));
+    if (!xs) { c->st = ABT_E_NOMEM; return; }
     for (int row = 0; row < h; ++row) {
+        if (cancelled(c)) break;
         float* line = cov + (size_t)row * (size_t)w;
         for (int s = 0; s < SS; ++s) {
             float y = (float)row + ((float)s + 0.5f) / (float)SS;
@@ -789,24 +795,24 @@ static void raster_edges(const edge* e, size_t ne, int w, int h, float* cov) {
                 if (ya > yb) { float t = ya; ya = yb; yb = t; dir = -1; }
                 if (y < ya || y >= yb) continue;
                 float x = e[i].x0 + (y - e[i].y0) * (e[i].x1 - e[i].x0) / (e[i].y1 - e[i].y0);
-                /* encode direction in the sort key via parallel array: store x, then dir below */
-                xs[nx * 2] = x;
-                xs[nx * 2 + 1] = (float)dir;
+                xs[nx].x = x;
+                xs[nx].dir = (float)dir;
                 ++nx;
             }
             if (nx < 2) continue;
-            /* sort pairs by x (insertion sort; crossing counts are small) */
-            for (size_t i = 1; i < nx; ++i) {
-                float kx = xs[i * 2], kd = xs[i * 2 + 1];
-                size_t j = i;
-                while (j > 0 && xs[(j - 1) * 2] > kx) { xs[j * 2] = xs[(j - 1) * 2]; xs[j * 2 + 1] = xs[(j - 1) * 2 + 1]; --j; }
-                xs[j * 2] = kx; xs[j * 2 + 1] = kd;
-            }
+            if (nx > 32) qsort(xs, nx, sizeof(xcross), cmp_xcross);
+            else /* insertion sort for the usual small crossing counts */
+                for (size_t i = 1; i < nx; ++i) {
+                    xcross k = xs[i];
+                    size_t j = i;
+                    while (j > 0 && xs[j - 1].x > k.x) { xs[j] = xs[j - 1]; --j; }
+                    xs[j] = k;
+                }
             int wind = 0;
             for (size_t i = 0; i + 1 < nx; ++i) {
-                wind += (int)xs[i * 2 + 1];
+                wind += (int)xs[i].dir;
                 if (!wind) continue;
-                float xa = xs[i * 2], xb = xs[(i + 1) * 2];
+                float xa = xs[i].x, xb = xs[i + 1].x;
                 if (xb <= 0.0f || xa >= (float)w) continue;
                 if (xa < 0.0f) xa = 0.0f;
                 if (xb > (float)w) xb = (float)w;
@@ -828,7 +834,9 @@ static fbuf* render_shape(ctx* c, const layer* L) {
     if (!soco_color(c, L, col)) return NULL;
     size_t ne;
     int invert;
-    edge* e = vmsk_edges(c, L, &ne, &invert);
+    int bad;
+    edge* e = vmsk_edges(c, L, &ne, &invert, &bad);
+    if (bad) return NULL;
     int w = c->dw, h = c->dh;
     int x0 = 0, y0 = 0, x1 = w, y1 = h;
     if (e && ne) { /* restrict to the polygon's bounding box */
@@ -851,7 +859,8 @@ static fbuf* render_shape(ctx* c, const layer* L) {
         cov = (float*)calloc((size_t)rw * (size_t)rh, sizeof(float));
         if (!cov) { c->st = ABT_E_NOMEM; fbuf_free(f); free(e); return NULL; }
         for (size_t i = 0; i < ne; ++i) { e[i].x0 -= (float)x0; e[i].x1 -= (float)x0; e[i].y0 -= (float)y0; e[i].y1 -= (float)y0; }
-        raster_edges(e, ne, rw, rh, cov);
+        raster_edges(c, e, ne, rw, rh, cov);
+        if (c->st != ABT_OK) { free(cov); fbuf_free(f); free(e); return NULL; }
     }
     int nc = c->nch, comps = nc + 1;
     for (int y = 0; y < rh; ++y)
@@ -879,8 +888,20 @@ static void comp_range(ctx* c, fbuf* B, int lo, int hi, int depth);
 static float layer_opacity(const layer* L) { return (L->opacity / 255.0f) * (L->fill / 255.0f); }
 static int is_group_div(const layer* L) { return L->divider != 0; }
 
+/* True if some visible non-divider layer in (lo, hi) can draw something. */
+static int range_has_content(const ctx* c, int lo, int hi) {
+    for (int k = lo; k < hi; ++k) {
+        const layer* L = &c->L[k];
+        if (is_group_div(L) || (L->flags & 2)) continue;
+        if (L->soco_len) return 1;
+        for (int s = 0; s < SLOT_A; ++s) if (L->ch[s].len >= 2) return 1;
+    }
+    return 0;
+}
+
 static void do_group(ctx* c, fbuf* B, int open_i, int hdr_i, int depth) {
     const layer* H = &c->L[hdr_i];
+    if (!range_has_content(c, open_i + 1, hdr_i)) return;
     float op = layer_opacity(H);
     int pass = memcmp(H->key, "pass", 4) == 0;
     int masked = H->has_mask && H->ch[SLOT_MASK].len >= 2;

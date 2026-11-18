@@ -1,5 +1,6 @@
 /* PSD / PSB decoding (composite and layer fallback). Requires abt_probe_psd() first. */
 #pragma once
+#include <string.h>
 #include "abt_core.h"
 #include "abt_image.h"
 #include "abt_probe.h"
@@ -21,6 +22,22 @@ typedef struct abt_pixbuf {
 } abt_pixbuf;
 
 void abt_pixbuf_free(abt_pixbuf* pb);
+
+/* Internal helpers shared by abt_psd.c and abt_psd_layers.c (defined in abt_psd.c). */
+void abt_psd_unpackbits(const uint8_t* src, size_t n, uint8_t* dst, size_t want);
+int abt_psd_inflate(const uint8_t* src, size_t n, uint8_t* dst, size_t want);
+void abt_psd_unpredict(uint8_t* buf, size_t rows, int w, int depth);
+void abt_psd_row_to8(const uint8_t* src, int w, int depth, int srgb, uint8_t* dst, int step);
+int abt_psd_layer_info(const uint8_t* d, size_t n, const abt_probe* pr, size_t* off, size_t* len);
+
+/* Tagged-block keys whose length field is 8 bytes in PSB files. */
+static inline int abt_psd_key_is_big(const uint8_t* k) {
+    static const char* const big[] = {"LMsk", "Lr16", "Lr32", "Layr", "Mt16", "Mt32", "Mtrn", "Alph", "FMsk",
+                                      "lnk2", "FEid", "FXid", "PxSD"};
+    for (size_t i = 0; i < sizeof(big) / sizeof(big[0]); ++i)
+        if (memcmp(k, big[i], 4) == 0) return 1;
+    return 0;
+}
 
 typedef struct abt_psd_opts {
     int dst_w, dst_h;            /* exact output size, <= document size (use abt_fit with allow_up=0) */

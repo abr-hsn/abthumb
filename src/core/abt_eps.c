@@ -301,7 +301,7 @@ static void scan_epsi(abt_probe* out, const uint8_t* d, const uint8_t* ps, size_
     const uint8_t* e = line_end(b, end);
     double v[4];
     if (parse_nums(b + 15, e, v, 3) < 3) return;
-    if (v[0] < 1 || v[1] < 1 || v[0] > ABT_MAX_DIM || v[1] > ABT_MAX_DIM) return;
+    if (!(v[0] >= 1 && v[0] <= ABT_MAX_DIM && v[1] >= 1 && v[1] <= ABT_MAX_DIM && v[2] >= 1 && v[2] <= 8)) return;
     uint32_t depth = (uint32_t)v[2];
     if (depth != 1 && depth != 2 && depth != 4 && depth != 8) return;
     const uint8_t* start = next_line(e, end);
@@ -399,6 +399,7 @@ abt_status abt_probe_eps(const uint8_t* d, size_t n, abt_probe* out) {
    fetched when this was written, so this follows the PostScript image-operator rule the spec
    references; it matches ps2epsi output. Rows are padded to a byte boundary. */
 abt_status abt_epsi_decode(const uint8_t* d, size_t n, const abt_preview* pv, abt_image* out) {
+    memset(out, 0, sizeof(*out));
     if (!pv || pv->offset > n || pv->length > n - pv->offset) return ABT_E_FORMAT;
     uint32_t depth = pv->bits;
     if (depth != 1 && depth != 2 && depth != 4 && depth != 8) return ABT_E_UNSUPPORTED;

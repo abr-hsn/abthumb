@@ -17,11 +17,7 @@ typedef struct abt_image {
 abt_status abt_image_alloc(abt_image* img, int w, int h); /* zero-filled (transparent) */
 void abt_image_free(abt_image* img);
 void abt_image_fill(abt_image* img, uint8_t b, uint8_t g, uint8_t r, uint8_t a);
-/* Composite premultiplied image over an opaque colour in place (result opaque). */
-void abt_image_flatten(abt_image* img, uint8_t b, uint8_t g, uint8_t r);
 int abt_image_scan_alpha(abt_image* img); /* sets and returns has_alpha */
-
-void abt_premultiply_bgra(uint8_t* px, size_t npx);
 
 /* Fit (sw, sh) inside an edge x edge box keeping aspect ratio. allow_up=0 never enlarges.
    Results are at least 1x1. */

@@ -46,7 +46,9 @@ HRESULT request_image(uint16_t msg, const wchar_t* path, UINT cx, UINT cy, UINT 
     if (in_agent()) req.flags |= ABT_RF_FROM_PREWARM;
     const DWORD timeout = msg == ABT_MSG_PREVIEW ? 30000 : 15000;
     HRESULT hr = abt::pipe_call(req, path, timeout, resp, px);
-    if (hr == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) && !in_agent()) {
+    // Never start the agent from a low-integrity host (prevhost): it would inherit low integrity,
+    // could not use its cache, and would hold the pipe name against the real agent.
+    if (hr == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) && !in_agent() && !abt::is_below_medium_integrity()) {
         // No agent yet: start it once (serialised across threads) and retry for up to 3 s.
         AcquireSRWLockExclusive(&g_start_lock);
         hr = abt::pipe_call(req, path, timeout, resp, px);
@@ -82,9 +84,10 @@ HRESULT make_bitmap(const uint8_t* px, int w, int h, HBITMAP* out, WTS_ALPHATYPE
             uint8_t* o = d + i * 4;
             unsigned a = s[3];
             if (a == 0) { o[0] = o[1] = o[2] = o[3] = 0; continue; }
-            o[0] = (uint8_t)((s[0] * 255u + a / 2) / a);
-            o[1] = (uint8_t)((s[1] * 255u + a / 2) / a);
-            o[2] = (uint8_t)((s[2] * 255u + a / 2) / a);
+            for (int c = 0; c < 3; ++c) {
+                unsigned v = (s[c] * 255u + a / 2) / a;  // clamp: input may not be valid premultiplied
+                o[c] = (uint8_t)(v > 255 ? 255 : v);
+            }
             o[3] = (uint8_t)a;
         }
         *alpha = WTSAT_ARGB;

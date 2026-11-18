@@ -184,7 +184,7 @@ void cmyk_xform_destroy(CmykXform* x) {
 
 extern "C" int cmyk_xform_fn(void* ctx, const uint8_t* cmyk, uint8_t* rgb, size_t n) {
     CmykXform* x = (CmykXform*)ctx;
-    if (!x || n > 0x7FFFFFFF) return 0;
+    if (!x || n > 0x3FFFFFFF) return 0;  // n * 4 must fit the DWORD stride below
     // ICM's BM_CMYKQUADS is a little-endian DWORD 0xCCMMYYKK, i.e. bytes K,Y,M,C in memory, and
     // BM_RGBTRIPLETS is B,G,R in memory (both verified with pure ink patches: `abthumb cmyktest`).
     uint8_t* bgr = (uint8_t*)mem_alloc(n * 3);

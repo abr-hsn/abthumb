@@ -44,6 +44,9 @@ DWORD reg_get_dword(HKEY root, const wchar_t* key, const wchar_t* name, DWORD de
 
 // True when the process token is elevated (admin).
 bool is_elevated();
+// True for low/untrusted integrity processes (prevhost, sandboxed apps) or when it cannot be read.
+bool is_below_medium_integrity();
+bool token_below_medium_integrity(HANDLE token);
 
 // ---- simple heap helpers (process heap, no CRT new/delete in hot paths)
 inline void* mem_alloc(size_t n) { return HeapAlloc(GetProcessHeap(), 0, n); }
