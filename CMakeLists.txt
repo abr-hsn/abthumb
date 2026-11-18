@@ -59,6 +59,11 @@ set_source_files_properties(third_party/miniz/miniz.c PROPERTIES COMPILE_OPTIONS
 target_include_directories(abt_core PUBLIC src/core PRIVATE third_party/miniz)
 
 if(ABT_FUZZ)
+  # Coverage feedback for the code under test: /fsanitize=fuzzer on the targets alone only
+  # instruments the harness, which leaves libFuzzer mutating blind.
+  target_compile_options(abt_core PRIVATE
+    /fsanitize-coverage=inline-8bit-counters /fsanitize-coverage=edge
+    /fsanitize-coverage=trace-cmp /fsanitize-coverage=trace-div)
   # libFuzzer targets (tests/fuzz): only abt_core + fuzzers are built.
   foreach(t probe psd qoi)
     add_executable(fuzz_${t} tests/fuzz/fuzz_${t}.c)

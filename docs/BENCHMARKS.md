@@ -44,6 +44,13 @@ no render fallback for PDFs without an XMP thumbnail). Failures: abthumb 7 (3 un
 files, PostScript-only files without Ghostscript), FastPictureViewer 39.
 
 ## Robustness
+**Correction (2026-11-18 audit):** the runs below were built without coverage instrumentation of
+`abt_core` (only the harness was instrumented, 56 counters), so libFuzzer was mutating almost
+blind and the execution counts overstate what was tested. With `/fsanitize-coverage` on
+`abt_core` the targets expose 1440 (probe), 2800 (psd) and 200 (qoi) counters. 2-minute
+instrumented runs of all three targets were clean. Longer runs are still to do.
+
+Original (uninstrumented) runs:
 libFuzzer + ASan, about 4 minutes per target (`tests/fuzz`): `fuzz_probe` 11.9 M executions,
 `fuzz_qoi` 41.8 M, `fuzz_psd` 68.6 k (large seeds, low coverage: worth a longer run). One bug found
 and fixed (QOI header claiming more pixels than its payload could encode forced a multi-GB
