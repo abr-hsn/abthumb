@@ -136,7 +136,19 @@ HRESULT render_pdf(const uint8_t* data, size_t size, const RenderRequest& rq, ab
                     FPDFBitmap_Destroy(bmp);
                 }
                 if (FAILED(hr)) abt_image_free(out);
-                else out->has_alpha = 0;  // filled white, opaque
+                else {
+                    out->has_alpha = 0;  // filled white, opaque
+                    // Nothing visible on the page (no objects, or only white / invisible ones): the
+                    // preview pane skips such artboards instead of showing a blank one (D-031).
+                    bool empty = FPDFPage_CountObjects(page) == 0;
+                    if (!empty) {
+                        const uint32_t* p = (const uint32_t*)out->px;
+                        size_t n = (size_t)dw * dh, i = 0;
+                        while (i < n && p[i] == 0xFFFFFFFFu) ++i;
+                        empty = i == n;
+                    }
+                    if (empty) info->flags |= ABT_INFO_PAGE_EMPTY;
+                }
             }
         }
         FPDF_ClosePage(page);

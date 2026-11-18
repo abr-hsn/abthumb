@@ -40,7 +40,8 @@ struct Shared {
 struct Result {
     int gen, file_gen, page;
     int req_w, req_h;
-    bool quick;  // low-res first paint from the thumbnail tier
+    bool quick;      // low-res first paint from the thumbnail tier
+    bool info_only;  // prefetch learned something about a page (e.g. it is empty); no pixels
     HRESULT hr;
     int w, h;
     uint8_t* px;  // premultiplied BGRA
@@ -104,15 +105,28 @@ Result* fetch(uint16_t msg, const wchar_t* path, int cx, int cy, int page, int g
 // Asks the agent to render the pages next to `page` (in the direction of travel first). Each call
 // returns at once; the renders land in the agent's cache, and a later request for one of those pages
 // joins the render if it is still running. Stops as soon as the user asks for something else.
-void prefetch_neighbours(Shared* s, const wchar_t* path, int cx, int cy, int page, int count, int dir) {
-    int order[2] = {page + (dir < 0 ? -1 : 1), page + (dir < 0 ? 1 : -1)};
+// A neighbour already in the cache comes back with its info: an empty artboard is reported to the
+// UI (which skips it, D-031) and the next page in that direction is prefetched instead.
+void prefetch_neighbours(Shared* s, const wchar_t* path, int cx, int cy, int page, int count, int dir, int gen,
+                         int file_gen) {
+    int dirs[2] = {dir < 0 ? -1 : 1, dir < 0 ? 1 : -1};
     for (int i = 0; i < 2; ++i) {
-        int p = order[i];
-        if (p < 0 || p >= count || new_request_pending(s)) continue;
-        abt_resp resp;
-        uint8_t* px = nullptr;
-        request_image(ABT_MSG_PREVIEW, path, (UINT)cx, (UINT)cy, (UINT)p, &resp, &px, ABT_RF_PREFETCH);
-        abt::mem_free(px);
+        for (int p = page + dirs[i], hops = 0; p >= 0 && p < count && hops < 8; p += dirs[i], ++hops) {
+            if (new_request_pending(s)) return;
+            abt_resp resp;
+            uint8_t* px = nullptr;
+            HRESULT hr = request_image(ABT_MSG_PREVIEW, path, (UINT)cx, (UINT)cy, (UINT)p, &resp, &px, ABT_RF_PREFETCH);
+            abt::mem_free(px);
+            if (hr != S_OK || !(resp.info.flags & ABT_INFO_PAGE_EMPTY)) break;  // queued, or a real page
+            Result* r = (Result*)abt::mem_zalloc(sizeof(Result));
+            if (!r) return;
+            r->gen = gen;
+            r->file_gen = file_gen;
+            r->page = p;
+            r->info_only = true;
+            r->info = resp.info;
+            post_result(s, r);
+        }
     }
 }
 
@@ -150,7 +164,7 @@ DWORD WINAPI request_thread(void* arg) {
                 post_result(s, r);
             }
         }
-        if (count > 1) prefetch_neighbours(s, path, cx, cy, page, count, dir);
+        if (count > 1) prefetch_neighbours(s, path, cx, cy, page, count, dir, gen, file_gen);
         abt::mem_free(path);
     }
     CoUninitialize();
@@ -228,6 +242,14 @@ class PreviewHandler final : public IPreviewHandler,
     int m_gen = 0, m_file_gen = 0;
     int m_req_w = 0, m_req_h = 0;
     char m_error[100] = "";
+    // Never a blank artboard (D-031): empty artboards are skipped, and the whole-document thumbnail
+    // (first paint) stays as a placeholder behind slow renders, failures and all-empty documents.
+    uint8_t m_empty[512] = {};  // bit per page, first 4096 pages
+    int m_empty_count = 0;
+    bool m_all_empty = false;
+    HBITMAP m_ph = nullptr;
+    int m_ph_w = 0, m_ph_h = 0;
+    bool m_ph_alpha = false;
     // input
     int m_zone = Z_NONE;
     bool m_tracking = false;
@@ -242,7 +264,36 @@ class PreviewHandler final : public IPreviewHandler,
     int px(int v) const { return MulDiv(v, dpi(), 96); }
     int strip_h() const { return px(30); }
     int page_count() const { return m_have_info && m_info.page_count > 1 ? (int)m_info.page_count : 1; }
-    bool can_go(int delta) const { int p = m_page + delta; return p >= 0 && p < page_count(); }
+    bool is_empty(int p) const { return p >= 0 && p < 4096 && ((m_empty[p >> 3] >> (p & 7)) & 1); }
+    void mark_empty(int p) {
+        if (p < 0 || p >= 4096 || is_empty(p)) return;
+        m_empty[p >> 3] |= (uint8_t)(1u << (p & 7));
+        ++m_empty_count;
+    }
+    // First page from `from` stepping by dir that is not known to be empty, or -1.
+    int next_shown(int from, int dir) const {
+        for (int p = from, n = page_count(); p >= 0 && p < n; p += dir)
+            if (!is_empty(p)) return p;
+        return -1;
+    }
+    bool can_go(int delta) const { return next_shown(m_page + delta, delta) >= 0; }
+
+    static HBITMAP bmp_from(const Result* r, bool* alpha) {
+        void* bits = nullptr;
+        HBITMAP b = abt::create_dib32(r->w, r->h, &bits);
+        *alpha = false;
+        if (!b) return nullptr;
+        size_t n = (size_t)r->w * r->h;
+        memcpy(bits, r->px, n * 4);  // premultiplied: ready for AlphaBlend
+        for (size_t i = 0; i < n; ++i)
+            if (r->px[i * 4 + 3] != 255) { *alpha = true; break; }
+        return b;
+    }
+    void drop_quick() {
+        if (m_bmp && m_quick) DeleteObject(m_bmp);
+        if (m_quick) m_bmp = nullptr;
+        m_quick = false;
+    }
 
     void image_area(RECT* r) const {
         GetClientRect(m_wnd, r);
@@ -417,6 +468,12 @@ class PreviewHandler final : public IPreviewHandler,
 
     void on_result(Result* r) {
         if (r->file_gen != m_file_gen) { free_result(r); return; }
+        if (r->info_only) {  // prefetch found a neighbour that is empty: arrows and keys skip it
+            if (r->info.flags & ABT_INFO_PAGE_EMPTY) mark_empty(r->page);
+            free_result(r);
+            InvalidateRect(m_wnd, nullptr, FALSE);
+            return;
+        }
         bool current = r->gen == m_gen && r->page == m_page;
         if (r->info.family && (!r->quick || !m_have_info)) {
             uint32_t pages = m_have_info ? m_info.page_count : 0;
@@ -425,23 +482,31 @@ class PreviewHandler final : public IPreviewHandler,
             m_have_info = true;
         }
         if (r->quick) {
+            if (SUCCEEDED(r->hr)) {
+                // Always kept as the placeholder: whatever happens to the artboard render, the pane
+                // has a picture of the document to show instead of a blank area.
+                if (m_ph) DeleteObject(m_ph);
+                m_ph = bmp_from(r, &m_ph_alpha);
+                m_ph_w = r->w;
+                m_ph_h = r->h;
+            }
             // The thumbnail is the whole document; for an Illustrator file with several artboards or
-            // art outside artboard 1 it is not artboard 1, so it must not stand in for it.
+            // art outside artboard 1 it is not artboard 1, so it only stands in for it when it is
+            // the same picture.
             bool same_picture = !(r->info.flags & ABT_INFO_CANVAS_BEYOND_PAGE1);
             if (current && SUCCEEDED(r->hr) && same_picture && (!m_bmp || m_quick) && m_loading) {
-                if (m_bmp && m_quick) DeleteObject(m_bmp);
-                void* bits = nullptr;
-                m_bmp = abt::create_dib32(r->w, r->h, &bits);
+                drop_quick();
+                m_bmp = bmp_from(r, &m_alpha);
                 if (m_bmp) {
-                    memcpy(bits, r->px, (size_t)r->w * r->h * 4);
                     m_bw = r->w;
                     m_bh = r->h;
-                    m_alpha = false;
-                    for (size_t i = 0, n = (size_t)r->w * r->h; i < n; ++i)
-                        if (r->px[i * 4 + 3] != 255) { m_alpha = true; break; }
                     m_quick = true;
                 }
             }
+        } else if (SUCCEEDED(r->hr) && (r->info.flags & ABT_INFO_PAGE_EMPTY)) {
+            // An artboard with nothing on it is never shown: move on to the next one.
+            mark_empty(r->page);
+            if (r->page == m_page && (current || m_loading)) skip_empty();
         } else if (SUCCEEDED(r->hr)) {
             PageBmp* c = cache_put(r);  // keep every finished page, current or not
             if (c && (current || (r->page == m_page && m_loading))) {
@@ -450,10 +515,10 @@ class PreviewHandler final : public IPreviewHandler,
                 m_error[0] = 0;
             }
         } else if (current) {
-            // Never leave another artboard on screen under this artboard's number.
-            if (m_bmp && m_quick) DeleteObject(m_bmp);
+            // Never leave another artboard on screen under this artboard's number; the placeholder
+            // (document thumbnail) is shown with the reason instead.
+            drop_quick();
             m_bmp = nullptr;
-            m_quick = false;
             m_loading = false;
             lstrcpynA(m_error, r->reason[0] ? r->reason : "No preview available", sizeof(m_error));
         }
@@ -461,15 +526,34 @@ class PreviewHandler final : public IPreviewHandler,
         InvalidateRect(m_wnd, nullptr, FALSE);
     }
 
-    void go_page(int p) {
+    // The page on screen (or being loaded) turned out to be empty: go on in the direction of travel,
+    // else back the other way; when every artboard is empty, show the whole-document thumbnail.
+    void skip_empty() {
+        int q = next_shown(m_page + m_dir, m_dir);
+        if (q < 0) q = next_shown(m_page - m_dir, -m_dir);
+        if (q >= 0) {
+            go_page(q, q > m_page ? 1 : -1);
+            return;
+        }
+        m_all_empty = true;
+        m_loading = false;
+        drop_quick();
+        m_bmp = nullptr;
+    }
+
+    // Moves to page p (skipping pages known to be empty, in direction dir).
+    void go_page(int p, int dir = 0) {
         int n = page_count();
         if (p < 0) p = 0;
         if (p >= n) p = n - 1;
-        if (p == m_page) return;
-        m_dir = p > m_page ? 1 : -1;
-        m_page = p;
+        if (!dir) dir = p >= m_page ? 1 : -1;
+        int q = next_shown(p, dir);
+        if (q < 0) q = next_shown(p, -dir);
+        if (q < 0 || q == m_page) return;
+        m_dir = q > m_page ? 1 : -1;
+        m_page = q;
         m_error[0] = 0;
-        PageBmp* c = cache_find(p);
+        PageBmp* c = cache_find(q);
         if (c && fits_pane(c)) {
             show(c);  // instant; still let the agent warm up the new neighbours
             m_loading = false;
@@ -503,29 +587,44 @@ class PreviewHandler final : public IPreviewHandler,
 
     // ---- painting
 
-    void draw_image(HDC mdc, const RECT& area) {
+    // Fits a bitmap into the area. Final renders are never enlarged beyond 1:1 device pixels (they
+    // were rendered for this size); low-res stand-ins (first paint, placeholder) may be.
+    void draw_bitmap(HDC mdc, const RECT& area, HBITMAP bmp, int bw, int bh, bool alpha, bool may_enlarge, BYTE opacity) {
         int aw = area.right - area.left, ah = area.bottom - area.top;
-        if (!m_bmp || aw <= 0 || ah <= 0) return;
-        // Fit into the area; the final image is never enlarged beyond 1:1 device pixels (it was
-        // rendered for this size), the quick first paint may be.
-        double s = fmin((double)aw / m_bw, (double)ah / m_bh);
-        if (!m_quick && s > 1.0) s = 1.0;
-        int dw = (int)(m_bw * s + 0.5), dh = (int)(m_bh * s + 0.5);
+        if (!bmp || bw <= 0 || bh <= 0 || aw <= 0 || ah <= 0) return;
+        double s = fmin((double)aw / bw, (double)ah / bh);
+        if (!may_enlarge && s > 1.0) s = 1.0;
+        int dw = (int)(bw * s + 0.5), dh = (int)(bh * s + 0.5);
         if (dw < 1) dw = 1;
         if (dh < 1) dh = 1;
         RECT dst = {area.left + (aw - dw) / 2, area.top + (ah - dh) / 2, 0, 0};
         dst.right = dst.left + dw;
         dst.bottom = dst.top + dh;
-        if (m_alpha && m_checker) {
+        if (alpha && m_checker) {
             SetBrushOrgEx(mdc, dst.left, dst.top, nullptr);
             FillRect(mdc, &dst, m_checker);
         }
         HDC idc = CreateCompatibleDC(mdc);
-        HGDIOBJ oi = SelectObject(idc, m_bmp);
-        BLENDFUNCTION bf = {AC_SRC_OVER, 0, (BYTE)(m_loading ? 110 : 255), AC_SRC_ALPHA};
-        AlphaBlend(mdc, dst.left, dst.top, dw, dh, idc, 0, 0, m_bw, m_bh, bf);
+        HGDIOBJ oi = SelectObject(idc, bmp);
+        BLENDFUNCTION bf = {AC_SRC_OVER, 0, opacity, AC_SRC_ALPHA};
+        AlphaBlend(mdc, dst.left, dst.top, dw, dh, idc, 0, 0, bw, bh, bf);
         SelectObject(idc, oi);
         DeleteDC(idc);
+    }
+
+    // A rounded label near the top of the image area.
+    void draw_pill(HDC mdc, const RECT& area, const wchar_t* msg) {
+        RECT m = {0, 0, area.right - area.left - px(40), 0};
+        if (m.right < px(40)) m.right = px(40);
+        DrawTextW(mdc, msg, -1, &m, DT_CENTER | DT_WORDBREAK | DT_CALCRECT);
+        int tw = m.right - m.left, th = m.bottom - m.top;
+        RECT pill = {(area.left + area.right) / 2 - tw / 2 - px(10), area.top + px(10), 0, 0};
+        pill.right = pill.left + tw + px(20);
+        pill.bottom = pill.top + th + px(8);
+        round_fill(mdc, pill, px(14), mix(m_bg, m_fg, 8));
+        ::SetTextColor(mdc, m_fg);
+        RECT tr = {pill.left + px(10), pill.top + px(4), pill.right - px(10), pill.bottom - px(4)};
+        DrawTextW(mdc, msg, -1, &tr, DT_CENTER | DT_WORDBREAK);
     }
 
     void draw_center_text(HDC mdc, const RECT& area, const wchar_t* text, COLORREF c) {
@@ -564,31 +663,40 @@ class PreviewHandler final : public IPreviewHandler,
 
         RECT area;
         image_area(&area);
-        draw_image(mdc, area);
-        wchar_t msg[160];
-        if (!m_bmp) {
-            if (m_error[0]) {
-                wchar_t err[100];
-                MultiByteToWideChar(CP_UTF8, 0, m_error, -1, err, _countof(err));
-                if (n > 1) _snwprintf_s(msg, _countof(msg), _TRUNCATE, L"%s %d: %s", page_noun(), m_page + 1, err);
-                else lstrcpynW(msg, err, _countof(msg));
-                draw_center_text(mdc, area, msg, dim);
-            } else if (m_path) {
-                if (n > 1) _snwprintf_s(msg, _countof(msg), _TRUNCATE, L"Rendering %s %d\x2026", page_noun(), m_page + 1);
-                else lstrcpynW(msg, L"Rendering\x2026", _countof(msg));
+        // What is on screen, in order of preference: the page itself (dimmed while the next one
+        // renders), else the document thumbnail as a placeholder, else (only before anything at all
+        // has arrived, or when the file has no picture whatsoever) a text line. Never a blank artboard.
+        wchar_t msg[200];
+        if (m_bmp) {
+            draw_bitmap(mdc, area, m_bmp, m_bw, m_bh, m_alpha, m_quick, (BYTE)(m_loading ? 110 : 255));
+            if (m_loading) {
+                _snwprintf_s(msg, _countof(msg), _TRUNCATE, L"Rendering %s %d\x2026", page_noun(), m_page + 1);
+                draw_pill(mdc, area, msg);
+            }
+        } else if (m_path) {
+            wchar_t err[100] = L"";
+            if (m_error[0]) MultiByteToWideChar(CP_UTF8, 0, m_error, -1, err, _countof(err));
+            if (m_all_empty)
+                lstrcpynW(msg, n > 1 ? L"No artwork on any artboard" : L"No artwork on the artboard", _countof(msg));
+            else if (err[0] && n > 1)
+                _snwprintf_s(msg, _countof(msg), _TRUNCATE, L"%s %d could not be shown: %s", page_noun(), m_page + 1, err);
+            else if (err[0])
+                _snwprintf_s(msg, _countof(msg), _TRUNCATE, L"Could not be shown: %s", err);
+            else if (n > 1)
+                _snwprintf_s(msg, _countof(msg), _TRUNCATE, L"Rendering %s %d\x2026", page_noun(), m_page + 1);
+            else
+                lstrcpynW(msg, L"Rendering\x2026", _countof(msg));
+            if (m_ph) {
+                // The whole document stands in: full strength when it is the answer (every artboard
+                // empty, e.g. art only outside them), dimmed while waiting or after a failure.
+                draw_bitmap(mdc, area, m_ph, m_ph_w, m_ph_h, m_ph_alpha, true, (BYTE)(m_all_empty ? 255 : 110));
+                size_t l = wcslen(msg);
+                if (m_all_empty || err[0])
+                    _snwprintf_s(msg + l, _countof(msg) - l, _TRUNCATE, L"%s", L" \x00b7 showing the whole document");
+                draw_pill(mdc, area, msg);
+            } else {
                 draw_center_text(mdc, area, msg, dim);
             }
-        } else if (m_loading) {
-            // Previous page stays on screen dimmed; say what is coming.
-            _snwprintf_s(msg, _countof(msg), _TRUNCATE, L"Rendering %s %d\x2026", page_noun(), m_page + 1);
-            SIZE ts = {};
-            GetTextExtentPoint32W(mdc, msg, lstrlenW(msg), &ts);
-            RECT pill = {0, area.top + px(10), 0, area.top + px(10) + ts.cy + px(8)};
-            pill.left = (area.left + area.right) / 2 - ts.cx / 2 - px(10);
-            pill.right = pill.left + ts.cx + px(20);
-            round_fill(mdc, pill, px(14), mix(m_bg, m_fg, 8));
-            ::SetTextColor(mdc, m_fg);
-            DrawTextW(mdc, msg, -1, &pill, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         }
 
         // Hover arrows over the image (multi-page files only).
@@ -616,7 +724,7 @@ class PreviewHandler final : public IPreviewHandler,
         RECT sep = {0, h - sh, w, h - sh + 1};
         fill(mdc, sep, line);
         RECT tr = {px(10), h - sh, w - px(10), h};
-        if (n > 1) {
+        if (n > 1 && !m_all_empty) {
             RECT bp, bl, bn;
             strip_buttons(&bp, &bl, &bn);
             tr.right = bp.left - px(8);
@@ -632,10 +740,17 @@ class PreviewHandler final : public IPreviewHandler,
         }
         wchar_t text[200];
         info_text(text, _countof(text));
-        if (n > 1) {
+        if (m_all_empty) {
+            size_t l = wcslen(text);
+            _snwprintf_s(text + l, _countof(text) - l, _TRUNCATE, L"%s", l ? L"  \x00b7  whole document" : L"Whole document");
+        } else if (n > 1) {
             size_t l = wcslen(text);
             _snwprintf_s(text + l, _countof(text) - l, _TRUNCATE, L"%s%s %d", l ? L"  \x00b7  " : L"", page_noun(),
                          m_page + 1);
+            if (m_empty_count) {
+                l = wcslen(text);
+                _snwprintf_s(text + l, _countof(text) - l, _TRUNCATE, L"  \x00b7  %d empty skipped", m_empty_count);
+            }
         }
         ::SetTextColor(mdc, dim);
         DrawTextW(mdc, text, -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
@@ -815,6 +930,12 @@ class PreviewHandler final : public IPreviewHandler,
         m_error[0] = 0;
         m_loading = false;
         m_req_w = m_req_h = 0;
+        memset(m_empty, 0, sizeof(m_empty));
+        m_empty_count = 0;
+        m_all_empty = false;
+        if (m_ph) DeleteObject(m_ph);
+        m_ph = nullptr;
+        m_ph_w = m_ph_h = 0;
         ++m_file_gen;  // results still in flight for the previous file are dropped
     }
 

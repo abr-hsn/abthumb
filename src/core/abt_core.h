@@ -45,8 +45,9 @@ enum {
     ABT_INFO_HAS_ALPHA         = 1u << 5,
     ABT_INFO_ICC_PROFILE       = 1u << 6,
     ABT_INFO_LAYERS            = 1u << 7,
-    ABT_INFO_CANVAS_BEYOND_PAGE1 = 1u << 8 /* AI: several artboards or art outside artboard 1, so the
+    ABT_INFO_CANVAS_BEYOND_PAGE1 = 1u << 8, /* AI: several artboards or art outside artboard 1, so the
                                               whole-canvas thumbnail differs from artboard 1 (D-029) */
+    ABT_INFO_PAGE_EMPTY = 1u << 9          /* the rendered page / artboard has no visible artwork (D-031) */
 };
 
 /* Fixed-layout description of a file, shared by worker, agent cache and DLL.

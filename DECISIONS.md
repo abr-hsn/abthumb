@@ -139,3 +139,9 @@ Revisit if: a cheap way to rasterise Illustrator's native data appears, or the o
 * Releases: pushing a tag `vX.Y.Z` runs `.github/workflows/release.yml`, which refuses a tag that does not match `project(abthumb VERSION ...)`, builds with `scripts\package.ps1` (Inno Setup from Chocolatey on the runner), runs the unit tests, and publishes the installer, a portable zip and `SHA256SUMS.txt` with notes from `.github/release-notes.md` plus GitHub's generated change list. 0.x versions are marked pre-release.
 * Releases are unsigned for now (owner's call); the notes explain the SmartScreen prompt and give the installer's SHA-256.
 * The first public release is 0.1.1, not 0.1.0, because the owner's PC already has a pre-audit build installed as 0.1.0 and the two must be told apart.
+
+## D-031 The preview pane never shows a blank artboard (owner's rule, 2026-11-18)
+* The worker flags a rendered page with no visible artwork (`ABT_INFO_PAGE_EMPTY`: no page objects, or every pixel still white after rendering); the flag is cached with the page.
+* The pane never shows such a page. It moves on in the direction of travel (else back the other way). Arrows, keys and Home/End skip pages already known to be empty, and prefetch reports an empty neighbour that is already cached, so skipping usually costs nothing. The info strip counts the empty artboards it skipped.
+* If every artboard is empty (for example all the art sits outside them), the pane shows the whole-document thumbnail at full strength, labelled "No artwork on any artboard, showing the whole document", and hides the artboard navigation.
+* The first-paint thumbnail is always kept as a placeholder. While an artboard renders and nothing else is on screen, and after a failed render, the pane shows it dimmed with a label instead of a blank area. Only when no picture of the file exists at all does the pane show text alone.

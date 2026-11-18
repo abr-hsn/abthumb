@@ -87,7 +87,8 @@ static void serve_image(const abt_req& req, const wchar_t* path, abt_resp* resp,
         // pane's real request later finds it in the cache or joins the job still in flight.
         if (cache_get(k, page, edge, img, &view)) {
             abt_image_free(img);
-            resp->hr = S_OK;
+            resp->hr = (view.flags & CF_NEGATIVE) ? S_FALSE : S_OK;
+            resp->info = view.info;  // lets the pane learn that a page is empty before showing it
             lstrcpynA(resp->reason, "prefetch: cached", sizeof(resp->reason));
         } else if (Job* pj = job_submit(path, k, page, edge, edge, ABT_MODE_AUTO, req.flags & ~ABT_RF_PREFETCH,
                                         LANE_PREVIEW)) {
