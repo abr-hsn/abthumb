@@ -19,6 +19,13 @@ cd %TEMP% && <repo>\build\release\bin\abt_tests.exe
 build.cmd fuzz                         :: libFuzzer + ASan targets, see tests/fuzz/README.md
 ```
 
+`powershell -File scripts\ci.ps1` runs everything GitHub CI runs (build, unit tests, fuzz smoke run)
+in separate build trees; add `-Quick` for build and tests only. To run the quick check before every
+push, enable the hook once: `git config core.hooksPath .githooks`.
+
+Releases: bump `project(abthumb VERSION ...)` in CMakeLists.txt, then push a matching tag
+(`git tag v0.1.2 && git push origin v0.1.2`). The Release workflow builds and publishes the installer.
+
 Unit tests that need the generated corpus skip themselves when it is missing. The corpus is
 generated from Illustrator and Photoshop (see `tests/corpus/scripts/README.md`); please never commit
 real design files or their names.

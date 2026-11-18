@@ -10,7 +10,7 @@
 ; - Upgrades in place, stops our own agent/workers first, repairs registration when re-run.
 
 #ifndef AppVer
-  #define AppVer "0.1.0"
+  #define AppVer "0.1.1"
 #endif
 #define Dist "..\dist\abthumb-" + AppVer + "-x64"
 

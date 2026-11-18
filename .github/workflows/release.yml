@@ -1,0 +1,79 @@
+name: Release
+
+# Push a tag vX.Y.Z (matching project(abthumb VERSION X.Y.Z) in CMakeLists.txt) to build, test,
+# package and publish a GitHub release with the installer, a portable zip and SHA256SUMS.txt.
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the tag matches the project version
+        id: ver
+        shell: pwsh
+        run: |
+          $ver = (Select-String -Path CMakeLists.txt -Pattern 'project\(abthumb VERSION ([0-9.]+)').Matches[0].Groups[1].Value
+          if ("v$ver" -ne "${{ github.ref_name }}") { throw "tag ${{ github.ref_name }} does not match CMakeLists.txt version $ver" }
+          "version=$ver" >> $env:GITHUB_OUTPUT
+
+      - name: Cache PDFium binaries (pinned by SHA-256 in cmake/pdfium.cmake)
+        uses: actions/cache@v4
+        with:
+          path: third_party/pdfium
+          key: pdfium-${{ hashFiles('cmake/pdfium.cmake') }}
+
+      - name: Install Inno Setup 6
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) {
+            choco install innosetup -y --no-progress
+            if ($LASTEXITCODE) { throw "choco install innosetup failed" }
+          }
+
+      - name: Build and package
+        shell: pwsh
+        run: ./scripts/package.ps1
+
+      - name: Unit tests
+        shell: pwsh
+        run: |
+          Push-Location $env:RUNNER_TEMP
+          & "$env:GITHUB_WORKSPACE\build\release\bin\abt_tests.exe"
+          $code = $LASTEXITCODE
+          Pop-Location
+          exit $code
+
+      - name: Portable zip and checksums
+        shell: pwsh
+        run: |
+          $v = "${{ steps.ver.outputs.version }}"
+          Compress-Archive -Path "dist\abthumb-$v-x64" -DestinationPath "dist\abthumb-$v-x64.zip"
+          $zip = Get-Item "dist\abthumb-$v-x64.zip"
+          "{0}  {1}" -f (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower(), $zip.Name |
+            Add-Content dist\SHA256SUMS.txt -Encoding ascii
+
+      - name: Publish the release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $v = "${{ steps.ver.outputs.version }}"
+          $setup = "dist\abthumb-setup-$v-x64.exe"
+          $hash = (Get-FileHash $setup -Algorithm SHA256).Hash.ToLower()
+          $notes = (Get-Content .github\release-notes.md -Raw).Replace('{VERSION}', $v).Replace('{SETUP_SHA256}', $hash)
+          Set-Content "$env:RUNNER_TEMP\notes.md" $notes -Encoding utf8
+          $pre = if ($v -match '^0\.') { @('--prerelease') } else { @() }
+          gh release create "${{ github.ref_name }}" $setup "dist\abthumb-$v-x64.zip" dist\SHA256SUMS.txt `
+            --title "abthumb $v" --notes-file "$env:RUNNER_TEMP\notes.md" --generate-notes --verify-tag @pre
+          if ($LASTEXITCODE) { throw "gh release create failed" }
