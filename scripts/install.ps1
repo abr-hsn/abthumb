@@ -99,10 +99,10 @@ if ($ElevatedStep) {
 Write-Host ($(if ($Uninstall) { "Removing abthumb..." } else { "Installing abthumb (Windows will ask for administrator permission once)..." }))
 Stop-Ours $null   # this user's agent and workers hold files open
 $log = Join-Path $env:TEMP "abthumb-setup-$PID.log"
-$args = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$PSCommandPath`"", "-ElevatedStep", "-Dir", "`"$Dir`"", "-Log", "`"$log`"")
-if ($Uninstall) { $args += "-Uninstall" }
+$elevArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$PSCommandPath`"", "-ElevatedStep", "-Dir", "`"$Dir`"", "-Log", "`"$log`"")
+if ($Uninstall) { $elevArgs += "-Uninstall" }
 try {
-    $p = Start-Process powershell.exe -Verb RunAs -ArgumentList $args -WindowStyle Hidden -Wait -PassThru
+    $p = Start-Process powershell.exe -Verb RunAs -ArgumentList $elevArgs -WindowStyle Hidden -Wait -PassThru
 } catch {
     Write-Host "Administrator permission was declined; nothing was changed."
     exit 1

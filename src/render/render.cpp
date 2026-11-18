@@ -49,7 +49,10 @@ static void fit_box(int w, int h, int bw, int bh, bool allow_up, int* dw, int* d
 
 // True if the preview is at least as large as what the box needs (no enlargement).
 static bool preview_adequate(const abt_preview& pv, int bw, int bh) {
-    if (!pv.width || !pv.height || (pv.flags & ABT_PVF_ASPECT_MISMATCH)) return false;
+    // ABT_PVF_ASPECT_MISMATCH (Illustrator's thumbnail shows every artboard) is deliberately not a
+    // reason to render: that thumbnail is the document thumbnail Illustrator and Bridge show, it is
+    // instant, and real multi-artboard files can take seconds to render (D-020, revised).
+    if (!pv.width || !pv.height) return false;
     double s = (double)bw / pv.width, s2 = (double)bh / pv.height;
     if (s2 < s) s = s2;
     return s <= 1.0001;

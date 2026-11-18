@@ -1,4 +1,4 @@
-# Benchmarks (preliminary)
+# Benchmarks
 
 PC: i7-14700, NVMe, Windows 11 build 26300. `abthumb bench <corpus dirs> --size 256`
 (best of 3 per file, render pipeline in-process, warm OS file cache). Generated corpus:
@@ -26,6 +26,22 @@ Notes:
 * Other measured points: 32,000 x 20,000 PSB to 256 px in about 45 ms (row-subsampled RLE);
   PDFium renders of Illustrator files at 1024 px in 2-18 ms; an Explorer-cache round trip
   through `IThumbnailCache` about 5-6 ms of which our handler is about 0.3 ms on a cache hit.
+
+## Real-world files (sample from this PC)
+320 randomly sampled local files (120 .ai, 120 .psd, 40 .eps, 40 .pdf; 8.7 GB; cloud placeholders
+excluded), 256 px, in-process pipeline, warm OS file cache. Aggregates only; no file names recorded.
+
+| Path | n | mean | p50 | p95 | p99 | max |
+|---|---|---|---|---|---|---|
+| abthumb auto, first policy (render multi-artboard AI) | 313 | 140 ms | 3.1 ms | 463 ms | - | 7823 ms |
+| **abthumb auto, revised D-020** | 317 | 8.6 ms | 2.2 ms | 38 ms | 160 ms | 192 ms |
+| abthumb embedded preview only | 278 | 1.3 ms | 1.05 ms | 3.2 ms | - | 4.8 ms |
+| WIC codec path (FastPictureViewer) | 281 | 11.0 ms | 1.8 ms | 54 ms | - | 173 ms |
+
+By format (first policy): PSD p50 2.3 ms / p95 21 ms (merged composite decode, row-subsampled),
+EPS p50 2.2 ms / p95 3.6 ms, PDF p50 66 ms / p95 170 ms (real page renders; FastPictureViewer has
+no render fallback for PDFs without an XMP thumbnail). Failures: abthumb 7 (3 unknown/corrupt
+files, PostScript-only files without Ghostscript), FastPictureViewer 39.
 
 ## Robustness
 libFuzzer + ASan, about 4 minutes per target (`tests/fuzz`): `fuzz_probe` 11.9 M executions,
