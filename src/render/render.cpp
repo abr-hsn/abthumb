@@ -115,6 +115,40 @@ void render_init(bool background) { g_background = background; }
 
 static void set_reason(RenderResult* rr, const char* s) { lstrcpynA(rr->reason, s, sizeof(rr->reason)); }
 
+// Illustrator: is the whole canvas (all art, on and off the artboards) just artboard 1? Only then
+// can PDF page 1 stand in for it; Illustrator's PDF pages hold each artboard's art clipped to that
+// artboard and nothing outside them (D-029). Art bounds are visual bounds, so a stroke that pokes a
+// little past the artboard edge (clipped in page 1, a sliver in the thumbnail) still counts as inside.
+static bool ai_canvas_is_page1(const abt_probe& pr, int pages, float w0, float h0) {
+    if (pages != 1) return false;
+    const float* b = pr.bbox;
+    if (b[0] == 0 && b[1] == 0 && b[2] == 0 && b[3] == 0) return true;  // bounds unknown: single artboard
+    float tol = 2.0f + 0.01f * (w0 > h0 ? w0 : h0);
+    return b[0] >= -tol && b[1] >= -tol && b[2] <= w0 + tol && b[3] <= h0 + tol;
+}
+
+// The whole-canvas thumbnail of a multi-artboard Illustrator file: Illustrator's own document
+// thumbnail, enlarged when the request is bigger than it (soft, but it is the only image that holds
+// art outside the artboards).
+static bool ai_canvas_thumbnail(const MappedFile& mf, const abt_probe& pr, int bw, int bh, RenderResult* rr) {
+    int edge = bw > bh ? bw : bh;
+    int best = -1;
+    for (int i = 0; i < pr.n_previews; ++i) {
+        if (pr.previews[i].source != ABT_PVS_XMP) continue;
+        if (best < 0 || abt_probe_best_preview(&pr, edge) == i) best = i;
+    }
+    if (best < 0) return false;
+    abt_image img = {};
+    if (FAILED(decode_preview(mf, pr.previews[best], bw, bh, &img))) return false;
+    bool small = img.w < bw && img.h < bh;
+    if (small && fit_image(&img, bw, bh, true) != S_OK) { abt_image_free(&img); return false; }
+    rr->img = img;
+    rr->hr = S_OK;
+    rr->source = ABT_SRC_EMBEDDED | (small ? ABT_SRC_SCALED : 0);
+    set_reason(rr, "Illustrator document thumbnail (whole canvas)");
+    return true;
+}
+
 // Body of the pipeline; may fault on I/O errors of the mapped view (guarded by the caller).
 static void render_inner(const RenderRequest& rq, const MappedFile& mf, RenderResult* rr) {
     abt_probe pr;
@@ -125,9 +159,24 @@ static void render_inner(const RenderRequest& rq, const MappedFile& mf, RenderRe
         _snprintf_s(rr->reason, sizeof(rr->reason), _TRUNCATE, "probe: %s", abt_status_str(st));
         return;
     }
-    if (rq.mode == ABT_MODE_PROBE) { rr->hr = S_OK; set_reason(rr, "probe"); return; }
-
     abt_family fam = (abt_family)pr.info.family;
+    const bool canvas = (uint32_t)rq.page == ABT_PAGE_CANVAS;
+    const int page = canvas ? 0 : rq.page;
+
+    // Illustrator: artboard count and whether the whole canvas is more than artboard 1 (D-029).
+    bool ai_multi = false;
+    if (fam == ABT_FAM_AI_PDF) {
+        int pages = 0;
+        float w0 = 0, h0 = 0;
+        if (pdf_layout(mf.data, mf.size, &pages, &w0, &h0)) {
+            rr->info.page_count = (uint32_t)pages;
+            rr->info.pt_width = w0;  // stDim in the XMP is the active artboard, not artboard 1
+            rr->info.pt_height = h0;
+            ai_multi = !ai_canvas_is_page1(pr, pages, w0, h0);
+            if (ai_multi) rr->info.flags |= ABT_INFO_CANVAS_BEYOND_PAGE1;
+        }
+    }
+    if (rq.mode == ABT_MODE_PROBE) { rr->hr = S_OK; set_reason(rr, "probe"); return; }
     // Illustrator 8 and older (PostScript-based .ai) are out of scope (D-026): fail fast so
     // Explorer shows its icon; the failure is negative-cached and never retried.
     if (fam == ABT_FAM_AI_PS) {
@@ -136,9 +185,17 @@ static void render_inner(const RenderRequest& rq, const MappedFile& mf, RenderRe
         return;
     }
     int bw = rq.cx > 0 ? rq.cx : 256, bh = rq.cy > 0 ? rq.cy : bw;
-    bool allow_embedded = !(rq.flags & ABT_RF_NO_EMBEDDED) && rq.mode != ABT_MODE_RENDER && rq.page == 0;
+    bool allow_embedded = !(rq.flags & ABT_RF_NO_EMBEDDED) && rq.mode != ABT_MODE_RENDER && page == 0;
     int edge = bw > bh ? bw : bh;
     int best = abt_probe_best_preview(&pr, edge);
+
+    if (ai_multi) {
+        // Whole canvas: only Illustrator's document thumbnail has it (D-029).
+        if (canvas && allow_embedded && ai_canvas_thumbnail(mf, pr, bw, bh, rr)) return;
+        // One artboard: that thumbnail shows more than the artboard, so it never stands in for it.
+        allow_embedded = false;
+        if (canvas) set_reason(rr, "no document thumbnail: artboard 1 only");
+    }
 
     // 1) An embedded preview that is big enough is exact and cheapest (D-011).
     if (allow_embedded && best >= 0 && preview_adequate(pr.previews[best], bw, bh)) {
@@ -172,6 +229,8 @@ static void render_inner(const RenderRequest& rq, const MappedFile& mf, RenderRe
             rr->info.flags |= ABT_INFO_NO_PDF_CONTENT;
             set_reason(rr, "AI saved without PDF content");
             hr = E_NOTIMPL;
+            // Illustrator's thumbnail is then the only picture of the file, canvas or not.
+            allow_embedded = page == 0 && !(rq.flags & ABT_RF_NO_EMBEDDED) && rq.mode != ABT_MODE_RENDER;
         } else if (SUCCEEDED(hr) && fam == ABT_FAM_AI_PDF) {
             rr->info.flags |= ABT_INFO_HAS_PDF_CONTENT;
         }

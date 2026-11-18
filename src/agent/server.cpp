@@ -78,8 +78,30 @@ static void serve_image(const abt_req& req, const wchar_t* path, abt_resp* resp,
     int bh = (req.msg == ABT_MSG_PREVIEW && req.cy) ? (int)req.cy : bw;
     int edge = bw > bh ? bw : bh;
     bool info_only = req.msg == ABT_MSG_INFO;
+    // Thumbnails always show the whole document (Illustrator: the full canvas, D-029); the preview
+    // pane asks for one page / artboard at a time.
+    const uint32_t page = req.msg == ABT_MSG_PREVIEW ? req.page : ABT_PAGE_CANVAS;
     CacheEntryView view = {};
-    if (!(req.flags & ABT_RF_NO_CACHE) && !info_only && cache_get(k, req.page, edge, img, &view)) {
+    if (req.msg == ABT_MSG_PREVIEW && (req.flags & ABT_RF_PREFETCH)) {
+        // Neighbouring artboards for the preview pane: start the render and answer at once. The
+        // pane's real request later finds it in the cache or joins the job still in flight.
+        if (cache_get(k, page, edge, img, &view)) {
+            abt_image_free(img);
+            resp->hr = S_OK;
+            lstrcpynA(resp->reason, "prefetch: cached", sizeof(resp->reason));
+        } else if (Job* pj = job_submit(path, k, page, edge, edge, ABT_MODE_AUTO, req.flags & ~ABT_RF_PREFETCH,
+                                        LANE_PREVIEW)) {
+            job_release(pj);  // the scheduler keeps its own reference; the result goes to the cache
+            resp->hr = S_FALSE;
+            lstrcpynA(resp->reason, "prefetch: queued", sizeof(resp->reason));
+        } else {
+            resp->hr = E_OUTOFMEMORY;
+        }
+        resp->total_len = sizeof(*resp);
+        resp->elapsed_us = (uint32_t)(qpc_ms(t0, qpc()) * 1000.0);
+        return;
+    }
+    if (!(req.flags & ABT_RF_NO_CACHE) && !info_only && cache_get(k, page, edge, img, &view)) {
         resp->info = view.info;
         resp->source = flags_to_source(view.flags);
         if (view.flags & CF_NEGATIVE) {
@@ -96,7 +118,7 @@ static void serve_image(const abt_req& req, const wchar_t* path, abt_resp* resp,
         Lane lane = req.msg == ABT_MSG_PREVIEW ? LANE_PREVIEW
                     : (req.flags & ABT_RF_FROM_PREWARM) ? LANE_VISIBLE
                                                          : LANE_FOREGROUND;
-        Job* j = job_submit(path, k, req.page, edge, edge, info_only ? ABT_MODE_PROBE : ABT_MODE_AUTO, req.flags, lane);
+        Job* j = job_submit(path, k, page, edge, edge, info_only ? ABT_MODE_PROBE : ABT_MODE_AUTO, req.flags, lane);
         if (!j) {
             resp->hr = E_OUTOFMEMORY;
         } else {
@@ -108,7 +130,7 @@ static void serve_image(const abt_req& req, const wchar_t* path, abt_resp* resp,
             if (req.msg == ABT_MSG_THUMB && !(req.flags & ABT_RF_FROM_PREWARM) && wait > 350) {
                 done = job_wait(j, 350, &r);
                 if (!done) {
-                    Job* fast = job_submit(path, k, req.page, edge, edge, ABT_MODE_FAST, req.flags | ABT_RF_NO_CACHE,
+                    Job* fast = job_submit(path, k, page, edge, edge, ABT_MODE_FAST, req.flags | ABT_RF_NO_CACHE,
                                            LANE_FOREGROUND);
                     JobResult fr = {};  // untouched when job_wait times out
                     if (fast && job_wait(fast, 1500, &fr) && SUCCEEDED(fr.hr) && fr.img.px) {
@@ -207,7 +229,7 @@ static void handle_client(HANDLE p, wchar_t* path, HANDLE ev) {
     abt_resp resp;
     init_resp(&resp, (abt_msg)req.msg);
     if (caller.low) {
-        req.flags = 0;
+        req.flags &= ABT_RF_PREFETCH;  // only scheduling hints; the rest steers the agent (D-028)
         if (req.msg != ABT_MSG_THUMB && req.msg != ABT_MSG_PREVIEW && req.msg != ABT_MSG_INFO && req.msg != ABT_MSG_PING)
             req.msg = 0;  // -> E_INVALIDARG below
     }

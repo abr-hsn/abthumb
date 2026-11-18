@@ -136,6 +136,32 @@ static void test_ai_probe(void) {
     probe_ai("ai/tiny__ai_ILLUSTRATOR3.ai", ABT_FAM_AI_PS, 0);
 }
 
+/* Art bounds from Illustrator's private-data header (D-029): whole canvas, artboard-1 coordinates. */
+static void test_ai_art_bounds(void) {
+    const char* doc =
+        "%PDF-1.6\n<</Illustrator 3 0 R>>\n"
+        "%!PS-Adobe-3.0 EPSF-3.0\n%%BoundingBox: 0 0 10 10\n%%EndComments\n" /* someone else's EPS: skipped */
+        "stream\n%!PS-Adobe-3.0 \n%%Creator: Adobe Illustrator(R) 24.0\n%%BoundingBox: -250 -220 750 450\n"
+        "%%HiResBoundingBox: -250.5 -220 750.25 450\n%AI5_FileFormat 14.0\n%%EndComments\n";
+    abt_probe p;
+    ABT_CHECK(abt_probe_file((const uint8_t*)doc, strlen(doc), &p) == ABT_OK);
+    ABT_CHECK(p.info.family == ABT_FAM_AI_PDF);
+    ABT_CHECK_MSG(p.bbox[0] == -250.5f && p.bbox[1] == -220.f && p.bbox[2] == 750.25f && p.bbox[3] == 450.f,
+                  "bbox %g %g %g %g", p.bbox[0], p.bbox[1], p.bbox[2], p.bbox[3]);
+    /* malformed bounds are ignored */
+    const char* bad = "%PDF-1.6\n<</Illustrator 3 0 R>>\n%!PS-Adobe-3.0 \n%%HiResBoundingBox: 5 5 1 1\n%AI5_FileFormat 14.0\n";
+    ABT_CHECK(abt_probe_file((const uint8_t*)bad, strlen(bad), &p) == ABT_OK);
+    ABT_CHECK(p.bbox[0] == 0 && p.bbox[2] == 0);
+    /* corpus: three artboards side by side */
+    size_t n = 0;
+    unsigned char* d = abt_test_read_file(abt_test_path("ai/multi_artboard__ai_cur.ai"), &n);
+    if (!d) { printf("  (skip: multi_artboard missing)\n"); return; }
+    ABT_CHECK(abt_probe_file(d, n, &p) == ABT_OK);
+    ABT_CHECK_MSG(p.bbox[0] == 38.f && p.bbox[1] == -107.f && p.bbox[2] > 1325.f && p.bbox[2] < 1326.f,
+                  "multi_artboard bbox %g %g %g %g", p.bbox[0], p.bbox[1], p.bbox[2], p.bbox[3]);
+    free(d);
+}
+
 static void test_detect(void) {
     const uint8_t psd[] = {'8', 'B', 'P', 'S', 0, 1};
     const uint8_t psb[] = {'8', 'B', 'P', 'S', 0, 2};
@@ -226,4 +252,5 @@ void suite_core(void) {
     test_pixbuf_validation();
     test_qoi_encode_limits();
     test_ai_probe();
+    test_ai_art_bounds();
 }

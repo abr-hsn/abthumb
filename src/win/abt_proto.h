@@ -23,7 +23,13 @@ enum : uint32_t {
     ABT_RF_NO_EMBEDDED = 1u << 1,   // worker: do not use embedded previews
     ABT_RF_MAX_QUALITY = 1u << 2,   // worker: exact downscale (no row subsampling)
     ABT_RF_NO_CACHE = 1u << 3,      // agent: bypass our cache (bench/tests)
+    ABT_RF_PREFETCH = 1u << 4,      // agent: PREVIEW only; queue the render, reply at once without pixels
 };
+
+// Page value for the whole-document view used by thumbnails (D-029). Illustrator: the full canvas
+// (every artboard and art outside them); other formats: the first page. Kept apart from page 0 in
+// the cache, because the preview pane's page 0 is artboard 1 only.
+#define ABT_PAGE_CANVAS 0xFFFFu
 
 // Worker modes
 enum : uint32_t {

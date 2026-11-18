@@ -240,6 +240,58 @@ int abt_xmp_creator_tool(const uint8_t* d, size_t n, char* out, size_t cap) {
 
 /* ------------------------------------------------------------------ PDF / AI 9+ */
 
+/* Up to n decimal numbers separated by spaces/tabs (optional sign and fraction). Returns count. */
+static int parse_reals(const uint8_t* p, const uint8_t* e, double* v, int n) {
+    int k = 0;
+    while (k < n) {
+        while (p < e && (*p == ' ' || *p == '\t')) ++p;
+        int neg = 0, any = 0, digits = 0;
+        double x = 0, scale = 0.1;
+        if (p < e && (*p == '-' || *p == '+')) neg = *p++ == '-';
+        while (p < e && *p >= '0' && *p <= '9') { if (++digits < 12) x = x * 10 + (*p - '0'); ++p; any = 1; }
+        if (p < e && *p == '.') {
+            ++p;
+            while (p < e && *p >= '0' && *p <= '9') { x += (*p++ - '0') * scale; scale /= 10; any = 1; }
+        }
+        if (!any) break;
+        v[k++] = neg ? -x : x;
+    }
+    return k;
+}
+
+/* Illustrator 9+ keeps an uncompressed PostScript-style header at the start of its private data
+   ("%!PS-Adobe-3.0 ... %%EndComments"). Its %%HiResBoundingBox is the bounding box of ALL art in the
+   document, on or off the artboards, in artboard-1 coordinates (verified CS-2026 on the corpus). */
+static void ai_art_bounds(const uint8_t* d, size_t n, abt_probe* out) {
+    const uint8_t* ps = NULL;
+    size_t win = 0;
+    const uint8_t* from = d;
+    for (int tries = 0; tries < 4 && !ps; ++tries) {  /* skip PostScript headers that are not Illustrator's */
+        const uint8_t* c = abt_memmem(from, (size_t)(d + n - from), "%!PS-Adobe-", 11);
+        if (!c) return;
+        win = (size_t)(d + n - c);
+        if (win > 16384) win = 16384;
+        const uint8_t* end = abt_memmem(c, win, "%%EndComments", 13);
+        if (end) win = (size_t)(end - c);
+        if (abt_memmem(c, win, "%AI5_FileFormat", 15)) ps = c;
+        from = c + 11;
+    }
+    if (!ps) return;
+    const uint8_t* b = abt_memmem(ps, win, "%%HiResBoundingBox:", 19);
+    size_t skip = 19;
+    if (!b) { b = abt_memmem(ps, win, "%%BoundingBox:", 14); skip = 14; }
+    if (!b) return;
+    const uint8_t* e = b + skip;
+    const uint8_t* lim = ps + win;
+    while (e < lim && *e != '\r' && *e != '\n') ++e;
+    double v[4];
+    if (parse_reals(b + skip, e, v, 4) != 4) return;
+    for (int i = 0; i < 4; ++i)
+        if (!(v[i] > -1e7 && v[i] < 1e7)) return;
+    if (!(v[2] > v[0] && v[3] > v[1])) return;
+    for (int i = 0; i < 4; ++i) out->bbox[i] = (float)v[i];
+}
+
 /* Illustrator writes the XMP packet right after the header (offset ~200) and keeps the
    thumbnail inside the first few KB (verified on the corpus for CS-2026). We scan a bounded
    head window; other producers may put metadata anywhere, so also look at the tail. */
@@ -294,10 +346,11 @@ abt_status abt_probe_pdf(const uint8_t* d, size_t n, abt_probe* out) {
             while (*v >= '0' && *v <= '9') major = major * 10 + (uint32_t)(*v++ - '0');
             out->ai_version = major;
         }
+        ai_art_bounds(d, head, out);
     }
-    /* Illustrator's XMP thumbnail shows ALL artboards side by side, while stDim (MaxPageSize) is the
-       first artboard. Thumbnails are the first artboard (= PDF page 1, like the preview pane), so a
-       preview whose aspect ratio differs from stDim is only a fallback. */
+    /* Illustrator's XMP thumbnail shows the whole canvas (every artboard and any art outside them,
+       cropped to the art bounds), while stDim (MaxPageSize) is the active artboard. Thumbnails show
+       that whole canvas (D-029); the flag below only records that the two differ. */
     if (xmp) {
         size_t xlen = xend ? (size_t)(xend - xmp) : (size_t)(d + head - xmp);
         float w = abt_xmp_float(xmp, xlen, "stDim:w"), h = abt_xmp_float(xmp, xlen, "stDim:h");

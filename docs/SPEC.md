@@ -29,7 +29,9 @@ Detection is by content, never by extension alone (`.ai` files can be PostScript
 | PSD / PSB / PSDT / PDD | resource 1036 JFIF (about 160 px), 1033 (old, BGR JPEG) | merged composite (raw/RLE; all depths and modes; lcms2 colour) if resource 1057 says `hasRealMergedData`; otherwise layer compositor |
 | PDF | XMP thumbnail, page `/Thumb` | PDFium page 1 |
 
-Preview pane requests always use the render path (pane sizes are far above embedded preview sizes) and can ask for any page/artboard.
+Thumbnails show the whole document (`ABT_PAGE_CANVAS`, D-029). For Illustrator that is the full canvas: every artboard plus any art outside them. When the canvas is just artboard 1 (one artboard, art bounds from the private-data header inside it) the table above applies. Otherwise only Illustrator's XMP thumbnail holds the whole canvas (PDF pages carry each artboard's art clipped to that artboard), so it is used at every size, enlarged when needed.
+
+Preview pane requests show one page/artboard at a time and use the render path, except an Illustrator page 1 whose canvas is more than artboard 1, which never uses the XMP thumbnail. The pane prefetches the neighbouring pages (D-030).
 
 ## 2. Processes and IPC
 

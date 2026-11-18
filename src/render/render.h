@@ -11,7 +11,7 @@ namespace abt {
 struct RenderRequest {
     const wchar_t* path;
     int cx, cy;           // box; thumbnails use cx == cy
-    int page;             // 0-based
+    int page;             // 0-based, or ABT_PAGE_CANVAS for the whole document (thumbnails)
     uint32_t mode;        // ABT_MODE_*
     uint32_t flags;       // ABT_RF_*
     uint32_t deadline_ms; // 0 = none
@@ -45,6 +45,9 @@ void unmap_file(MappedFile* mf);
 // sets *no_pdf_content when an AI file only carries the "saved without PDF content" placeholder.
 HRESULT render_pdf(const uint8_t* data, size_t size, const RenderRequest& rq, abt_family fam, abt_image* out,
                    abt_file_info* info, bool* no_pdf_content);
+
+// Page count and first-page size in points, without rendering anything. False if unreadable.
+bool pdf_layout(const uint8_t* data, size_t size, int* pages, float* w0, float* h0);
 
 // EPS / PostScript AI through an installed Ghostscript (D-004). S_FALSE-like E_NOTIMPL if absent.
 HRESULT render_ghostscript(const wchar_t* path, const abt_probe& pr, const RenderRequest& rq, abt_image* out);

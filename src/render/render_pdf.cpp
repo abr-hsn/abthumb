@@ -58,6 +58,26 @@ static bool is_ai_placeholder(FPDF_PAGE page) {
     return hit;
 }
 
+bool pdf_layout(const uint8_t* data, size_t size, int* pages, float* w0, float* h0) {
+    *pages = 0;
+    *w0 = *h0 = 0;
+    pdfium_init();
+    // Loading parses the trailer and cross-reference table only; page sizes come from the page
+    // tree without parsing any content stream, so this stays around a millisecond.
+    FPDF_DOCUMENT doc = FPDF_LoadMemDocument64(data, size, nullptr);
+    if (!doc) return false;
+    int n = FPDF_GetPageCount(doc);
+    FS_SIZEF sz = {};
+    bool ok = n > 0 && FPDF_GetPageSizeByIndexF(doc, 0, &sz) && sz.width > 0 && sz.height > 0;
+    if (ok) {
+        *pages = n;
+        *w0 = sz.width;
+        *h0 = sz.height;
+    }
+    FPDF_CloseDocument(doc);
+    return ok;
+}
+
 HRESULT render_pdf(const uint8_t* data, size_t size, const RenderRequest& rq, abt_family fam, abt_image* out,
                    abt_file_info* info, bool* no_pdf_content) {
     *no_pdf_content = false;
@@ -70,13 +90,19 @@ HRESULT render_pdf(const uint8_t* data, size_t size, const RenderRequest& rq, ab
     }
     int pages = FPDF_GetPageCount(doc);
     info->page_count = pages > 0 ? (uint32_t)pages : 0;
-    int index = rq.page;
-    if (index < 0 || index >= pages) index = 0;
+    int index = (uint32_t)rq.page == ABT_PAGE_CANVAS ? 0 : rq.page;
+    if (index < 0 || index >= pages) {
+        // A page that does not exist (the file changed, or a stale request) is an error, not page 1:
+        // the preview pane would otherwise show artboard 1 labelled as another artboard.
+        FPDF_CloseDocument(doc);
+        return HRESULT_FROM_WIN32(ERROR_INVALID_INDEX);
+    }
     HRESULT hr = E_FAIL;
     FPDF_PAGE page = pages > 0 ? FPDF_LoadPage(doc, index) : nullptr;
     if (page) {
         float pw = FPDF_GetPageWidthF(page), ph = FPDF_GetPageHeightF(page);
-        if (index == 0) { info->pt_width = pw; info->pt_height = ph; }
+        info->pt_width = pw;  // size of the page / artboard shown
+        info->pt_height = ph;
         if (fam == ABT_FAM_AI_PDF && index == 0 && is_ai_placeholder(page)) {
             *no_pdf_content = true;
         } else if (pw > 0 && ph > 0) {

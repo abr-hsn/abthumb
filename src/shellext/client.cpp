@@ -33,7 +33,8 @@ static bool start_agent() {
     return true;
 }
 
-HRESULT request_image(uint16_t msg, const wchar_t* path, UINT cx, UINT cy, UINT page, abt_resp* resp, uint8_t** px) {
+HRESULT request_image(uint16_t msg, const wchar_t* path, UINT cx, UINT cy, UINT page, abt_resp* resp, uint8_t** px,
+                      uint32_t flags) {
     memset(resp, 0, sizeof(*resp));
     *px = nullptr;
     size_t plen = (size_t)lstrlenW(path);
@@ -43,6 +44,7 @@ HRESULT request_image(uint16_t msg, const wchar_t* path, UINT cx, UINT cy, UINT 
     req.cx = cx;
     req.cy = cy;
     req.page = page;
+    req.flags = flags;
     if (in_agent()) req.flags |= ABT_RF_FROM_PREWARM;
     const DWORD timeout = msg == ABT_MSG_PREVIEW ? 30000 : 15000;
     HRESULT hr = abt::pipe_call(req, path, timeout, resp, px);

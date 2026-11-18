@@ -45,7 +45,9 @@ typedef struct abt_probe {
     abt_file_info info;
     int n_previews;
     abt_preview previews[ABT_MAX_PREVIEWS];
-    /* PostScript (EPS / AI 1-8): where the PostScript program is, and its bounding box. */
+    /* PostScript (EPS / AI 1-8): where the PostScript program is, and its bounding box.
+       Illustrator 9+: bounds of all art (on and off the artboards) from the private-data header
+       (%%HiResBoundingBox), in artboard-1 coordinates, i.e. PDF page 1 user space (D-029). */
     uint64_t ps_offset, ps_length;
     float bbox[4];        /* llx lly urx ury in points; all 0 if unknown */
     /* PSD / PSB section offsets (see abt_psd.h) */

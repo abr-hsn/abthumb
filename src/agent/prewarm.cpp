@@ -228,7 +228,7 @@ static void process_folder(const Hint& h, IThumbnailCache* tc) {
             if (!file_key(path, &k)) continue;
             abt_image img = {};
             CacheEntryView v;
-            if (cache_get(k, 0, h.edge, &img, &v)) {  // already done
+            if (cache_get(k, ABT_PAGE_CANVAS, h.edge, &img, &v)) {  // already done
                 abt_image_free(&img);
                 InterlockedIncrement64(&g_skipped_cached);
                 continue;
@@ -240,7 +240,7 @@ static void process_folder(const Hint& h, IThumbnailCache* tc) {
                 yielded = true;
                 break;
             }
-            pending[i - base] = job_submit(path, k, 0, h.edge, h.edge, ABT_MODE_AUTO, 0, i < 64 ? LANE_VISIBLE : LANE_FOLDER);
+            pending[i - base] = job_submit(path, k, ABT_PAGE_CANVAS, h.edge, h.edge, ABT_MODE_AUTO, 0, i < 64 ? LANE_VISIBLE : LANE_FOLDER);
             InterlockedIncrement64(&g_queued);
         }
         // Phase 2: Explorer's cache, as each of our renditions completes.

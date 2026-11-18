@@ -24,11 +24,11 @@ static void usage() {
         "  abthumb shelltest PATH... [--size N] [--force] [--repeat N] [--out DIR]\n"
         "        drive the real shell thumbnail pipeline (IShellItemImageFactory, or\n"
         "        IThumbnailCache with WTS_FORCEEXTRACTION when --force)\n"
-        "  abthumb render PATH... [--size N | --box W H] [--page N] [--fast|--render|--probe] [--max]\n"
+        "  abthumb render PATH... [--size N | --box W H] [--page N | --canvas] [--fast|--render|--probe] [--max]\n"
         "        [--repeat N] [--out DIR]   run the render pipeline in-process (no agent)\n"
         "  abthumb bench DIR... [--size N] [--agent] [-v]   latency percentiles vs the WIC/FPV path\n"
         "  abthumb thumbtest FILE [--size N] [--repeat N]   our provider in-process (DLL -> agent)\n"
-        "  abthumb previewtest FILE [--out PNG] [--inproc] [--size W H] [--wait MS]\n"
+        "  abthumb previewtest FILE [--out PNG] [--inproc | --dll PATH] [--size W H] [--wait MS] [--nav N [--step MS]]\n"
         "        host the preview handler like Explorer's preview pane and capture it\n",
         stderr);
 }
@@ -211,6 +211,7 @@ static int cmd_render(int argc, wchar_t** argv) {
         if (arg_is(argv[i], L"--size") && i + 1 < argc) o.cx = _wtoi(argv[++i]);
         else if (arg_is(argv[i], L"--box") && i + 2 < argc) { o.cx = _wtoi(argv[++i]); o.cy = _wtoi(argv[++i]); }
         else if (arg_is(argv[i], L"--page") && i + 1 < argc) o.page = _wtoi(argv[++i]);
+        else if (arg_is(argv[i], L"--canvas")) o.page = (int)ABT_PAGE_CANVAS;  // what thumbnails show
         else if (arg_is(argv[i], L"--repeat") && i + 1 < argc) o.repeat = _wtoi(argv[++i]);
         else if (arg_is(argv[i], L"--out") && i + 1 < argc) o.out = argv[++i];
         else if (arg_is(argv[i], L"--fast")) o.mode = ABT_MODE_FAST;
@@ -448,13 +449,17 @@ static LRESULT CALLBACK host_wndproc(HWND h, UINT m, WPARAM w, LPARAM l) { retur
 static int cmd_previewtest(int argc, wchar_t** argv) {
     const wchar_t* file = nullptr;
     const wchar_t* out = nullptr;
+    const wchar_t* dll = nullptr;  // load this build's DLL directly (no registration needed)
     bool inproc = false;
-    int w = 800, h = 600, wait_ms = 1500;
+    int w = 800, h = 600, wait_ms = 1500, nav = 0, step_ms = 400;
     for (int i = 0; i < argc; ++i) {
         if (arg_is(argv[i], L"--out") && i + 1 < argc) out = argv[++i];
         else if (arg_is(argv[i], L"--inproc")) inproc = true;
         else if (arg_is(argv[i], L"--size") && i + 2 < argc) { w = _wtoi(argv[++i]); h = _wtoi(argv[++i]); }
         else if (arg_is(argv[i], L"--wait") && i + 1 < argc) wait_ms = _wtoi(argv[++i]);
+        else if (arg_is(argv[i], L"--dll") && i + 1 < argc) { dll = argv[++i]; inproc = true; }
+        else if (arg_is(argv[i], L"--nav") && i + 1 < argc) nav = _wtoi(argv[++i]);  // press Right N times
+        else if (arg_is(argv[i], L"--step") && i + 1 < argc) step_ms = _wtoi(argv[++i]);
         else file = argv[i];
     }
     if (!file) { usage(); return 2; }
@@ -475,8 +480,18 @@ static int cmd_previewtest(int argc, wchar_t** argv) {
 
     uint64_t t0 = abt::qpc();
     IPreviewHandler* ph = nullptr;
-    HRESULT hr = CoCreateInstance(CLSID_AbtPreviewHandler, nullptr, inproc ? CLSCTX_INPROC_SERVER : CLSCTX_LOCAL_SERVER,
-                                  IID_PPV_ARGS(&ph));
+    HRESULT hr = E_FAIL;
+    if (dll) {
+        HMODULE mod = LoadLibraryW(dll);
+        typedef HRESULT(STDAPICALLTYPE * GetClassObjectFn)(REFCLSID, REFIID, void**);
+        GetClassObjectFn gco = mod ? (GetClassObjectFn)GetProcAddress(mod, "DllGetClassObject") : nullptr;
+        IClassFactory* cf = nullptr;
+        hr = gco ? gco(CLSID_AbtPreviewHandler, IID_PPV_ARGS(&cf)) : HRESULT_FROM_WIN32(GetLastError());
+        if (SUCCEEDED(hr)) { hr = cf->CreateInstance(nullptr, IID_PPV_ARGS(&ph)); cf->Release(); }
+    } else {
+        hr = CoCreateInstance(CLSID_AbtPreviewHandler, nullptr, inproc ? CLSCTX_INPROC_SERVER : CLSCTX_LOCAL_SERVER,
+                              IID_PPV_ARGS(&ph));
+    }
     printf("CoCreateInstance(%s): 0x%08lx  %.1f ms\n", inproc ? "inproc" : "local server", hr, abt::qpc_ms(t0, abt::qpc()));
     if (FAILED(hr)) { DestroyWindow(host); return 1; }
     IInitializeWithItem* iwi = nullptr;
@@ -496,30 +511,41 @@ static int cmd_previewtest(int argc, wchar_t** argv) {
     if (SUCCEEDED(hr)) hr = ph->SetWindow(host, &rc);
     if (SUCCEEDED(hr)) hr = ph->DoPreview();
     printf("DoPreview: 0x%08lx  %.1f ms since create\n", hr, abt::qpc_ms(t0, abt::qpc()));
-    uint64_t until = abt::qpc();
-    while (abt::qpc_ms(until, abt::qpc()) < wait_ms) {
-        MSG msg;
-        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
-        Sleep(10);
-    }
-    if (out) {
+    IOleWindow* ow = nullptr;
+    HWND child = nullptr;
+    if (inproc && SUCCEEDED(ph->QueryInterface(IID_PPV_ARGS(&ow)))) { ow->GetWindow(&child); ow->Release(); }
+    // --nav N: after the first wait, press Right N times (step_ms apart), capturing after each step
+    // into <out>.<step>.png, to check artboard cycling.
+    for (int step = 0; step <= nav; ++step) {
+        if (step && child) {
+            SendMessageW(child, WM_KEYDOWN, VK_RIGHT, 0);
+            printf("step %d: Right\n", step);
+        }
+        uint64_t until = abt::qpc();
+        int ms = step ? step_ms : wait_ms;
+        while (abt::qpc_ms(until, abt::qpc()) < ms) {
+            MSG msg;
+            while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
+            Sleep(5);
+        }
+        if (!out) continue;
+        wchar_t path[MAX_PATH];
+        if (step) _snwprintf_s(path, MAX_PATH, _TRUNCATE, L"%s.%d.png", out, step);
+        else lstrcpynW(path, out, MAX_PATH);
         void* bits = nullptr;
         HBITMAP bmp = abt::create_dib32(w, h, &bits);
         HDC wdc = GetDC(host);
         HDC mdc = CreateCompatibleDC(wdc);
         HGDIOBJ old = SelectObject(mdc, bmp);
         // In-process: ask our window to paint itself (works off-screen). Out of process: DWM capture.
-        IOleWindow* ow = nullptr;
-        HWND child = nullptr;
-        if (inproc && SUCCEEDED(ph->QueryInterface(IID_PPV_ARGS(&ow)))) { ow->GetWindow(&child); ow->Release(); }
         if (child) SendMessageW(child, WM_PRINTCLIENT, (WPARAM)mdc, PRF_CLIENT);
         else PrintWindow(host, mdc, PW_CLIENTONLY | PW_RENDERFULLCONTENT);
         SelectObject(mdc, old);
         DeleteDC(mdc);
         ReleaseDC(host, wdc);
         for (int i = 0; i < w * h; ++i) ((uint8_t*)bits)[i * 4 + 3] = 255;
-        HRESULT shr = abt::save_png_bgra(out, (const uint8_t*)bits, w, h, w * 4, false);
-        printf("capture -> %ls: 0x%08lx\n", out, shr);
+        HRESULT shr = abt::save_png_bgra(path, (const uint8_t*)bits, w, h, w * 4, false);
+        printf("capture -> %ls: 0x%08lx\n", path, shr);
         DeleteObject(bmp);
     }
     ph->Unload();
