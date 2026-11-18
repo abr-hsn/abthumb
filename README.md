@@ -18,13 +18,16 @@ Fast, accurate Windows Explorer thumbnails and preview pane for Adobe Illustrato
 
 ## Install
 
-1. Run `install.cmd` from a release folder (or build one, below). Windows asks for administrator
-   permission once: Explorer only loads thumbnail handlers that are registered machine-wide.
-2. Say yes when asked to clear Explorer's thumbnail cache, so thumbnails made by the previous
-   handler (for example FastPictureViewer's small embedded previews) are regenerated.
+1. Run `abthumb-setup-<version>-x64.exe`. Windows asks for administrator permission once:
+   Explorer only loads thumbnail handlers that are registered machine-wide.
+2. Leave "Clear Explorer's thumbnail cache" ticked, so thumbnails made by the previous handler
+   (for example FastPictureViewer's small embedded previews) are regenerated.
 
-`uninstall.cmd` (or Settings > Apps) removes abthumb and gives the file types back to whatever
-handled them before.
+Running the setup again repairs the registration (for example after another program's
+uninstaller removed it) and upgrades in place without restarting Explorer. Uninstall from
+Settings > Apps: it stops abthumb, gives the file types back to whatever handled them before and
+deletes the thumbnail cache. Silent: `abthumb-setup-<version>-x64.exe /VERYSILENT /TASKS=resetcache`.
+Checksums of every shipped file are in `SHA256SUMS.txt`.
 
 Optional: install [Ghostscript](https://ghostscript.com) if you have EPS or Illustrator 3-8 files
 without embedded previews; abthumb uses it automatically when present.

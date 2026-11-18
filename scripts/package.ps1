@@ -1,4 +1,5 @@
-# Builds a release and assembles dist\abthumb-<version>-x64 (+ .zip).
+# Builds a release, assembles dist\abthumb-<version>-x64 and compiles the installer
+# dist\abthumb-setup-<version>-x64.exe (Inno Setup 6), plus SHA256SUMS.txt.
 param([string]$Preset = "release")
 $ErrorActionPreference = "Stop"
 $root = Resolve-Path "$PSScriptRoot\.."
@@ -12,12 +13,25 @@ New-Item -ItemType Directory -Force "$out\licenses" | Out-Null
 foreach ($f in "abthumb.dll", "abthumb.exe", "abthumb-agent.exe", "abthumb-render.exe", "abthumb-preview.exe", "pdfium.dll") {
   Copy-Item "$bin\$f" $out
 }
-Copy-Item "$root\LICENSE", "$root\README.md", "$root\THIRD_PARTY_NOTICES.md", "$root\scripts\install.cmd", "$root\scripts\uninstall.cmd", "$root\scripts\install.ps1" $out
+Copy-Item "$root\LICENSE", "$root\README.md", "$root\THIRD_PARTY_NOTICES.md" $out
 Copy-Item "$root\third_party\pdfium\LICENSE" "$out\licenses\pdfium-LICENSE.txt"
 Copy-Item "$root\third_party\pdfium\licenses\*" "$out\licenses\"
 Copy-Item "$root\third_party\miniz\LICENSE" "$out\licenses\miniz-LICENSE.txt"
-$zip = "$out.zip"
-if (Test-Path $zip) { Remove-Item $zip }
-Compress-Archive -Path "$out\*" -DestinationPath $zip
-Write-Host "package: $out"
-Write-Host "zip:     $zip ($([math]::Round((Get-Item $zip).Length / 1MB, 1)) MB)"
+
+# Installer
+$iscc = @("$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe", "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+          "$env:ProgramFiles\Inno Setup 6\ISCC.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
+if (-not $iscc) { throw "Inno Setup 6 not found (winget install JRSoftware.InnoSetup --scope user)" }
+& $iscc /Q "/DAppVer=$ver" "$root\installer\abthumb.iss"
+if ($LASTEXITCODE) { throw "installer build failed" }
+$setup = "$root\dist\abthumb-setup-$ver-x64.exe"
+
+# Checksums for everything we ship
+$sums = Get-ChildItem $out -Recurse -File | ForEach-Object {
+  "{0}  {1}" -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower(), $_.FullName.Substring($out.Length + 1)
+}
+$sums += "{0}  {1}" -f (Get-FileHash $setup -Algorithm SHA256).Hash.ToLower(), (Split-Path $setup -Leaf)
+$sums | Set-Content "$root\dist\SHA256SUMS.txt" -Encoding ascii
+Write-Host "files:     $out"
+Write-Host "installer: $setup ($([math]::Round((Get-Item $setup).Length / 1MB, 1)) MB)"
+Write-Host "checksums: $root\dist\SHA256SUMS.txt"
