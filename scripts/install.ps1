@@ -102,13 +102,19 @@ $log = Join-Path $env:TEMP "abthumb-setup-$PID.log"
 $elevArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$PSCommandPath`"", "-ElevatedStep", "-Dir", "`"$Dir`"", "-Log", "`"$log`"")
 if ($Uninstall) { $elevArgs += "-Uninstall" }
 try {
-    $p = Start-Process powershell.exe -Verb RunAs -ArgumentList $elevArgs -WindowStyle Hidden -Wait -PassThru
+    $p = Start-Process powershell.exe -Verb RunAs -ArgumentList $elevArgs -WindowStyle Hidden -PassThru
+    $null = $p.Handle   # keep the handle so ExitCode is readable for an elevated process
+    $p.WaitForExit()
 } catch {
     Write-Host "Administrator permission was declined; nothing was changed."
     exit 1
 }
-if (Test-Path $log) { Get-Content $log | ForEach-Object { Write-Host $_ }; Remove-Item $log -Force }
-if ($p.ExitCode -ne 0) { Write-Host "Setup failed (exit $($p.ExitCode))."; exit $p.ExitCode }
+$failed = $false
+if (Test-Path $log) {
+    Get-Content $log | ForEach-Object { Write-Host $_; if ($_ -like "ERROR:*") { $failed = $true } }
+    Remove-Item $log -Force
+}
+if ($failed -or ($null -ne $p.ExitCode -and $p.ExitCode -ne 0)) { Write-Host "Setup failed (exit $($p.ExitCode))."; exit 1 }
 
 # Per-user developer registrations (HKCU) would shadow the machine-wide ones for in-process callers.
 foreach ($clsid in "{0A1153BB-F895-4458-8DE8-D08EDC536A91}", "{A4E31D04-2524-467B-9B51-520F3D114E32}") {
