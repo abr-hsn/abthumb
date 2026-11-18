@@ -4,6 +4,8 @@
 #include "abt_proto.h"
 #include "render.h"
 #include <objbase.h>
+#include <shlobj.h>
+#include <knownfolders.h>
 
 static void enter_background_mode() {
     // EcoQoS: lets the scheduler put us on efficiency cores at low clocks (D-017).
@@ -22,6 +24,21 @@ int wmain(int argc, wchar_t** argv) {
         if (!lstrcmpiW(argv[i], L"--background")) background = true;
     // Never show error dialogs from a background renderer.
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
+    // At low integrity (the agent's sandbox) %TEMP% is read-only to us; Ghostscript and any
+    // library temp files go to the low-integrity profile folder instead.
+    if (abt::is_below_medium_integrity()) {
+        PWSTR low = nullptr;
+        if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppDataLow, KF_FLAG_DEFAULT, nullptr, &low))) {
+            wchar_t tmp[MAX_PATH];
+            _snwprintf_s(tmp, MAX_PATH, _TRUNCATE, L"%s\\abthumb\\tmp", low);
+            CoTaskMemFree(low);
+            int rc = SHCreateDirectoryExW(nullptr, tmp, nullptr);
+            if (rc == ERROR_SUCCESS || rc == ERROR_ALREADY_EXISTS) {
+                SetEnvironmentVariableW(L"TEMP", tmp);
+                SetEnvironmentVariableW(L"TMP", tmp);
+            }
+        }
+    }
     abt::log_init(L"worker");
     if (background) enter_background_mode();
     if (FAILED(CoInitializeEx(nullptr, COINIT_MULTITHREADED))) return 1;

@@ -17,8 +17,9 @@ Only the latest release gets security fixes.
   pipe and copies the returned pixels into a bitmap, after validating every size field.
 * `abthumb-agent.exe` (per user) owns the cache and scheduling and never parses file content.
   Callers below medium integrity can only request images.
-* `abthumb-render.exe` workers do all parsing and rendering inside a job object (memory cap,
-  kill on close, per-request deadline). Their replies are validated like any untrusted input.
+* `abthumb-render.exe` workers do all parsing and rendering at low integrity, with process
+  mitigations, inside a job object (memory cap, process cap, UI limits, kill on close,
+  per-request deadline). Their replies are validated like any untrusted input.
 * Parsers are fuzzed with libFuzzer and AddressSanitizer (`tests/fuzz`).
 
 Details and known limitations: [DECISIONS.md](DECISIONS.md), entries D-005 and D-028.

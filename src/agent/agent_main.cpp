@@ -93,9 +93,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
         DispatchMessageW(&msg);
     }
     logf("agent stopping");
+    // Pool first: it cancels queued jobs, which wakes pipe threads waiting on them.
     prewarm_stop();
-    server_stop();
     pool_stop();
+    server_stop();
     cache_close();
     CloseHandle(g_quit_event);
     ReleaseMutex(mutex);

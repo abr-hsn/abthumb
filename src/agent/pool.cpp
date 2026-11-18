@@ -90,6 +90,7 @@ Job* job_submit(const wchar_t* path, const FileKey& k, uint32_t page, int cx, in
                 Lane lane) {
     int tier = tier_for(cx > cy ? cx : cy);
     AcquireSRWLockExclusive(&g_lock);
+    if (g_stop) { ReleaseSRWLockExclusive(&g_lock); return nullptr; }  // shutting down: nobody would run it
     for (Job* a = g_active; a; a = a->anext) {
         if (a->key.hi == k.hi && a->key.lo == k.lo && a->key.mtime == k.mtime && a->page == page &&
             a->tier == tier && a->mode == mode) {
@@ -183,6 +184,34 @@ static void finish(Job* j) {
 
 // ------------------------------------------------------------------ worker processes
 
+// ------------------------------------------------------------------ worker sandbox
+// Workers parse untrusted files, so they run with a low-integrity copy of our token: they can
+// still read what the user can read (they must), but cannot write to the user's files, registry
+// or processes. Opt-out for troubleshooting: HKCU\Software\abthumb\WorkerLowIntegrity = 0.
+static HANDLE g_worker_token = nullptr;
+
+static HANDLE make_worker_token() {
+    if (!reg_get_dword(HKEY_CURRENT_USER, ABT_REG_ROOT, L"WorkerLowIntegrity", 1)) return nullptr;
+    HANDLE self = nullptr, tok = nullptr;
+    const DWORD access = TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ADJUST_DEFAULT | TOKEN_ASSIGN_PRIMARY;
+    if (!OpenProcessToken(GetCurrentProcess(), access, &self)) return nullptr;
+    bool ok = DuplicateTokenEx(self, access, nullptr, SecurityImpersonation, TokenPrimary, &tok) != 0;
+    CloseHandle(self);
+    if (!ok) return nullptr;
+    SID_IDENTIFIER_AUTHORITY ml = SECURITY_MANDATORY_LABEL_AUTHORITY;
+    PSID low = nullptr;
+    ok = AllocateAndInitializeSid(&ml, 1, SECURITY_MANDATORY_LOW_RID, 0, 0, 0, 0, 0, 0, 0, &low) != 0;
+    if (ok) {
+        TOKEN_MANDATORY_LABEL tml = {};
+        tml.Label.Attributes = SE_GROUP_INTEGRITY;
+        tml.Label.Sid = low;
+        ok = SetTokenInformation(tok, TokenIntegrityLevel, &tml, sizeof(tml) + GetLengthSid(low)) != 0;
+        FreeSid(low);
+    }
+    if (!ok) { CloseHandle(tok); return nullptr; }
+    return tok;
+}
+
 static void slot_close(Slot* s) {
     if (s->in_w) CloseHandle(s->in_w);
     if (s->out_r) CloseHandle(s->out_r);
@@ -205,14 +234,21 @@ static bool slot_spawn(Slot* s) {
     SetHandleInformation(s->in_w, HANDLE_FLAG_INHERIT, 0);
     SetHandleInformation(s->out_r, HANDLE_FLAG_INHERIT, 0);
 
-    // Inherit exactly the two pipe ends, nothing else.
+    // Inherit exactly the two pipe ends, nothing else; no extension-point DLLs, no images from
+    // remote or low-integrity locations, terminate on heap corruption.
     SIZE_T attr_size = 0;
-    InitializeProcThreadAttributeList(nullptr, 1, 0, &attr_size);
+    InitializeProcThreadAttributeList(nullptr, 2, 0, &attr_size);
     LPPROC_THREAD_ATTRIBUTE_LIST attrs = (LPPROC_THREAD_ATTRIBUTE_LIST)mem_alloc(attr_size);
     HANDLE inherit[2] = {child_in, child_out};
-    bool ok = attrs && InitializeProcThreadAttributeList(attrs, 1, 0, &attr_size) &&
+    DWORD64 mitigations = PROCESS_CREATION_MITIGATION_POLICY_EXTENSION_POINT_DISABLE_ALWAYS_ON |
+                          PROCESS_CREATION_MITIGATION_POLICY_HEAP_TERMINATE_ALWAYS_ON |
+                          PROCESS_CREATION_MITIGATION_POLICY_IMAGE_LOAD_NO_REMOTE_ALWAYS_ON |
+                          PROCESS_CREATION_MITIGATION_POLICY_IMAGE_LOAD_NO_LOW_LABEL_ALWAYS_ON;
+    bool ok = attrs && InitializeProcThreadAttributeList(attrs, 2, 0, &attr_size) &&
               UpdateProcThreadAttribute(attrs, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherit, sizeof(inherit), nullptr,
-                                        nullptr);
+                                        nullptr) &&
+              UpdateProcThreadAttribute(attrs, 0, PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY, &mitigations,
+                                        sizeof(mitigations), nullptr, nullptr);
     STARTUPINFOEXW si = {};
     si.StartupInfo.cb = sizeof(si);
     si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
@@ -223,10 +259,19 @@ static bool slot_spawn(Slot* s) {
     wchar_t cmd[MAX_PATH + 32];
     _snwprintf_s(cmd, _countof(cmd), _TRUNCATE, L"\"%s\"%s", g_worker_exe, s->background ? L" --background" : L"");
     PROCESS_INFORMATION pi = {};
-    if (ok)
-        ok = CreateProcessW(g_worker_exe, cmd, nullptr, nullptr, TRUE,
-                            CREATE_SUSPENDED | CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT, nullptr, nullptr,
-                            &si.StartupInfo, &pi) != 0;
+    const DWORD cflags = CREATE_SUSPENDED | CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT;
+    if (ok && g_worker_token) {
+        ok = CreateProcessAsUserW(g_worker_token, g_worker_exe, cmd, nullptr, nullptr, TRUE, cflags, nullptr, nullptr,
+                                  &si.StartupInfo, &pi) != 0;
+        if (!ok) {  // keep thumbnails working, but say so
+            logf("low-integrity worker spawn failed (%lu); using a normal worker", GetLastError());
+            CloseHandle(g_worker_token);
+            g_worker_token = nullptr;
+            ok = true;
+        }
+    }
+    if (ok && !pi.hProcess)
+        ok = CreateProcessW(g_worker_exe, cmd, nullptr, nullptr, TRUE, cflags, nullptr, nullptr, &si.StartupInfo, &pi) != 0;
     if (attrs) { DeleteProcThreadAttributeList(attrs); mem_free(attrs); }
     CloseHandle(child_in);
     CloseHandle(child_out);
@@ -340,7 +385,17 @@ static DWORD WINAPI slot_thread(void* p) {
         }
         if (j) s->job = j;
         ReleaseSRWLockExclusive(&g_lock);
-        if (g_stop) break;
+        if (g_stop) {
+            if (j) {  // picked just as we stopped: its waiters must still wake up
+                memset(&j->res, 0, sizeof(j->res));
+                j->res.hr = HRESULT_FROM_WIN32(ERROR_CANCELLED);
+                AcquireSRWLockExclusive(&g_lock);
+                s->job = nullptr;
+                ReleaseSRWLockExclusive(&g_lock);
+                finish(j);
+            }
+            break;
+        }
         if (!j) {  // idle timeout: let the worker go
             if (s->proc) {
                 abt_req q;
@@ -394,17 +449,24 @@ bool pool_start(int fg, int bg) {
     module_dir(nullptr, dir, MAX_PATH);
     _snwprintf_s(g_worker_exe, MAX_PATH, _TRUNCATE, L"%s\\abthumb-render.exe", dir);
     g_job_obj = CreateJobObjectW(nullptr, nullptr);
+    if (fg < 1) fg = 1;
+    if (bg < 0) bg = 0;
+    if (fg + bg > (int)_countof(g_slots)) bg = (int)_countof(g_slots) - fg;
+    g_worker_token = make_worker_token();
+    logf("render workers: %s integrity", g_worker_token ? "low" : "normal");
     if (g_job_obj) {
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION li = {};
         li.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE |
                                               JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION |
-                                              JOB_OBJECT_LIMIT_PROCESS_MEMORY;
+                                              JOB_OBJECT_LIMIT_PROCESS_MEMORY | JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
         li.ProcessMemoryLimit = (SIZE_T)2048 << 20;  // a pathological file cannot eat the machine
+        li.BasicLimitInformation.ActiveProcessLimit = (DWORD)(fg + bg) * 2 + 2;  // workers + Ghostscript children
         SetInformationJobObject(g_job_obj, JobObjectExtendedLimitInformation, &li, sizeof(li));
+        JOBOBJECT_BASIC_UI_RESTRICTIONS ui = {JOB_OBJECT_UILIMIT_DESKTOP | JOB_OBJECT_UILIMIT_DISPLAYSETTINGS |
+                                              JOB_OBJECT_UILIMIT_EXITWINDOWS | JOB_OBJECT_UILIMIT_READCLIPBOARD |
+                                              JOB_OBJECT_UILIMIT_WRITECLIPBOARD | JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS};
+        SetInformationJobObject(g_job_obj, JobObjectBasicUIRestrictions, &ui, sizeof(ui));
     }
-    if (fg < 1) fg = 1;
-    if (bg < 0) bg = 0;
-    if (fg + bg > (int)_countof(g_slots)) bg = (int)_countof(g_slots) - fg;
     g_nslots = 0;
     for (int i = 0; i < fg + bg; ++i) {
         Slot* s = &g_slots[g_nslots++];
@@ -417,27 +479,41 @@ bool pool_start(int fg, int bg) {
 }
 
 void pool_stop() {
+    // Stop accepting work and take every queued job off the lanes (under the lock), then fail
+    // them outside it so their waiters (pipe server threads) wake up now, not at their deadline.
+    Job* cancelled = nullptr;
     AcquireSRWLockExclusive(&g_lock);
     g_stop = true;
-    WakeAllConditionVariable(&g_cv);
-    ReleaseSRWLockExclusive(&g_lock);
-    for (int i = 0; i < g_nslots; ++i) {
-        if (g_slots[i].thread) {
-            WaitForSingleObject(g_slots[i].thread, 5000);
-            CloseHandle(g_slots[i].thread);
-        }
-    }
-    if (g_watchdog) { WaitForSingleObject(g_watchdog, 1000); CloseHandle(g_watchdog); }
-    // Fail whatever is still queued so waiters wake up.
     for (int l = 0; l < LANE_COUNT; ++l) {
         while (Job* j = g_head[l]) {
             g_head[l] = j->next;
-            j->res.hr = HRESULT_FROM_WIN32(ERROR_CANCELLED);
-            finish(j);
+            j->next = cancelled;
+            cancelled = j;
         }
         g_tail[l] = nullptr;
     }
+    WakeAllConditionVariable(&g_cv);
+    ReleaseSRWLockExclusive(&g_lock);
+    while (Job* j = cancelled) {
+        cancelled = j->next;
+        j->next = nullptr;
+        memset(&j->res, 0, sizeof(j->res));
+        j->res.hr = HRESULT_FROM_WIN32(ERROR_CANCELLED);
+        finish(j);
+    }
+    // Running jobs: give them a moment, then kill the workers so blocked reads return.
+    HANDLE th[_countof(g_slots)];
+    DWORD n = 0;
+    for (int i = 0; i < g_nslots; ++i)
+        if (g_slots[i].thread) th[n++] = g_slots[i].thread;
+    if (n && WaitForMultipleObjects(n, th, TRUE, 3000) == WAIT_TIMEOUT && g_job_obj) {
+        TerminateJobObject(g_job_obj, 1);
+        WaitForMultipleObjects(n, th, TRUE, 3000);
+    }
+    for (DWORD i = 0; i < n; ++i) CloseHandle(th[i]);
+    if (g_watchdog) { WaitForSingleObject(g_watchdog, 1000); CloseHandle(g_watchdog); }
     if (g_job_obj) CloseHandle(g_job_obj);
+    if (g_worker_token) { CloseHandle(g_worker_token); g_worker_token = nullptr; }
 }
 
 void pool_stats(char* buf, size_t cap) {

@@ -347,12 +347,14 @@ void server_stop() {
         HANDLE h = CreateFileW(g_name, GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
         if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
     }
-    for (int i = 0; i < g_nthreads; ++i) {
-        if (WaitForSingleObject(g_threads[i], 2000) != WAIT_OBJECT_0) CancelSynchronousIo(g_threads[i]);
-        CloseHandle(g_threads[i]);
-    }
+    // Every pipe read/write has a timeout and the pool has already cancelled queued jobs, so
+    // threads finish within a few seconds. If one still runs, keep what it may touch alive.
+    bool all_done = !g_nthreads ||
+                    WaitForMultipleObjects((DWORD)g_nthreads, g_threads, TRUE, 8000) != WAIT_TIMEOUT;
+    if (!all_done) logf("pipe server: threads still busy at shutdown");
+    for (int i = 0; i < g_nthreads; ++i) CloseHandle(g_threads[i]);
     g_nthreads = 0;
-    if (g_sd) { LocalFree(g_sd); g_sd = nullptr; }
+    if (all_done && g_sd) { LocalFree(g_sd); g_sd = nullptr; }
 }
 
 }  // namespace abt

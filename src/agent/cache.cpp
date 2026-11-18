@@ -257,12 +257,13 @@ struct IdxHdr {
 
 static void snapshot_path(wchar_t* out) { _snwprintf_s(out, MAX_PATH, _TRUNCATE, L"%s\\index.abi", g_dir); }
 
-static void snapshot_write() {
-    if (!g_dirty) return;
+// Serialises the index (lock held). Returns null when nothing changed. Clears g_dirty.
+static uint8_t* snapshot_build(size_t* out_bytes) {
+    if (!g_dirty) return nullptr;
     size_t nseg = (size_t)g_nsegs, nent = g_count;
     size_t bytes = sizeof(IdxHdr) + nseg * 16 + nent * sizeof(Entry);
     uint8_t* buf = (uint8_t*)mem_alloc(bytes);
-    if (!buf) return;
+    if (!buf) return nullptr;
     IdxHdr* hd = (IdxHdr*)buf;
     hd->magic = kIdxMagic; hd->version = 1; hd->renderer_ver = kRendererVersion; hd->nsegs = (uint32_t)nseg;
     hd->count = (uint32_t)nent; hd->live_bytes = g_live_bytes;
@@ -283,15 +284,28 @@ static void snapshot_write() {
     hd->count = (uint32_t)written;
     bytes = (size_t)(p - buf);
     hd->crc = crc32(0, buf + sizeof(IdxHdr), bytes - sizeof(IdxHdr));
+    g_dirty = false;
+    *out_bytes = bytes;
+    return buf;
+}
+
+// Writes a built snapshot atomically (temp file, flush, rename). No lock needed: only the
+// maintenance thread and cache_close write snapshots.
+static bool snapshot_save(const uint8_t* buf, size_t bytes) {
     wchar_t path[MAX_PATH], tmp[MAX_PATH];
     snapshot_path(path);
     _snwprintf_s(tmp, MAX_PATH, _TRUNCATE, L"%s.tmp", path);
     HANDLE h = CreateFileW(tmp, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h != INVALID_HANDLE_VALUE) {
-        bool ok = write_all(h, buf, bytes);
-        CloseHandle(h);
-        if (ok && MoveFileExW(tmp, path, MOVEFILE_REPLACE_EXISTING)) g_dirty = false;
-    }
+    if (h == INVALID_HANDLE_VALUE) return false;
+    bool ok = write_all(h, buf, bytes) && FlushFileBuffers(h);
+    CloseHandle(h);
+    return ok && MoveFileExW(tmp, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+}
+
+static void snapshot_write() {
+    size_t bytes = 0;
+    uint8_t* buf = snapshot_build(&bytes);
+    if (buf && !snapshot_save(buf, bytes)) g_dirty = true;
     mem_free(buf);
 }
 
@@ -541,27 +555,43 @@ static int cmp_access(const void* a, const void* b) {
     return x < y ? -1 : x > y;
 }
 
-static void compact_segment(Seg* s) {
-    // Copy live records of s to the active segment, then delete s.
+// Moves the live records of segment `id` to the active segment, then deletes it. Called with the
+// lock held exclusively; reads each record with the lock released, so thumbnail requests are only
+// held up for one record's append at a time instead of the whole segment (up to 64 MB).
+// Only maintenance closes or removes segments, so the source handle stays valid while unlocked.
+static void compact_segment_locked(uint32_t id) {
     uint8_t* buf = nullptr;
     size_t cap = 0;
     for (uint32_t i = 0; i < g_cap; ++i) {
         Entry* e = &g_tab[i];
-        if (e->tier == 0 || e->tier == kTomb || e->seg != s->id) continue;
-        if (e->rec_len > cap) { mem_free(buf); buf = (uint8_t*)mem_alloc(e->rec_len); cap = buf ? e->rec_len : 0; }
-        if (!buf || !pread(s->h, e->offset, buf, e->rec_len)) { remove_entry(e); continue; }
-        Seg* a = active_seg(e->rec_len);
-        if (!a || a == s || !pwrite(a->h, a->size, buf, e->rec_len)) { remove_entry(e); continue; }
+        if (e->tier == 0 || e->tier == kTomb || e->seg != id) continue;
+        const Entry snap = *e;
+        Seg* s = seg_by_id(id);
+        if (!s) break;
+        HANDLE src = s->h;
+        if (snap.rec_len > cap) { mem_free(buf); buf = (uint8_t*)mem_alloc(snap.rec_len); cap = buf ? snap.rec_len : 0; }
+        ReleaseSRWLockExclusive(&g_lock);
+        bool got = buf && pread(src, snap.offset, buf, snap.rec_len);
+        AcquireSRWLockExclusive(&g_lock);
+        // The table may have been rehashed or the entry replaced meanwhile: look it up again.
+        e = find(snap.key_hi, snap.key_lo, snap.page, snap.tier);
+        if (!e || e->seg != id || e->offset != snap.offset) { i = UINT32_MAX; continue; }  // rescan from 0
+        if (!got) { remove_entry(e); continue; }
+        Seg* a = active_seg(snap.rec_len);
+        s = seg_by_id(id);
+        if (!a || a->id == id || !s || !pwrite(a->h, a->size, buf, snap.rec_len)) { remove_entry(e); continue; }
         e->seg = a->id;
         e->offset = a->size;
-        a->size += e->rec_len;
-        a->live += e->rec_len;
-        s->live -= e->rec_len;
+        a->size += snap.rec_len;
+        a->live += snap.rec_len;
+        s->live -= snap.rec_len;
     }
     mem_free(buf);
+    Seg* s = seg_by_id(id);
+    if (!s) return;
     CloseHandle(s->h);
     wchar_t p[MAX_PATH];
-    seg_path(s->id, p);
+    seg_path(id, p);
     DeleteFileW(p);
     int idx = (int)(s - g_segs);
     memmove(&g_segs[idx], &g_segs[idx + 1], sizeof(Seg) * (size_t)(g_nsegs - idx - 1));
@@ -590,10 +620,18 @@ void cache_maintenance() {
         Seg* s = &g_segs[i];
         if (s->size && s->live * 2 < s->size && (!worst || s->live * worst->size < worst->live * s->size)) worst = s;
     }
-    if (worst) compact_segment(worst);
+    if (worst) compact_segment_locked(worst->id);
     if (g_used > g_count * 2 + 1024) rehash(g_cap);  // purge tombstones
-    snapshot_write();
+    // Build the snapshot under the lock, write it to disk without it.
+    size_t bytes = 0;
+    uint8_t* snap = snapshot_build(&bytes);
     ReleaseSRWLockExclusive(&g_lock);
+    if (snap && !snapshot_save(snap, bytes)) {
+        AcquireSRWLockExclusive(&g_lock);
+        g_dirty = true;  // try again next time
+        ReleaseSRWLockExclusive(&g_lock);
+    }
+    mem_free(snap);
 }
 
 void cache_stats(char* buf, size_t cap) {
