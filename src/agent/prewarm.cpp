@@ -7,6 +7,7 @@
 #include <thumbcache.h>
 #include <shlwapi.h>
 #include <shellapi.h>
+#include <shlobj.h>
 
 namespace abt {
 
@@ -38,16 +39,28 @@ static bool supported(const wchar_t* name) {
     return false;
 }
 
+static volatile LONG g_typical_edge = 0;  // most recent size Explorer actually asked for
+
+int prewarm_typical_edge() { return g_typical_edge ? (int)g_typical_edge : 256; }
+
+static void add_hint(const wchar_t* folder, int edge);
+
 void prewarm_hint_file(const wchar_t* path, int edge) {
+    wchar_t folder[MAX_PATH];
+    lstrcpynW(folder, path, MAX_PATH);
+    wchar_t* slash = wcsrchr(folder, L'\\');
+    if (!slash) return;
+    *slash = 0;
+    if (edge > 0) InterlockedExchange(&g_typical_edge, edge);
+    add_hint(folder, edge);
+}
+
+void prewarm_hint_folder(const wchar_t* folder, int edge) { add_hint(folder, edge); }
+
+static void add_hint(const wchar_t* folder, int edge) {
     if (reg_get_dword(HKEY_CURRENT_USER, ABT_REG_ROOT, L"Prewarm", 1) == 0) return;
     Hint h = {};
-    lstrcpynW(h.folder, path, MAX_PATH);
-    // A file path: strip to its folder. A folder path (ends with no extension we support) stays.
-    if (supported(path)) {
-        wchar_t* slash = wcsrchr(h.folder, L'\\');
-        if (!slash) return;
-        *slash = 0;
-    }
+    lstrcpynW(h.folder, folder, MAX_PATH);
     h.edge = edge > 0 ? edge : 256;
     h.when = GetTickCount64();
     AcquireSRWLockExclusive(&g_lock);
@@ -85,11 +98,71 @@ static void forget_recent(const wchar_t* folder) {
     ReleaseSRWLockExclusive(&g_lock);
 }
 
+// ---- progressive upgrades: a slow render finished after we answered with the embedded preview
+struct Upgrade {
+    Job* job;
+    wchar_t path[MAX_PATH];
+    int edge;
+};
+static Upgrade g_upgrades[16];
+static int g_nupgrades = 0;
+static volatile LONG64 g_upgraded = 0;
+
+void prewarm_upgrade_when_done(Job* j, const wchar_t* path, int edge) {
+    AcquireSRWLockExclusive(&g_lock);
+    if (g_nupgrades < (int)_countof(g_upgrades)) {
+        Upgrade& u = g_upgrades[g_nupgrades++];
+        u.job = j;
+        lstrcpynW(u.path, path, MAX_PATH);
+        u.edge = edge;
+        j = nullptr;
+        WakeAllConditionVariable(&g_cv);
+    }
+    ReleaseSRWLockExclusive(&g_lock);
+    if (j) job_release(j);
+}
+
+static bool take_upgrade(Upgrade* out) {
+    AcquireSRWLockExclusive(&g_lock);
+    bool ok = g_nupgrades > 0;
+    if (ok) {
+        *out = g_upgrades[0];
+        memmove(&g_upgrades[0], &g_upgrades[1], sizeof(Upgrade) * (size_t)(g_nupgrades - 1));
+        --g_nupgrades;
+    }
+    ReleaseSRWLockExclusive(&g_lock);
+    return ok;
+}
+
+// Waits for the render, then replaces Explorer's cached (embedded-preview) entry and tells
+// Explorer to repaint the item.
+static void process_upgrade(Upgrade& u, IThumbnailCache* tc) {
+    JobResult r;
+    bool ok = job_wait(u.job, 60000, &r) && SUCCEEDED(r.hr);
+    if (ok) abt_image_free(&r.img);
+    job_release(u.job);
+    if (!ok || !tc) return;
+    IShellItem* item = nullptr;
+    if (SUCCEEDED(SHCreateItemFromParsingName(u.path, nullptr, IID_PPV_ARGS(&item)))) {
+        ISharedBitmap* sb = nullptr;
+        WTS_CACHEFLAGS cf = WTS_DEFAULT;
+        if (SUCCEEDED(tc->GetThumbnail(item, (UINT)u.edge, WTS_FORCEEXTRACTION, &sb, &cf, nullptr)) && sb) sb->Release();
+        item->Release();
+    }
+    SHChangeNotify(SHCNE_UPDATEITEM, SHCNF_PATHW | SHCNF_FLUSHNOWAIT, u.path, nullptr);
+    InterlockedIncrement64(&g_upgraded);
+}
+
 // Most recent hint first: the folder on screen now matters most.
 static bool take_hint(Hint* out) {
     AcquireSRWLockExclusive(&g_lock);
-    while (!g_stop && g_nhints == 0) SleepConditionVariableSRW(&g_cv, &g_lock, INFINITE, 0);
+    while (!g_stop && g_nhints == 0 && g_nupgrades == 0) SleepConditionVariableSRW(&g_cv, &g_lock, INFINITE, 0);
     bool ok = !g_stop && g_nhints > 0;
+    if (!g_stop && !ok && g_nupgrades > 0) {  // only upgrades pending: let the caller run them
+        ReleaseSRWLockExclusive(&g_lock);
+        out->folder[0] = 0;
+        return true;
+    }
     if (ok) {
         *out = g_hints[--g_nhints];
         g_recent[g_recent_pos] = *out;
@@ -111,7 +184,7 @@ static void shell_fill(IThumbnailCache* tc, const wchar_t* path, int edge) {
     ISharedBitmap* sb = nullptr;
     WTS_CACHEFLAGS cf = WTS_DEFAULT;
     if (SUCCEEDED(tc->GetThumbnail(item, (UINT)edge, WTS_EXTRACT, &sb, &cf, nullptr)) && sb) {
-        if (!(cf & WTS_CACHED)) InterlockedIncrement64(&g_shell_fills);
+        InterlockedIncrement64(&g_shell_fills);  // (WTS_CACHED is reported even right after extraction)
         sb->Release();
     }
     item->Release();
@@ -196,9 +269,14 @@ static DWORD WINAPI prewarm_thread(void*) {
     CoCreateInstance(CLSID_LocalThumbnailCache, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&tc));
     Hint h;
     while (take_hint(&h)) {
+        Upgrade u;
+        while (take_upgrade(&u)) process_upgrade(u, tc);  // user-visible items first
+        if (!h.folder[0]) continue;
         logf("prewarm %ls @%d", h.folder, h.edge);
         process_folder(h, tc);
     }
+    Upgrade u;
+    while (take_upgrade(&u)) job_release(u.job);
     if (tc) tc->Release();
     CoUninitialize();
     return 0;
@@ -230,6 +308,9 @@ static DWORD WINAPI monitor_thread(void*) {
     return 0;
 }
 
+// Note: an Explorer navigation watcher (IShellWindows + DWebBrowserEvents2) was tried and removed:
+// Bitdefender quarantines binaries that subscribe to browser navigation events (D-024). Pre-warm
+// starts from the first thumbnail request of a folder instead (see docs/attic).
 void prewarm_start() {
     g_stop = false;
     g_thread = CreateThread(nullptr, 0, prewarm_thread, nullptr, 0, nullptr);
@@ -248,8 +329,8 @@ void prewarm_stop() {
 void prewarm_stats(char* buf, size_t cap) {
     _snprintf_s(buf, cap, _TRUNCATE,
                 "prewarm: %lld hints, %lld folders, %lld files queued, %lld already cached, %lld Explorer cache "
-                "fills, throttle: %s\n",
-                g_hint_count, g_folders, g_queued, g_skipped_cached, g_shell_fills,
+                "fills, %lld progressive upgrades, typical size %d, throttle: %s\n",
+                g_hint_count, g_folders, g_queued, g_skipped_cached, g_shell_fills, g_upgraded, prewarm_typical_edge(),
                 g_allowed ? "open" : g_throttle_reason);
 }
 

@@ -26,6 +26,12 @@ static void test_qoi_roundtrip(void) {
     abt_image t;
     if (abt_qoi_decode(enc, n / 2, &t) == ABT_OK) abt_image_free(&t);
     free(enc);
+    {   /* fuzz regression: 22-byte file claiming 24062x16898 px must be rejected, not allocate GBs */
+        static const uint8_t huge[22] = {'q','o','i','f', 0,0,0x5d,0xfe, 0,0,0x42,0x02, 4,0, 0,0,0,0,0,0,0,1};
+        abt_image big = {0};
+        ABT_CHECK(abt_qoi_decode(huge, sizeof huge, &big) == ABT_E_FORMAT);
+        ABT_CHECK(big.px == NULL);
+    }
     free(px);
 }
 

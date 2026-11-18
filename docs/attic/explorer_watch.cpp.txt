@@ -1,0 +1,209 @@
+// Explorer watcher (step 3e): learns which folder each Explorer window shows the moment it
+// navigates (DWebBrowserEvents2::NavigateComplete2), so pre-warm starts before Explorer asks for
+// a single thumbnail. Purely event-driven: no polling, ~0 CPU while nothing happens.
+#include "agent.h"
+#include <ole2.h>
+#include <shobjidl.h>
+#include <exdisp.h>
+#include <exdispid.h>
+#include <shlguid.h>
+#include <shobjidl.h>
+#include <ocidl.h>
+#include <new>
+
+namespace abt {
+
+void prewarm_hint_folder(const wchar_t* folder, int edge);  // prewarm.cpp
+int prewarm_typical_edge();                                  // prewarm.cpp
+
+namespace {
+
+typedef void (*EventFn)(DISPID id);
+
+class Sink final : public IDispatch {
+    LONG m_ref = 1;
+    IID m_iid;
+    EventFn m_fn;
+
+public:
+    Sink(REFIID iid, EventFn fn) : m_iid(iid), m_fn(fn) {}
+    IFACEMETHODIMP QueryInterface(REFIID riid, void** ppv) override {
+        if (riid == IID_IUnknown || riid == IID_IDispatch || riid == m_iid) {
+            *ppv = static_cast<IDispatch*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+    IFACEMETHODIMP_(ULONG) AddRef() override { return (ULONG)InterlockedIncrement(&m_ref); }
+    IFACEMETHODIMP_(ULONG) Release() override {
+        LONG r = InterlockedDecrement(&m_ref);
+        if (!r) delete this;
+        return (ULONG)r;
+    }
+    IFACEMETHODIMP GetTypeInfoCount(UINT* n) override { *n = 0; return S_OK; }
+    IFACEMETHODIMP GetTypeInfo(UINT, LCID, ITypeInfo**) override { return E_NOTIMPL; }
+    IFACEMETHODIMP GetIDsOfNames(REFIID, LPOLESTR*, UINT, LCID, DISPID*) override { return E_NOTIMPL; }
+    IFACEMETHODIMP Invoke(DISPID id, REFIID, LCID, WORD, DISPPARAMS*, VARIANT*, EXCEPINFO*, UINT*) override {
+        m_fn(id);
+        return S_OK;
+    }
+};
+
+struct Tracked {
+    IWebBrowser2* wb;
+    IConnectionPoint* cp;
+    DWORD cookie;
+};
+
+IShellWindows* g_sw = nullptr;
+IConnectionPoint* g_sw_cp = nullptr;
+DWORD g_sw_cookie = 0;
+Tracked g_wins[64];
+int g_nwins = 0;
+DWORD g_thread_id = 0;
+HANDLE g_thread = nullptr;
+volatile LONG64 g_navigations = 0;
+
+// Folder shown by a browser window, and its icon size, via IFolderView2.
+bool window_folder(IWebBrowser2* wb, wchar_t* path, size_t cap, int* icon) {
+    bool ok = false;
+    IServiceProvider* sp = nullptr;
+    IShellBrowser* sb = nullptr;
+    IShellView* sv = nullptr;
+    IFolderView2* fv = nullptr;
+    if (SUCCEEDED(wb->QueryInterface(IID_PPV_ARGS(&sp))) &&
+        SUCCEEDED(sp->QueryService(SID_STopLevelBrowser, IID_PPV_ARGS(&sb))) &&
+        SUCCEEDED(sb->QueryActiveShellView(&sv)) && SUCCEEDED(sv->QueryInterface(IID_PPV_ARGS(&fv)))) {
+        IShellItem* item = nullptr;
+        if (SUCCEEDED(fv->GetFolder(IID_PPV_ARGS(&item)))) {
+            PWSTR p = nullptr;
+            if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &p))) {
+                lstrcpynW(path, p, (int)cap);
+                CoTaskMemFree(p);
+                ok = true;
+            }
+            item->Release();
+        }
+        FOLDERVIEWMODE mode;
+        int size = 0;
+        *icon = SUCCEEDED(fv->GetViewModeAndIconSize(&mode, &size)) ? size : 0;
+        if (mode == FVM_DETAILS || mode == FVM_LIST || mode == FVM_SMALLICON) *icon = 0;  // no thumbnails shown
+    }
+    if (fv) fv->Release();
+    if (sv) sv->Release();
+    if (sb) sb->Release();
+    if (sp) sp->Release();
+    return ok;
+}
+
+void scan_folders() {
+    for (int i = 0; i < g_nwins; ++i) {
+        wchar_t path[MAX_PATH];
+        int icon = 0;
+        if (!window_folder(g_wins[i].wb, path, MAX_PATH, &icon) || icon < 48) continue;
+        // Explorer requests thumbnails at the cache bucket it uses for this view; until we have seen
+        // a real request, assume the size it most often asked for (or 256).
+        int edge = prewarm_typical_edge();
+        int px = icon;  // icon size is in logical pixels at the window's DPI
+        if (px > edge) edge = px <= 256 ? 256 : px <= 768 ? 768 : 1024;
+        prewarm_hint_folder(path, edge);
+    }
+}
+
+void on_browser_event(DISPID id) {
+    if (id == DISPID_NAVIGATECOMPLETE2 || id == DISPID_DOCUMENTCOMPLETE) {
+        InterlockedIncrement64(&g_navigations);
+        scan_folders();
+    }
+}
+
+void untrack_all() {
+    for (int i = 0; i < g_nwins; ++i) {
+        if (g_wins[i].cp) { g_wins[i].cp->Unadvise(g_wins[i].cookie); g_wins[i].cp->Release(); }
+        g_wins[i].wb->Release();
+    }
+    g_nwins = 0;
+}
+
+// Re-advises every Explorer window (cheap: a handful of windows; runs only on register/revoke).
+void retrack() {
+    untrack_all();
+    long n = 0;
+    if (!g_sw || FAILED(g_sw->get_Count(&n))) return;
+    for (long i = 0; i < n && g_nwins < (int)_countof(g_wins); ++i) {
+        VARIANT v;
+        V_VT(&v) = VT_I4;
+        V_I4(&v) = i;
+        IDispatch* d = nullptr;
+        if (FAILED(g_sw->Item(v, &d)) || !d) continue;
+        IWebBrowser2* wb = nullptr;
+        if (SUCCEEDED(d->QueryInterface(IID_PPV_ARGS(&wb)))) {
+            Tracked& t = g_wins[g_nwins++];
+            t.wb = wb;
+            t.cp = nullptr;
+            t.cookie = 0;
+            IConnectionPointContainer* cpc = nullptr;
+            if (SUCCEEDED(wb->QueryInterface(IID_PPV_ARGS(&cpc)))) {
+                if (SUCCEEDED(cpc->FindConnectionPoint(DIID_DWebBrowserEvents2, &t.cp))) {
+                    Sink* s = new (std::nothrow) Sink(DIID_DWebBrowserEvents2, on_browser_event);
+                    if (!s || FAILED(t.cp->Advise(s, &t.cookie))) { t.cp->Release(); t.cp = nullptr; }
+                    if (s) s->Release();
+                }
+                cpc->Release();
+            }
+        }
+        d->Release();
+    }
+    scan_folders();
+}
+
+void on_windows_event(DISPID id) {
+    (void)id;  // WindowRegistered / WindowRevoked
+    retrack();
+}
+
+DWORD WINAPI watch_thread(void*) {
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
+    if (SUCCEEDED(CoCreateInstance(CLSID_ShellWindows, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&g_sw)))) {
+        IConnectionPointContainer* cpc = nullptr;
+        if (SUCCEEDED(g_sw->QueryInterface(IID_PPV_ARGS(&cpc)))) {
+            if (SUCCEEDED(cpc->FindConnectionPoint(DIID_DShellWindowsEvents, &g_sw_cp))) {
+                Sink* s = new (std::nothrow) Sink(DIID_DShellWindowsEvents, on_windows_event);
+                if (!s || FAILED(g_sw_cp->Advise(s, &g_sw_cookie))) { g_sw_cp->Release(); g_sw_cp = nullptr; }
+                if (s) s->Release();
+            }
+            cpc->Release();
+        }
+        retrack();
+    } else {
+        logf("explorer watcher: ShellWindows unavailable");
+    }
+    MSG msg;
+    while (GetMessageW(&msg, nullptr, 0, 0) > 0) DispatchMessageW(&msg);
+    untrack_all();
+    if (g_sw_cp) { g_sw_cp->Unadvise(g_sw_cookie); g_sw_cp->Release(); g_sw_cp = nullptr; }
+    if (g_sw) { g_sw->Release(); g_sw = nullptr; }
+    CoUninitialize();
+    return 0;
+}
+
+}  // namespace
+
+void explorer_watch_start() {
+    g_thread = CreateThread(nullptr, 0, watch_thread, nullptr, 0, &g_thread_id);
+}
+
+void explorer_watch_stop() {
+    if (!g_thread) return;
+    PostThreadMessageW(g_thread_id, WM_QUIT, 0, 0);
+    WaitForSingleObject(g_thread, 3000);
+    CloseHandle(g_thread);
+    g_thread = nullptr;
+}
+
+long long explorer_watch_navigations() { return g_navigations; }
+
+}  // namespace abt

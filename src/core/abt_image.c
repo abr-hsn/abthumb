@@ -392,6 +392,10 @@ abt_status abt_qoi_decode(const uint8_t* d, size_t n, abt_image* out) {
     if (n < 14 + 8 || memcmp(d, "qoif", 4) != 0) return ABT_E_FORMAT;
     uint32_t w = abt_load_u32be(d + 4), h = abt_load_u32be(d + 8);
     if (d[12] != 4) return ABT_E_UNSUPPORTED;
+    /* Fuzz fix: a tiny file could claim up to 32768x32768 pixels, forcing a multi-GB calloc and a
+       billion-iteration fill loop. Every encoded byte yields at most 62 pixels (run op), so a header
+       claiming more pixels than the payload could possibly encode is rejected before allocating. */
+    if (w == 0 || h == 0 || (uint64_t)w * h > (uint64_t)(n - 22) * 62u) return ABT_E_FORMAT;
     abt_status st = abt_image_alloc(out, (int)w, (int)h);
     if (st) return st;
     size_t npx = (size_t)w * h, p = 14, end = n - 8;

@@ -51,3 +51,17 @@ DWORD reg_get_dword(HKEY root, const wchar_t* key, const wchar_t* name, DWORD de
 }
 
 }  // namespace abt
+
+namespace abt {
+
+bool is_elevated() {
+    HANDLE tok = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) return false;
+    TOKEN_ELEVATION el = {};
+    DWORD len = 0;
+    bool r = GetTokenInformation(tok, TokenElevation, &el, sizeof(el), &len) && el.TokenIsElevated;
+    CloseHandle(tok);
+    return r;
+}
+
+}  // namespace abt

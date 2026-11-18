@@ -92,17 +92,17 @@ STDAPI DllGetClassObject(REFCLSID clsid, REFIID riid, void** ppv) {
 static HRESULT register_self(bool in_process) {
     wchar_t path[MAX_PATH];
     if (!GetModuleFileNameW(g_dll, path, MAX_PATH)) return HRESULT_FROM_WIN32(GetLastError());
-    abt::RegisterOptions opt = {in_process};
+    abt::RegisterOptions opt = {in_process, abt::is_elevated()};
     return abt::shell_register(path, opt);
 }
 
-// regsvr32 abthumb.dll  -> per-user registration, in-process thumbnail provider.
+// regsvr32 abthumb.dll  -> machine-wide when elevated (what Explorer needs), else per-user.
 STDAPI DllRegisterServer() { return register_self(true); }
-STDAPI DllUnregisterServer() { return abt::shell_unregister(); }
+STDAPI DllUnregisterServer() { return abt::shell_unregister(abt::is_elevated()); }
 
 // regsvr32 /i:isolated abthumb.dll -> keep the thumbnail provider in the isolated surrogate.
 STDAPI DllInstall(BOOL install, PCWSTR cmdline) {
-    if (!install) return abt::shell_unregister();
+    if (!install) return abt::shell_unregister(abt::is_elevated());
     bool isolated = cmdline && StrStrIW(cmdline, L"isolated") != nullptr;
     return register_self(!isolated);
 }

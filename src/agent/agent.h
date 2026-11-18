@@ -68,6 +68,10 @@ void pool_stats(char* buf, size_t cap);
 void prewarm_start();
 void prewarm_stop();
 void prewarm_hint_file(const wchar_t* path, int edge);
+void prewarm_hint_folder(const wchar_t* folder, int edge);
+int prewarm_typical_edge();
+// Takes over the job reference; refreshes Explorer's entry for path once the job finishes.
+void prewarm_upgrade_when_done(Job* j, const wchar_t* path, int edge);
 bool prewarm_allowed();     // throttle: battery saver, full-screen, CPU load
 void prewarm_stats(char* buf, size_t cap);
 

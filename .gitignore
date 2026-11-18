@@ -22,3 +22,6 @@
 # test output images
 *.pam
 *.ppm
+
+# packaged builds
+/dist/

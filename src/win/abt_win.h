@@ -42,6 +42,9 @@ void to_utf8(const wchar_t* w, char* out, size_t cap);
 // ---- registry helpers
 DWORD reg_get_dword(HKEY root, const wchar_t* key, const wchar_t* name, DWORD def);
 
+// True when the process token is elevated (admin).
+bool is_elevated();
+
 // ---- simple heap helpers (process heap, no CRT new/delete in hot paths)
 inline void* mem_alloc(size_t n) { return HeapAlloc(GetProcessHeap(), 0, n); }
 inline void* mem_zalloc(size_t n) { return HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, n); }

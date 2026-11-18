@@ -58,6 +58,15 @@ target_compile_definitions(abt_core PRIVATE MINIZ_NO_STDIO MINIZ_NO_ARCHIVE_APIS
 set_source_files_properties(third_party/miniz/miniz.c PROPERTIES COMPILE_OPTIONS "/W0")
 target_include_directories(abt_core PUBLIC src/core PRIVATE third_party/miniz)
 
+if(ABT_FUZZ)
+  # libFuzzer targets (tests/fuzz): only abt_core + fuzzers are built.
+  foreach(t probe psd qoi)
+    add_executable(fuzz_${t} tests/fuzz/fuzz_${t}.c)
+    target_compile_options(fuzz_${t} PRIVATE /fsanitize=fuzzer)
+    target_link_libraries(fuzz_${t} PRIVATE abt_core)
+  endforeach()
+else()
+
 # ---------------------------------------------------------------- Windows helpers (C++)
 add_library(abt_win STATIC
   src/win/abt_log.cpp
@@ -140,3 +149,5 @@ add_executable(abthumb_agent WIN32
 set_target_properties(abthumb_agent PROPERTIES OUTPUT_NAME abthumb-agent)
 target_link_libraries(abthumb_agent PRIVATE abt_win)
 add_dependencies(abthumb_agent abthumb_render abthumb)
+
+endif() # NOT ABT_FUZZ

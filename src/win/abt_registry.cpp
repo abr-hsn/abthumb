@@ -9,119 +9,140 @@ const wchar_t* const kExtensions[] = {L".ai",  L".ait", L".eps", L".epsf", L".ep
 const int kExtensionCount = (int)(sizeof(kExtensions) / sizeof(kExtensions[0]));
 
 static const wchar_t kClasses[] = L"Software\\Classes";
+static const wchar_t kBackupKey[] = ABT_REG_ROOT L"\\Backup";
+static const wchar_t kPreviewList[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\PreviewHandlers";
 
-static LSTATUS set_sz(const wchar_t* subkey, const wchar_t* name, const wchar_t* value) {
-    return RegSetKeyValueW(HKEY_CURRENT_USER, subkey, name, REG_SZ, value,
-                           (DWORD)((lstrlenW(value) + 1) * sizeof(wchar_t)));
+static LSTATUS set_sz(HKEY root, const wchar_t* subkey, const wchar_t* name, const wchar_t* value) {
+    return RegSetKeyValueW(root, subkey, name, REG_SZ, value, (DWORD)((lstrlenW(value) + 1) * sizeof(wchar_t)));
 }
 
-static LSTATUS set_dword(const wchar_t* subkey, const wchar_t* name, DWORD v) {
-    return RegSetKeyValueW(HKEY_CURRENT_USER, subkey, name, REG_DWORD, &v, sizeof(v));
+static LSTATUS set_dword(HKEY root, const wchar_t* subkey, const wchar_t* name, DWORD v) {
+    return RegSetKeyValueW(root, subkey, name, REG_DWORD, &v, sizeof(v));
 }
 
-static bool default_value_equals(HKEY root, const wchar_t* subkey, const wchar_t* expect) {
-    wchar_t v[64];
-    DWORD sz = sizeof(v);
-    if (RegGetValueW(root, subkey, nullptr, RRF_RT_REG_SZ, nullptr, v, &sz) != ERROR_SUCCESS) return false;
-    return lstrcmpiW(v, expect) == 0;
+static bool get_sz(HKEY root, const wchar_t* subkey, const wchar_t* name, wchar_t* out, DWORD cap_bytes) {
+    out[0] = 0;
+    return RegGetValueW(root, subkey, name, RRF_RT_REG_SZ, nullptr, out, &cap_bytes) == ERROR_SUCCESS;
 }
 
-// Deletes key if it is now empty (no values, no subkeys). Walks up one level per call.
-static void delete_if_empty(const wchar_t* subkey) {
+// Deletes key if it is now empty (no values, no subkeys).
+static void delete_if_empty(HKEY root, const wchar_t* subkey) {
     HKEY k;
-    if (RegOpenKeyExW(HKEY_CURRENT_USER, subkey, 0, KEY_READ, &k) != ERROR_SUCCESS) return;
+    if (RegOpenKeyExW(root, subkey, 0, KEY_READ, &k) != ERROR_SUCCESS) return;
     DWORD nsub = 0, nval = 0;
     RegQueryInfoKeyW(k, nullptr, nullptr, nullptr, &nsub, nullptr, nullptr, &nval, nullptr, nullptr, nullptr, nullptr);
     RegCloseKey(k);
-    if (nsub == 0 && nval == 0) RegDeleteKeyW(HKEY_CURRENT_USER, subkey);
+    if (nsub == 0 && nval == 0) RegDeleteKeyW(root, subkey);
 }
 
+struct Pair { const wchar_t* iid; const wchar_t* clsid; };
+static const Pair kPairs[2] = {{ABT_SHELLEX_THUMB_STR, ABT_CLSID_THUMB_STR}, {ABT_SHELLEX_PREVIEW_STR, ABT_CLSID_PREVIEW_STR}};
+
 HRESULT shell_register(const wchar_t* dll_path, const RegisterOptions& opt) {
+    HKEY root = opt.machine ? HKEY_LOCAL_MACHINE : HKEY_CURRENT_USER;
     wchar_t key[512];
     LSTATUS e = ERROR_SUCCESS;
 
     // CLSID: thumbnail provider. ThreadingModel Both: objects have no thread affinity.
     _snwprintf_s(key, _countof(key), _TRUNCATE, L"%s\\CLSID\\%s", kClasses, ABT_CLSID_THUMB_STR);
-    e |= set_sz(key, nullptr, L"abthumb Thumbnail Provider");
+    e |= set_sz(root, key, nullptr, L"abthumb Thumbnail Provider");
     if (opt.in_process)
-        e |= set_dword(key, L"DisableProcessIsolation", 1);
+        e |= set_dword(root, key, L"DisableProcessIsolation", 1);
     else
-        RegDeleteKeyValueW(HKEY_CURRENT_USER, key, L"DisableProcessIsolation");
+        RegDeleteKeyValueW(root, key, L"DisableProcessIsolation");
     _snwprintf_s(key, _countof(key), _TRUNCATE, L"%s\\CLSID\\%s\\InprocServer32", kClasses, ABT_CLSID_THUMB_STR);
-    e |= set_sz(key, nullptr, dll_path);
-    e |= set_sz(key, L"ThreadingModel", L"Both");
+    e |= set_sz(root, key, nullptr, dll_path);
+    e |= set_sz(root, key, L"ThreadingModel", L"Both");
 
-    // CLSID: preview handler. Explorer activates preview handlers out of process. Windows'
-    // prevhost/dllhost surrogates ignore per-user registrations (E1), so the out-of-process
-    // server is our own abthumb-preview.exe next to the DLL (LocalServer32).
+    // CLSID: preview handler. Machine-wide: Windows' prevhost.exe surrogate (D-019). Per-user:
+    // our own local server (Windows ignores per-user out-of-process classes on current builds).
     _snwprintf_s(key, _countof(key), _TRUNCATE, L"%s\\CLSID\\%s", kClasses, ABT_CLSID_PREVIEW_STR);
-    e |= set_sz(key, nullptr, L"abthumb Preview Handler");
-    e |= set_sz(key, L"DisplayName", L"abthumb Preview Handler");
-    RegDeleteKeyValueW(HKEY_CURRENT_USER, key, L"AppID");
+    e |= set_sz(root, key, nullptr, L"abthumb Preview Handler");
+    e |= set_sz(root, key, L"DisplayName", L"abthumb Preview Handler");
+    if (opt.machine) e |= set_sz(root, key, L"AppID", ABT_PREVHOST_APPID_STR);
+    else RegDeleteKeyValueW(root, key, L"AppID");
     _snwprintf_s(key, _countof(key), _TRUNCATE, L"%s\\CLSID\\%s\\InprocServer32", kClasses, ABT_CLSID_PREVIEW_STR);
-    e |= set_sz(key, nullptr, dll_path);
-    e |= set_sz(key, L"ThreadingModel", L"Apartment");
-    {
+    e |= set_sz(root, key, nullptr, dll_path);
+    e |= set_sz(root, key, L"ThreadingModel", L"Apartment");
+    _snwprintf_s(key, _countof(key), _TRUNCATE, L"%s\\CLSID\\%s\\LocalServer32", kClasses, ABT_CLSID_PREVIEW_STR);
+    if (opt.machine) {
+        RegDeleteKeyW(root, key);
+    } else {
         wchar_t exe[MAX_PATH + 2];
         lstrcpynW(exe, dll_path, MAX_PATH);
-        wchar_t* slash = nullptr;
-        for (wchar_t* p = exe; *p; ++p) if (*p == L'\\') slash = p;
+        wchar_t* slash = wcsrchr(exe, L'\\');
         if (slash) lstrcpyW(slash + 1, L"abthumb-preview.exe");
         wchar_t quoted[MAX_PATH + 4];
         _snwprintf_s(quoted, _countof(quoted), _TRUNCATE, L"\"%s\"", exe);
-        _snwprintf_s(key, _countof(key), _TRUNCATE, L"%s\\CLSID\\%s\\LocalServer32", kClasses, ABT_CLSID_PREVIEW_STR);
-        e |= set_sz(key, nullptr, quoted);
+        e |= set_sz(root, key, nullptr, quoted);
     }
+    e |= set_sz(root, kPreviewList, ABT_CLSID_PREVIEW_STR, L"abthumb Preview Handler");
 
-    e |= set_sz(L"Software\\Microsoft\\Windows\\CurrentVersion\\PreviewHandlers", ABT_CLSID_PREVIEW_STR,
-                L"abthumb Preview Handler");
-
-    // Per-extension handler keys, both on the extension and on SystemFileAssociations.
+    // Per-extension handler keys. The .ext key wins over SystemFileAssociations, so that is the one
+    // to own; machine mode remembers whatever was there before.
     for (int i = 0; i < kExtensionCount; ++i) {
-        const wchar_t* ext = kExtensions[i];
-        const wchar_t* bases[2] = {L"", L"SystemFileAssociations\\"};
-        for (int b = 0; b < 2; ++b) {
-            _snwprintf_s(key, _countof(key), _TRUNCATE, L"%s\\%s%s\\ShellEx\\%s", kClasses, bases[b], ext,
-                         ABT_SHELLEX_THUMB_STR);
-            e |= set_sz(key, nullptr, ABT_CLSID_THUMB_STR);
-            _snwprintf_s(key, _countof(key), _TRUNCATE, L"%s\\%s%s\\ShellEx\\%s", kClasses, bases[b], ext,
-                         ABT_SHELLEX_PREVIEW_STR);
-            e |= set_sz(key, nullptr, ABT_CLSID_PREVIEW_STR);
+        for (const Pair& pr : kPairs) {
+            _snwprintf_s(key, _countof(key), _TRUNCATE, L"%s\\%s\\ShellEx\\%s", kClasses, kExtensions[i], pr.iid);
+            if (opt.machine) {
+                wchar_t old[64];
+                if (get_sz(root, key, nullptr, old, sizeof(old)) && old[0] && lstrcmpiW(old, pr.clsid) != 0) {
+                    wchar_t name[96];
+                    _snwprintf_s(name, _countof(name), _TRUNCATE, L"%s|%s", kExtensions[i], pr.iid);
+                    wchar_t existing[64];
+                    if (!get_sz(root, kBackupKey, name, existing, sizeof(existing)))  // keep the first backup
+                        e |= set_sz(root, kBackupKey, name, old);
+                }
+            }
+            e |= set_sz(root, key, nullptr, pr.clsid);
+            if (!opt.machine) {
+                _snwprintf_s(key, _countof(key), _TRUNCATE, L"%s\\SystemFileAssociations\\%s\\ShellEx\\%s", kClasses,
+                             kExtensions[i], pr.iid);
+                e |= set_sz(root, key, nullptr, pr.clsid);
+            }
         }
     }
-
-    e |= set_dword(ABT_REG_ROOT, L"InProcess", opt.in_process ? 1u : 0u);
+    e |= set_dword(root, ABT_REG_ROOT, L"InProcess", opt.in_process ? 1u : 0u);
     SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, nullptr, nullptr);
     return e == ERROR_SUCCESS ? S_OK : HRESULT_FROM_WIN32(ERROR_CANTWRITE);
 }
 
-HRESULT shell_unregister() {
+HRESULT shell_unregister(bool machine) {
+    HKEY root = machine ? HKEY_LOCAL_MACHINE : HKEY_CURRENT_USER;
     wchar_t key[512];
     for (int i = 0; i < kExtensionCount; ++i) {
         const wchar_t* ext = kExtensions[i];
+        for (const Pair& pr : kPairs) {
+            const wchar_t* bases[2] = {L"", L"SystemFileAssociations\\"};
+            for (int b = 0; b < 2; ++b) {
+                _snwprintf_s(key, _countof(key), _TRUNCATE, L"%s\\%s%s\\ShellEx\\%s", kClasses, bases[b], ext, pr.iid);
+                wchar_t cur[64];
+                if (!get_sz(root, key, nullptr, cur, sizeof(cur)) || lstrcmpiW(cur, pr.clsid) != 0) continue;
+                wchar_t name[96], old[64];
+                _snwprintf_s(name, _countof(name), _TRUNCATE, L"%s|%s", ext, pr.iid);
+                if (b == 0 && machine && get_sz(root, kBackupKey, name, old, sizeof(old)) && old[0]) {
+                    set_sz(root, key, nullptr, old);  // give the slot back to the previous handler
+                    RegDeleteKeyValueW(root, kBackupKey, name);
+                } else {
+                    RegDeleteKeyW(root, key);
+                }
+            }
+        }
         const wchar_t* bases[2] = {L"", L"SystemFileAssociations\\"};
         for (int b = 0; b < 2; ++b) {
-            const wchar_t* pairs[2][2] = {{ABT_SHELLEX_THUMB_STR, ABT_CLSID_THUMB_STR},
-                                          {ABT_SHELLEX_PREVIEW_STR, ABT_CLSID_PREVIEW_STR}};
-            for (int p = 0; p < 2; ++p) {
-                _snwprintf_s(key, _countof(key), _TRUNCATE, L"%s\\%s%s\\ShellEx\\%s", kClasses, bases[b], ext,
-                             pairs[p][0]);
-                if (default_value_equals(HKEY_CURRENT_USER, key, pairs[p][1])) RegDeleteKeyW(HKEY_CURRENT_USER, key);
-            }
             _snwprintf_s(key, _countof(key), _TRUNCATE, L"%s\\%s%s\\ShellEx", kClasses, bases[b], ext);
-            delete_if_empty(key);
+            delete_if_empty(root, key);
             _snwprintf_s(key, _countof(key), _TRUNCATE, L"%s\\%s%s", kClasses, bases[b], ext);
-            delete_if_empty(key);
+            delete_if_empty(root, key);
         }
     }
-    _snwprintf_s(key, _countof(key), _TRUNCATE, L"%s\\CLSID\\%s", kClasses, ABT_CLSID_THUMB_STR);
-    RegDeleteTreeW(HKEY_CURRENT_USER, key);
-    RegDeleteKeyW(HKEY_CURRENT_USER, key);
-    _snwprintf_s(key, _countof(key), _TRUNCATE, L"%s\\CLSID\\%s", kClasses, ABT_CLSID_PREVIEW_STR);
-    RegDeleteTreeW(HKEY_CURRENT_USER, key);
-    RegDeleteKeyW(HKEY_CURRENT_USER, key);
-    RegDeleteKeyValueW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\PreviewHandlers",
-                       ABT_CLSID_PREVIEW_STR);
+    static const wchar_t* const kClsids[2] = {ABT_CLSID_THUMB_STR, ABT_CLSID_PREVIEW_STR};
+    for (const wchar_t* clsid : kClsids) {
+        _snwprintf_s(key, _countof(key), _TRUNCATE, L"%s\\CLSID\\%s", kClasses, clsid);
+        RegDeleteTreeW(root, key);
+        RegDeleteKeyW(root, key);
+    }
+    RegDeleteKeyValueW(root, kPreviewList, ABT_CLSID_PREVIEW_STR);
+    delete_if_empty(root, kBackupKey);
     SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, nullptr, nullptr);
     return S_OK;
 }
@@ -131,17 +152,19 @@ void shell_describe(char* buf, size_t cap) {
     buf[0] = 0;
     for (int i = 0; i < kExtensionCount; ++i) {
         wchar_t key[256], thumb[64] = L"-", prev[64] = L"-";
-        DWORD sz;
         _snwprintf_s(key, _countof(key), _TRUNCATE, L"%s\\ShellEx\\%s", kExtensions[i], ABT_SHELLEX_THUMB_STR);
-        sz = sizeof(thumb);
-        RegGetValueW(HKEY_CLASSES_ROOT, key, nullptr, RRF_RT_REG_SZ, nullptr, thumb, &sz);
+        get_sz(HKEY_CLASSES_ROOT, key, nullptr, thumb, sizeof(thumb));
         _snwprintf_s(key, _countof(key), _TRUNCATE, L"%s\\ShellEx\\%s", kExtensions[i], ABT_SHELLEX_PREVIEW_STR);
-        sz = sizeof(prev);
-        RegGetValueW(HKEY_CLASSES_ROOT, key, nullptr, RRF_RT_REG_SZ, nullptr, prev, &sz);
+        get_sz(HKEY_CLASSES_ROOT, key, nullptr, prev, sizeof(prev));
+        // Which hive provides it (machine-wide is what Explorer's surrogates see, D-023).
+        wchar_t mk[256], m[64];
+        _snwprintf_s(mk, _countof(mk), _TRUNCATE, L"%s\\%s\\ShellEx\\%s", kClasses, kExtensions[i], ABT_SHELLEX_THUMB_STR);
+        bool machine_ours = get_sz(HKEY_LOCAL_MACHINE, mk, nullptr, m, sizeof(m)) && !lstrcmpiW(m, ABT_CLSID_THUMB_STR);
         char line[256];
-        int n = _snprintf_s(line, sizeof(line), _TRUNCATE, "%-6ls thumb=%ls%s preview=%ls%s\n", kExtensions[i], thumb,
-                            lstrcmpiW(thumb, ABT_CLSID_THUMB_STR) == 0 ? " (abthumb)" : "", prev,
-                            lstrcmpiW(prev, ABT_CLSID_PREVIEW_STR) == 0 ? " (abthumb)" : "");
+        int n = _snprintf_s(line, sizeof(line), _TRUNCATE, "%-6ls thumb=%ls%s preview=%ls%s%s\n", kExtensions[i],
+                            thumb[0] ? thumb : L"-", lstrcmpiW(thumb, ABT_CLSID_THUMB_STR) == 0 ? " (abthumb)" : "",
+                            prev[0] ? prev : L"-", lstrcmpiW(prev, ABT_CLSID_PREVIEW_STR) == 0 ? " (abthumb)" : "",
+                            machine_ours ? "  [machine-wide]" : "");
         if (n > 0 && used + (size_t)n < cap) {
             memcpy(buf + used, line, (size_t)n + 1);
             used += (size_t)n;

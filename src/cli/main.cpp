@@ -17,14 +17,18 @@ static void usage() {
     fputs(
         "abthumb " ABT_VERSION_STR "\n"
         "usage:\n"
-        "  abthumb register [--isolated] [--dll PATH]   per-user registration\n"
-        "  abthumb unregister\n"
+        "  (install/uninstall: run install.cmd / uninstall.cmd, which use regsvr32)\n"
+        "  abthumb stats | ping | stop-agent             talk to the running agent\n"
+        "  abthumb register [--machine] [--isolated] [--dll PATH]   developer registration\n"
+        "  abthumb unregister [--machine]\n"
         "  abthumb status                               show handler registration per extension\n"
         "  abthumb shelltest PATH... [--size N] [--force] [--repeat N] [--out DIR]\n"
         "        drive the real shell thumbnail pipeline (IShellItemImageFactory, or\n"
         "        IThumbnailCache with WTS_FORCEEXTRACTION when --force)\n"
         "  abthumb render PATH... [--size N | --box W H] [--page N] [--fast|--render|--probe] [--max]\n"
         "        [--repeat N] [--out DIR]   run the render pipeline in-process (no agent)\n"
+        "  abthumb bench DIR... [--size N] [--agent] [-v]   latency percentiles vs the WIC/FPV path\n"
+        "  abthumb thumbtest FILE [--size N] [--repeat N]   our provider in-process (DLL -> agent)\n"
         "  abthumb previewtest FILE [--out PNG] [--inproc] [--size W H] [--wait MS]\n"
         "        host the preview handler like Explorer's preview pane and capture it\n",
         stderr);
@@ -32,11 +36,13 @@ static void usage() {
 
 static bool arg_is(const wchar_t* a, const wchar_t* b) { return lstrcmpiW(a, b) == 0; }
 
+
 static int cmd_register(int argc, wchar_t** argv) {
-    abt::RegisterOptions opt = {true};
+    abt::RegisterOptions opt = {true, false};
     wchar_t dll[MAX_PATH] = L"";
     for (int i = 0; i < argc; ++i) {
         if (arg_is(argv[i], L"--isolated")) opt.in_process = false;
+        else if (arg_is(argv[i], L"--machine")) opt.machine = true;
         else if (arg_is(argv[i], L"--dll") && i + 1 < argc) GetFullPathNameW(argv[++i], MAX_PATH, dll, nullptr);
     }
     if (!dll[0]) {
@@ -49,7 +55,8 @@ static int cmd_register(int argc, wchar_t** argv) {
         return 2;
     }
     HRESULT hr = abt::shell_register(dll, opt);
-    printf("register %ls (%s): 0x%08lx\n", dll, opt.in_process ? "in-process" : "isolated", hr);
+    printf("register %ls (%s, %s): 0x%08lx\n", dll, opt.in_process ? "in-process" : "isolated",
+           opt.machine ? "machine-wide" : "per-user dev mode: Explorer will not use it (D-023)", hr);
     return SUCCEEDED(hr) ? 0 : 1;
 }
 
@@ -262,70 +269,191 @@ static int cmd_render(int argc, wchar_t** argv) {
     return fails ? 1 : 0;
 }
 
-// ---------------------------------------------------------------- explorer-view (experiment helper)
-// Opens an Explorer window on DIR, switches it to each icon size given, waits, then closes it.
-// Used to measure which thumbnail sizes Explorer requests per view (DLL log shows cx).
-static IFolderView2* find_view(const wchar_t* dir, IWebBrowser2** browser_out) {
-    IShellWindows* sw = nullptr;
-    if (FAILED(CoCreateInstance(CLSID_ShellWindows, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&sw)))) return nullptr;
-    long n = 0;
-    sw->get_Count(&n);
-    IFolderView2* found = nullptr;
-    for (long i = 0; i < n && !found; ++i) {
-        VARIANT v;
-        V_VT(&v) = VT_I4;
-        V_I4(&v) = i;
-        IDispatch* d = nullptr;
-        if (FAILED(sw->Item(v, &d)) || !d) continue;
-        IWebBrowser2* wb = nullptr;
-        IServiceProvider* sp = nullptr;
-        IShellBrowser* sb = nullptr;
-        IShellView* sv = nullptr;
-        IFolderView2* fv = nullptr;
-        if (SUCCEEDED(d->QueryInterface(IID_PPV_ARGS(&wb))) && SUCCEEDED(wb->QueryInterface(IID_PPV_ARGS(&sp))) &&
-            SUCCEEDED(sp->QueryService(SID_STopLevelBrowser, IID_PPV_ARGS(&sb))) &&
-            SUCCEEDED(sb->QueryActiveShellView(&sv)) && SUCCEEDED(sv->QueryInterface(IID_PPV_ARGS(&fv)))) {
-            IShellItem* folder = nullptr;
-            if (SUCCEEDED(fv->GetFolder(IID_PPV_ARGS(&folder)))) {
-                PWSTR p = nullptr;
-                if (SUCCEEDED(folder->GetDisplayName(SIGDN_FILESYSPATH, &p)) && !lstrcmpiW(p, dir)) {
-                    found = fv;
-                    fv = nullptr;
-                    *browser_out = wb;
-                    wb = nullptr;
-                }
-                CoTaskMemFree(p);
-                folder->Release();
-            }
+// ---------------------------------------------------------------- bench
+// Per file: our pipeline (auto / forced render / embedded only), the WIC path that the
+// FastPictureViewer codecs plug into (baseline), and the agent (cache miss vs cache hit).
+
+static double wic_thumb_ms(const wchar_t* path, int size, bool* ok) {
+    *ok = false;
+    IWICImagingFactory* f = nullptr;
+    if (FAILED(abt::wic_factory(&f))) return 0;
+    uint64_t t0 = abt::qpc();
+    IWICBitmapDecoder* dec = nullptr;
+    IWICBitmapFrameDecode* fr = nullptr;
+    IWICBitmapSource* thumb = nullptr;
+    IWICBitmapScaler* sc = nullptr;
+    HRESULT hr = f->CreateDecoderFromFilename(path, nullptr, GENERIC_READ, WICDecodeMetadataCacheOnDemand, &dec);
+    if (SUCCEEDED(hr)) hr = dec->GetFrame(0, &fr);
+    UINT w = 0, h = 0;
+    if (SUCCEEDED(hr)) {
+        // The photo thumbnail provider asks the codec for its thumbnail first, then the frame.
+        if (FAILED(fr->GetThumbnail(&thumb)) && FAILED(dec->GetThumbnail(&thumb))) thumb = nullptr;
+        IWICBitmapSource* src = thumb ? thumb : (IWICBitmapSource*)fr;
+        hr = src->GetSize(&w, &h);
+        int dw, dh;
+        abt_fit((int)w, (int)h, size, 0, &dw, &dh);
+        if (SUCCEEDED(hr)) hr = f->CreateBitmapScaler(&sc);
+        if (SUCCEEDED(hr)) hr = sc->Initialize(src, (UINT)dw, (UINT)dh, WICBitmapInterpolationModeFant);
+        if (SUCCEEDED(hr)) {
+            IWICFormatConverter* cv = nullptr;
+            hr = f->CreateFormatConverter(&cv);
+            if (SUCCEEDED(hr)) hr = cv->Initialize(sc, GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, nullptr, 0, WICBitmapPaletteTypeCustom);
+            uint8_t* px = SUCCEEDED(hr) ? (uint8_t*)malloc((size_t)dw * dh * 4) : nullptr;
+            if (px) hr = cv->CopyPixels(nullptr, (UINT)dw * 4, (UINT)(dw * dh * 4), px);
+            free(px);
+            if (cv) cv->Release();
         }
-        if (fv) fv->Release();
-        if (sv) sv->Release();
-        if (sb) sb->Release();
-        if (sp) sp->Release();
-        if (wb) wb->Release();
-        d->Release();
     }
-    sw->Release();
-    return found;
+    double ms = abt::qpc_ms(t0, abt::qpc());
+    if (sc) sc->Release();
+    if (thumb) thumb->Release();
+    if (fr) fr->Release();
+    if (dec) dec->Release();
+    f->Release();
+    *ok = SUCCEEDED(hr);
+    return ms;
 }
 
-static int cmd_explorer_view(int argc, wchar_t** argv) {
-    if (argc < 2) { usage(); return 2; }
-    wchar_t dir[MAX_PATH];
-    GetFullPathNameW(argv[0], MAX_PATH, dir, nullptr);
-    ShellExecuteW(nullptr, L"open", L"explorer.exe", dir, nullptr, SW_SHOWNORMAL);
-    IFolderView2* fv = nullptr;
-    IWebBrowser2* wb = nullptr;
-    for (int t = 0; t < 50 && !fv; ++t) { Sleep(200); fv = find_view(dir, &wb); }
-    if (!fv) { printf("explorer window not found\n"); return 1; }
-    for (int i = 1; i < argc; ++i) {
-        int size = _wtoi(argv[i]);
-        HRESULT hr = fv->SetViewModeAndIconSize(size <= 16 ? FVM_DETAILS : FVM_ICON, size);
-        printf("icon size %d: 0x%08lx\n", size, hr);
-        Sleep(3000);
+struct Series {
+    double v[4096];
+    int n = 0;
+    void add(double x) { if (n < 4096) v[n++] = x; }
+};
+static int cmp_d(const void* a, const void* b) {
+    double x = *(const double*)a, y = *(const double*)b;
+    return x < y ? -1 : x > y;
+}
+static void summary(const char* name, Series& s) {
+    if (!s.n) { printf("  %-22s  (no samples)\n", name); return; }
+    qsort(s.v, (size_t)s.n, sizeof(double), cmp_d);
+    double sum = 0;
+    for (int i = 0; i < s.n; ++i) sum += s.v[i];
+    printf("  %-22s n=%-4d mean %8.2f  p50 %8.2f  p95 %8.2f  max %8.2f ms\n", name, s.n, sum / s.n, s.v[s.n / 2],
+           s.v[(int)(s.n * 0.95) < s.n ? (int)(s.n * 0.95) : s.n - 1], s.v[s.n - 1]);
+}
+
+static double pipe_thumb_ms(const wchar_t* path, int size, uint32_t flags, HRESULT* hr_out, uint32_t* source) {
+    abt_req req;
+    abt::init_req(&req, ABT_MSG_THUMB, (uint32_t)lstrlenW(path));
+    req.cx = req.cy = (uint32_t)size;
+    req.flags = flags;
+    abt_resp resp;
+    uint8_t* px = nullptr;
+    uint64_t t0 = abt::qpc();
+    *hr_out = abt::pipe_call(req, path, 60000, &resp, &px);
+    double ms = abt::qpc_ms(t0, abt::qpc());
+    *source = resp.source;
+    abt::mem_free(px);
+    return ms;
+}
+
+static int cmd_bench(int argc, wchar_t** argv) {
+    int size = 256;
+    bool agent = false, verbose = false;
+    const wchar_t* list = nullptr;
+    const wchar_t* dirs[64];
+    int nd = 0;
+    for (int i = 0; i < argc; ++i) {
+        if (arg_is(argv[i], L"--size") && i + 1 < argc) size = _wtoi(argv[++i]);
+        else if (arg_is(argv[i], L"--agent")) agent = true;
+        else if (arg_is(argv[i], L"-v")) verbose = true;
+        else if (arg_is(argv[i], L"--list") && i + 1 < argc) list = argv[++i];
+        else if (nd < 64) dirs[nd++] = argv[i];
     }
-    fv->Release();
-    if (wb) { wb->Quit(); wb->Release(); }
+    if (!nd && !list) { usage(); return 2; }
+    abt::render_init(false);
+    static Series s_auto, s_render, s_fast, s_wic, s_miss, s_hit;
+    int files = 0, wic_fail = 0, auto_fail = 0;
+    // Collect paths: directory listings, then an optional UTF-8/UTF-16 list file (one path per line).
+    static wchar_t paths[4096][MAX_PATH];
+    int np = 0;
+    for (int d = 0; d < nd; ++d) {
+        wchar_t pat[MAX_PATH], dir[MAX_PATH];
+        GetFullPathNameW(dirs[d], MAX_PATH, dir, nullptr);
+        _snwprintf_s(pat, MAX_PATH, _TRUNCATE, L"%s\\*", dir);
+        WIN32_FIND_DATAW fd;
+        HANDLE h = FindFirstFileExW(pat, FindExInfoBasic, &fd, FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH);
+        if (h == INVALID_HANDLE_VALUE) continue;
+        do {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY || np >= 4096) continue;
+            _snwprintf_s(paths[np], MAX_PATH, _TRUNCATE, L"%s\\%s", dir, fd.cFileName);
+            if (is_supported(paths[np])) ++np;
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+    if (list) {
+        FILE* lf = nullptr;
+        if (_wfopen_s(&lf, list, L"rt, ccs=UTF-8") == 0 && lf) {
+            wchar_t line[MAX_PATH];
+            while (np < 4096 && fgetws(line, MAX_PATH, lf)) {
+                size_t l = wcslen(line);
+                while (l && (line[l - 1] == L'\n' || line[l - 1] == L'\r')) line[--l] = 0;
+                if (l && is_supported(line)) lstrcpynW(paths[np++], line, MAX_PATH);
+            }
+            fclose(lf);
+        }
+    }
+    for (int pi = 0; pi < np; ++pi) {
+        {
+            const wchar_t* f = paths[pi];
+            struct { const wchar_t* cFileName; } fd = {PathFindFileNameW(f)};
+            ++files;
+            abt::RenderRequest rq = {};
+            rq.path = f;
+            rq.cx = rq.cy = size;
+            double best[3] = {1e30, 1e30, 1e30};
+            uint32_t modes[3] = {ABT_MODE_AUTO, ABT_MODE_RENDER, ABT_MODE_FAST};
+            bool okm[3] = {};
+            for (int m = 0; m < 3; ++m) {
+                rq.mode = modes[m];
+                for (int r = 0; r < 3; ++r) {
+                    abt::RenderResult rr;
+                    abt::render_file(rq, &rr);
+                    okm[m] = SUCCEEDED(rr.hr);
+                    double ms = rr.elapsed_us / 1000.0;
+                    if (ms < best[m]) best[m] = ms;
+                    abt::render_result_free(&rr);
+                    if (!okm[m]) break;
+                }
+            }
+            if (okm[0]) s_auto.add(best[0]); else ++auto_fail;
+            if (okm[1]) s_render.add(best[1]);
+            if (okm[2]) s_fast.add(best[2]);
+            bool wok = false;
+            double wbest = 1e30;
+            for (int r = 0; r < 3; ++r) {
+                double ms = wic_thumb_ms(f, size, &wok);
+                if (!wok) break;
+                if (ms < wbest) wbest = ms;
+            }
+            if (wok) s_wic.add(wbest); else ++wic_fail;
+            double miss = 0, hit = 0;
+            if (agent) {
+                HRESULT hr;
+                uint32_t src;
+                miss = pipe_thumb_ms(f, size, ABT_RF_NO_CACHE, &hr, &src);
+                if (SUCCEEDED(hr)) s_miss.add(miss);
+                pipe_thumb_ms(f, size, 0, &hr, &src);  // make sure it is cached
+                hit = pipe_thumb_ms(f, size, 0, &hr, &src);
+                if (SUCCEEDED(hr) && (src & ABT_SRC_CACHE)) s_hit.add(hit);
+            }
+            if (verbose)
+                printf("%-44ls auto %7.2f render %7.2f fast %7.2f wic %7.2f%s agent miss %7.2f hit %6.2f\n",
+                       fd.cFileName, okm[0] ? best[0] : -1, okm[1] ? best[1] : -1, okm[2] ? best[2] : -1,
+                       wok ? wbest : -1, wok ? "" : "(no codec)", miss, hit);
+        }
+    }
+    printf("%d files at %d px (best of 3 per file; render worker path in-process, warm OS file cache)\n", files, size);
+    summary("abthumb auto", s_auto);
+    summary("abthumb forced render", s_render);
+    summary("abthumb embedded only", s_fast);
+    summary("WIC/FPV codec path", s_wic);
+    if (agent) {
+        summary("agent, cache miss", s_miss);
+        summary("agent, cache hit", s_hit);
+    }
+    printf("  failures: abthumb auto %d, WIC/FPV %d (no codec or decode error)\n", auto_fail, wic_fail);
+    abt::render_shutdown();
     return 0;
 }
 
@@ -424,12 +552,51 @@ int wmain(int argc, wchar_t** argv) {
     int rc = 2;
     const wchar_t* cmd = argv[1];
     if (arg_is(cmd, L"register")) rc = cmd_register(argc - 2, argv + 2);
-    else if (arg_is(cmd, L"unregister")) { hr = abt::shell_unregister(); printf("unregister: 0x%08lx\n", hr); rc = 0; }
+    else if (arg_is(cmd, L"unregister")) {
+        bool machine = argc > 2 && arg_is(argv[2], L"--machine");
+        hr = abt::shell_unregister(machine);
+        printf("unregister (%s): 0x%08lx\n", machine ? "machine-wide" : "per-user", hr);
+        rc = 0;
+    }
     else if (arg_is(cmd, L"status")) rc = cmd_status();
     else if (arg_is(cmd, L"shelltest")) rc = cmd_shelltest(argc - 2, argv + 2);
     else if (arg_is(cmd, L"previewtest")) rc = cmd_previewtest(argc - 2, argv + 2);
     else if (arg_is(cmd, L"render")) rc = cmd_render(argc - 2, argv + 2);
-    else if (arg_is(cmd, L"explorer-view")) rc = cmd_explorer_view(argc - 2, argv + 2);
+    else if (arg_is(cmd, L"bench")) rc = cmd_bench(argc - 2, argv + 2);
+    else if (arg_is(cmd, L"thumbtest") && argc > 2) {
+        // Our thumbnail provider created directly in-process (DLL -> agent -> worker), independent
+        // of which handler the shell would pick (useful before a machine-wide install).
+        int size = 256, repeat = 1;
+        for (int i = 3; i + 1 < argc; ++i) {
+            if (arg_is(argv[i], L"--size")) size = _wtoi(argv[i + 1]);
+            if (arg_is(argv[i], L"--repeat")) repeat = _wtoi(argv[i + 1]);
+        }
+        wchar_t full[MAX_PATH];
+        GetFullPathNameW(argv[2], MAX_PATH, full, nullptr);
+        rc = 1;
+        for (int r = 0; r < repeat; ++r) {
+            uint64_t t0 = abt::qpc();
+            IThumbnailProvider* tp = nullptr;
+            IInitializeWithItem* iwi = nullptr;
+            IShellItem* item = nullptr;
+            HBITMAP bmp = nullptr;
+            WTS_ALPHATYPE at = WTSAT_UNKNOWN;
+            hr = CoCreateInstance(CLSID_AbtThumbnailProvider, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&tp));
+            if (SUCCEEDED(hr)) hr = tp->QueryInterface(IID_PPV_ARGS(&iwi));
+            if (SUCCEEDED(hr)) hr = SHCreateItemFromParsingName(full, nullptr, IID_PPV_ARGS(&item));
+            if (SUCCEEDED(hr)) hr = iwi->Initialize(item, STGM_READ);
+            if (SUCCEEDED(hr)) hr = tp->GetThumbnail((UINT)size, &bmp, &at);
+            BITMAP bm = {};
+            if (bmp) GetObjectW(bmp, sizeof(bm), &bm);
+            printf("%-44ls hr=0x%08lx %4ldx%-4ld alpha=%d %.2f ms\n", PathFindFileNameW(full), hr, bm.bmWidth,
+                   bm.bmHeight, (int)at, abt::qpc_ms(t0, abt::qpc()));
+            if (bmp) DeleteObject(bmp);
+            if (item) item->Release();
+            if (iwi) iwi->Release();
+            if (tp) tp->Release();
+            if (SUCCEEDED(hr)) rc = 0;
+        }
+    }
     else if (arg_is(cmd, L"cmyktest")) {  // prints sRGB for pure C, M, Y, K, white through the ICM transform
         abt::CmykXform* x = abt::cmyk_xform_create(nullptr, 0);
         const uint8_t in[5][4] = {{255, 0, 0, 0}, {0, 255, 0, 0}, {0, 0, 255, 0}, {0, 0, 0, 255}, {0, 0, 0, 0}};

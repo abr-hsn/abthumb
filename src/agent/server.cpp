@@ -100,8 +100,33 @@ static void serve_image(const abt_req& req, const wchar_t* path, abt_resp* resp,
             resp->hr = E_OUTOFMEMORY;
         } else {
             DWORD wait = req.deadline_ms ? req.deadline_ms : (req.msg == ABT_MSG_PREVIEW ? 25000u : 12000u);
-            JobResult r;
-            if (job_wait(j, wait, &r)) {
+            JobResult r = {};
+            bool done = false;
+            // Progressive upgrade (D-011): a thumbnail whose render is slow gets the embedded preview
+            // now; the render keeps going, lands in our cache, and Explorer's entry is refreshed.
+            if (req.msg == ABT_MSG_THUMB && !(req.flags & ABT_RF_FROM_PREWARM) && wait > 350) {
+                done = job_wait(j, 350, &r);
+                if (!done) {
+                    Job* fast = job_submit(path, k, req.page, edge, edge, ABT_MODE_FAST, req.flags | ABT_RF_NO_CACHE,
+                                           LANE_FOREGROUND);
+                    JobResult fr;
+                    if (fast && job_wait(fast, 1500, &fr) && SUCCEEDED(fr.hr) && fr.img.px) {
+                        resp->hr = S_OK;
+                        resp->info = fr.info;
+                        resp->source = fr.source | ABT_SRC_UPGRADE_PENDING;
+                        lstrcpynA(resp->reason, "embedded preview; sharper render on its way", sizeof(resp->reason));
+                        *img = fr.img;
+                        prewarm_upgrade_when_done(j, path, edge);  // takes over our reference
+                        j = nullptr;
+                    } else if (fast) {
+                        abt_image_free(&fr.img);
+                    }
+                    if (fast) job_release(fast);
+                    if (!j) goto finish;
+                    wait -= 350;
+                }
+            }
+            if (done || job_wait(j, wait, &r)) {
                 resp->hr = r.hr;
                 resp->info = r.info;
                 resp->source = r.source;
@@ -116,6 +141,7 @@ static void serve_image(const abt_req& req, const wchar_t* path, abt_resp* resp,
             job_release(j);
         }
     }
+finish:
     if (SUCCEEDED(resp->hr) && img->px) {
         fit_to_box(img, bw, bh);
         resp->width = (uint32_t)img->w;
@@ -150,10 +176,13 @@ static void handle_client(HANDLE p, wchar_t* path) {
         resp.hr = S_OK;
         agent_request_quit();
         break;
-    case ABT_MSG_HINT:
-        prewarm_hint_file(path, req.cx ? (int)req.cx : 256);
+    case ABT_MSG_HINT: {
+        DWORD a = GetFileAttributesW(path);
+        if (a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY)) prewarm_hint_folder(path, req.cx ? (int)req.cx : 256);
+        else prewarm_hint_file(path, req.cx ? (int)req.cx : 256);
         resp.hr = S_OK;
         break;
+    }
     case ABT_MSG_STATS: {
         text = (char*)mem_zalloc(8192);
         if (!text) break;
