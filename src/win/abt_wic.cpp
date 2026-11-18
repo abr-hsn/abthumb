@@ -74,7 +74,7 @@ HRESULT save_png_bgra(const wchar_t* path, const uint8_t* px, int w, int h, int 
     return hr;
 }
 
-HRESULT hbitmap_to_bgra(HBITMAP bmp, uint8_t** px, int* w, int* h) {
+HRESULT hbitmap_to_bgra(HBITMAP bmp, uint8_t** px, int* w, int* h, bool shell_bitmap) {
     DIBSECTION ds = {};
     if (GetObjectW(bmp, sizeof(ds), &ds) != sizeof(ds) || ds.dsBm.bmBitsPixel != 32 || !ds.dsBm.bmBits) {
         // Not a 32bpp DIB section: go through GetDIBits.
@@ -98,7 +98,10 @@ HRESULT hbitmap_to_bgra(HBITMAP bmp, uint8_t** px, int* w, int* h) {
     int bw = ds.dsBm.bmWidth, bh = ds.dsBm.bmHeight;
     uint8_t* out = (uint8_t*)mem_alloc((size_t)bw * bh * 4);
     if (!out) return E_OUTOFMEMORY;
-    bool bottom_up = ds.dsBmih.biHeight > 0;
+    // Thumbnail-cache bitmaps (IThumbnailCache / IShellItemImageFactory) report a positive height
+    // but hold their rows top-first; verified with Windows' own PNG thumbnails. Explorer draws
+    // them that way, so read them in memory order.
+    bool bottom_up = ds.dsBmih.biHeight > 0 && !shell_bitmap;
     for (int y = 0; y < bh; ++y) {
         const uint8_t* src = (const uint8_t*)ds.dsBm.bmBits + (size_t)(bottom_up ? bh - 1 - y : y) * ds.dsBm.bmWidthBytes;
         memcpy(out + (size_t)y * bw * 4, src, (size_t)bw * 4);

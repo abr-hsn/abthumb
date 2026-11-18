@@ -128,10 +128,14 @@ static int cmd_shelltest(int argc, wchar_t** argv) {
             GetObjectW(bmp, sizeof(bm), &bm);
             w = bm.bmWidth;
             h = bm.bmHeight;
+            DIBSECTION ds = {};
+            int dsz = GetObjectW(bmp, sizeof(ds), &ds);
+            printf("  [bitmap: %s, biHeight=%ld, bpp=%u]\n", dsz == sizeof(ds) ? "DIB section" : "DDB",
+                   dsz == sizeof(ds) ? ds.dsBmih.biHeight : 0L, bm.bmBitsPixel);
             if (o.out) {
                 uint8_t* px = nullptr;
                 int bw, bh;
-                if (SUCCEEDED(abt::hbitmap_to_bgra(bmp, &px, &bw, &bh))) {
+                if (SUCCEEDED(abt::hbitmap_to_bgra(bmp, &px, &bw, &bh, true))) {
                     wchar_t png[MAX_PATH];
                     _snwprintf_s(png, MAX_PATH, _TRUNCATE, L"%s\\%s_%d.png", o.out, PathFindFileNameW(full), o.size);
                     abt::save_png_bgra(png, px, bw, bh, bw * 4, true);
