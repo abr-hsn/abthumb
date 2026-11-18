@@ -609,18 +609,30 @@ void cache_maintenance() {
             for (uint32_t i = 0; i < g_cap; ++i)
                 if (g_tab[i].tier && g_tab[i].tier != kTomb) list[n++] = &g_tab[i];
             qsort(list, n, sizeof(Entry*), cmp_access);
-            uint64_t target = g_cap_bytes / 10 * 9;
+            uint64_t target = g_cap_bytes / 10 * 9;  // headroom so compaction can bring disk under the cap
             for (uint32_t i = 0; i < n && g_live_bytes > target; ++i) remove_entry(list[i]);
             mem_free(list);
         }
     }
-    // Compact the emptiest non-active segment if under half live (one per call keeps pauses short).
-    Seg* worst = nullptr;
-    for (int i = 0; i + 1 < g_nsegs; ++i) {
-        Seg* s = &g_segs[i];
-        if (s->size && s->live * 2 < s->size && (!worst || s->live * worst->size < worst->live * s->size)) worst = s;
+    // Reclaim dead space. The cap applies to bytes on disk, not just live bytes: segments that are
+    // 55% live were never compacted before, so the store could grow to about twice the cap.
+    // Compact the emptiest non-active segments while the store is over the cap (or any segment is
+    // under half live), within a small time budget per call so requests are not starved.
+    const ULONGLONG t_end = GetTickCount64() + 2000;
+    for (int pass = 0; pass < 16 && GetTickCount64() < t_end; ++pass) {
+        uint64_t disk = 0;
+        for (int i = 0; i < g_nsegs; ++i) disk += g_segs[i].size;
+        Seg* worst = nullptr;
+        for (int i = 0; i + 1 < g_nsegs; ++i) {
+            Seg* s = &g_segs[i];
+            if (s->size && (!worst || s->live * worst->size < worst->live * s->size)) worst = s;
+        }
+        if (!worst) break;
+        bool sparse = worst->live * 2 < worst->size;
+        bool over = disk > g_cap_bytes && worst->live * 20 < worst->size * 19;  // < 95% live: worth moving
+        if (!sparse && !over) break;
+        compact_segment_locked(worst->id);
     }
-    if (worst) compact_segment_locked(worst->id);
     if (g_used > g_count * 2 + 1024) rehash(g_cap);  // purge tombstones
     // Build the snapshot under the lock, write it to disk without it.
     size_t bytes = 0;
