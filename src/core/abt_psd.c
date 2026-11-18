@@ -395,6 +395,11 @@ static uint32_t rle_count(const chan_src* s, int c, int y) {
 }
 
 static abt_status src_init(chan_src* s, size_t total_channels) {
+    /* Truncated image data would only be decoded as zeros, at the cost of the claimed size (a
+       58-byte file can claim 16k x 16k): require the raw planes or the RLE row table to exist. */
+    size_t avail = s->base <= s->n ? s->n - s->base : 0;
+    if (s->comp == 0 && (uint64_t)s->rb * (uint64_t)s->h * (uint64_t)s->nneed > avail) return ABT_E_TRUNCATED;
+    if (s->comp == 1 && (uint64_t)total_channels * (uint64_t)s->h * (s->psb ? 4u : 2u) > avail) return ABT_E_TRUNCATED;
     s->scratch = (uint8_t*)malloc(s->rb + 8);
     if (!s->scratch) return ABT_E_NOMEM;
     if (s->comp == 1) {
@@ -410,7 +415,6 @@ static abt_status src_init(chan_src* s, size_t total_channels) {
         }
     } else if (s->comp == 2 || s->comp == 3) {
         size_t total = s->rb * (size_t)s->h * (size_t)s->nneed;
-        size_t avail = s->base <= s->n ? s->n - s->base : 0;
         /* deflate expands at most ~1032:1 */
         if (total > ((size_t)256 << 20) || total > (uint64_t)avail * 1032 + ((uint64_t)1 << 20)) return ABT_E_LIMIT;
         s->zip = (uint8_t*)malloc(total ? total : 1);

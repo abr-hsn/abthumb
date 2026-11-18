@@ -760,7 +760,26 @@ static void test_robustness(void) {
     ABT_CHECK(1);
 }
 
+/* Fuzzer find: a 58-byte header claiming 16384 x 16640 CMYK 1-bit raw data with no data used to
+   spend tens of seconds decoding zeros. It must now fail fast. */
+static void test_truncated_raw_claim(void) {
+    static const uint8_t d[58] = {0x38, 0x42, 0x50, 0x53, 0x00, 0x01, 0x29, 0, 0, 0, 0, 0, 0x00, 0x06,
+                                  0x00, 0x00, 0x41, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x01, 0x00, 0x04};
+    abt_probe pr;
+    memset(&pr, 0, sizeof(pr));
+    if (abt_probe_psd(d, sizeof(d), &pr) != ABT_OK) { ABT_CHECK(1); return; }
+    abt_psd_opts o = {0};
+    o.dst_w = 64;
+    o.dst_h = 64;
+    abt_pixbuf pb = {0};
+    clock_t t0 = clock();
+    ABT_CHECK(abt_psd_decode_composite(d, sizeof(d), &pr, &o, &pb) != ABT_OK);
+    ABT_CHECK(ms_since(t0) < 100.0);
+    abt_pixbuf_free(&pb);
+}
+
 void suite_psd(void) {
+    test_truncated_raw_claim();
     test_synthetic();
     test_synthetic_resources();
     test_pixbuf();
