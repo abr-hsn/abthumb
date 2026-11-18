@@ -83,9 +83,6 @@ jobs:
           $hash = (Get-FileHash $setup -Algorithm SHA256).Hash.ToLower()
           $notes = (Get-Content .github\release-notes.md -Raw).Replace('{VERSION}', $v).Replace('{SETUP_SHA256}', $hash)
           Set-Content "$env:RUNNER_TEMP\notes.md" $notes -Encoding utf8
-          # Keep this an array: splatting a lone string passes it one character at a time.
-          $pre = @()
-          if ($v -match '^0\.') { $pre += '--prerelease' }
           gh release create $env:TAG $setup "dist\abthumb-$v-x64.zip" dist\SHA256SUMS.txt `
-            --title "abthumb $v" --notes-file "$env:RUNNER_TEMP\notes.md" --generate-notes --verify-tag @pre
+            --title "abthumb $v" --notes-file "$env:RUNNER_TEMP\notes.md" --generate-notes --verify-tag --latest
           if ($LASTEXITCODE) { throw "gh release create failed" }

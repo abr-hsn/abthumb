@@ -16,9 +16,12 @@ Fast, accurate Windows Explorer thumbnails and preview pane for Adobe Illustrato
   deadlines; a broken file can never take Explorer down. Background work runs on efficiency
   cores and pauses on battery saver, full-screen apps and high CPU load.
 
+This project is made with Claude code and Codex
+
 ## Install
 
-1. Run `abthumb-setup-<version>-x64.exe`. Windows asks for administrator permission once:
+1. Download `abthumb-setup-<version>-x64.exe` from the
+   [latest release](https://github.com/abr-hsn/abthumb/releases/latest) and run it. Windows asks for administrator permission once:
    Explorer only loads thumbnail handlers that are registered machine-wide.
 2. Leave "Clear Explorer's thumbnail cache" ticked, so thumbnails made by the previous handler
    (for example FastPictureViewer's small embedded previews) are regenerated.

@@ -24,7 +24,7 @@ in separate build trees; add `-Quick` for build and tests only. To run the quick
 push, enable the hook once: `git config core.hooksPath .githooks`.
 
 Releases: bump `project(abthumb VERSION ...)` in CMakeLists.txt, then push a matching tag
-(`git tag v0.1.2 && git push origin v0.1.2`). The Release workflow builds and publishes the installer.
+(`git tag v0.1.3 && git push origin v0.1.3`). The Release workflow builds and publishes the installer.
 
 Unit tests that need the generated corpus skip themselves when it is missing. The corpus is
 generated from Illustrator and Photoshop (see `tests/corpus/scripts/README.md`); please never commit
