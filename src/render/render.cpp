@@ -167,6 +167,16 @@ static bool ai_canvas_thumbnail(const MappedFile& mf, const abt_probe& pr, int b
     return true;
 }
 
+// Share of pixels that are clearly not white (any channel below 230): how much art a render shows.
+static double ink_fraction(const abt_image& img) {
+    if (!img.px || img.w < 1 || img.h < 1) return 0.0;
+    size_t n = (size_t)img.w * img.h, ink = 0;
+    const uint8_t* p = img.px;
+    for (size_t i = 0; i < n; ++i, p += 4)
+        if (p[0] < 230 || p[1] < 230 || p[2] < 230) ++ink;
+    return (double)ink / (double)n;
+}
+
 // Body of the pipeline; may fault on I/O errors of the mapped view (guarded by the caller).
 static void render_inner(const RenderRequest& rq, const MappedFile& mf, RenderResult* rr) {
     abt_probe pr;
@@ -302,10 +312,14 @@ static void render_inner(const RenderRequest& rq, const MappedFile& mf, RenderRe
     }
     // Still nothing visible (artboard 1 is empty, the document thumbnail blank or missing): a thumbnail
     // is never left white while another page or artboard has art, so show the first one that does.
-    if (SUCCEEDED(hr) && canvas && (fam == ABT_FAM_AI_PDF || fam == ABT_FAM_PDF) &&
-        (rr->info.flags & ABT_INFO_PAGE_EMPTY) && rr->info.page_count > 1) {
+    // An Illustrator artboard with only crop marks or a stray line counts as nearly empty (under 1 %
+    // ink). PDFs keep a sparse page 1 (a cover is page 1 even when it is mostly white).
+    if (SUCCEEDED(hr) && canvas && (fam == ABT_FAM_AI_PDF || fam == ABT_FAM_PDF) && rr->info.page_count > 1 &&
+        ((rr->info.flags & ABT_INFO_PAGE_EMPTY) || (fam == ABT_FAM_AI_PDF && ink_fraction(rr->img) < 0.01))) {
+        double best_ink = (rr->info.flags & ABT_INFO_PAGE_EMPTY) ? 0.0 : ink_fraction(rr->img);
+        uint32_t best_page = 0;
         uint32_t last = rr->info.page_count < 16 ? rr->info.page_count : 16;  // bounded cost
-        for (uint32_t p = 1; p < last; ++p) {
+        for (uint32_t p = 1; p < last && best_ink < 0.01; ++p) {
             RenderRequest r2 = rq;
             r2.page = (int)p;
             abt_image img = {};
@@ -313,21 +327,26 @@ static void render_inner(const RenderRequest& rq, const MappedFile& mf, RenderRe
             inf.flags &= ~(uint32_t)ABT_INFO_PAGE_EMPTY;
             bool np = false;
             if (FAILED(render_pdf(mf.data, mf.size, r2, fam, &img, &inf, &np))) break;  // e.g. deadline
-            if (!(inf.flags & ABT_INFO_PAGE_EMPTY)) {
+            double ink = (inf.flags & ABT_INFO_PAGE_EMPTY) ? 0.0 : ink_fraction(img);
+            if (ink > best_ink) {
                 abt_image_free(&rr->img);
                 rr->img = img;
                 rr->info.flags &= ~(uint32_t)ABT_INFO_PAGE_EMPTY;
-                _snprintf_s(rr->reason, sizeof(rr->reason), _TRUNCATE, "first artboard with art (%u)", p + 1);
-                break;
+                best_ink = ink;
+                best_page = p;
+            } else {
+                abt_image_free(&img);
             }
-            abt_image_free(&img);
         }
+        if (best_page)
+            _snprintf_s(rr->reason, sizeof(rr->reason), _TRUNCATE, "first artboard with art (%u)", best_page + 1);
     }
     // A white tile tells the user nothing (D-016): when no page has visible art and there is no
     // usable document thumbnail (art only outside the artboards, saved by an Illustrator that wrote a
     // blank thumbnail), Explorer shows its icon instead. Remembered until the file changes.
+    // Crop marks alone (well under 0.3 % ink) count as nothing for an Illustrator file.
     if (SUCCEEDED(hr) && canvas && (fam == ABT_FAM_AI_PDF || fam == ABT_FAM_PDF) &&
-        (rr->info.flags & ABT_INFO_PAGE_EMPTY)) {
+        ((rr->info.flags & ABT_INFO_PAGE_EMPTY) || (fam == ABT_FAM_AI_PDF && ink_fraction(rr->img) < 0.003))) {
         abt_image_free(&rr->img);
         rr->hr = HRESULT_FROM_WIN32(ERROR_NO_DATA);
         set_reason(rr, "no visible art on the artboards and no usable document thumbnail");
