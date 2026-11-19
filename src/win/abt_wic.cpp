@@ -74,6 +74,67 @@ HRESULT save_png_bgra(const wchar_t* path, const uint8_t* px, int w, int h, int 
     return hr;
 }
 
+HRESULT encode_jpeg_bgra(const uint8_t* px, int w, int h, float quality, uint8_t** out, size_t* len) {
+    *out = nullptr;
+    *len = 0;
+    IWICImagingFactory* f = nullptr;
+    HRESULT hr = wic_factory(&f);
+    if (FAILED(hr)) return hr;
+    IStream* st = nullptr;
+    IWICBitmapEncoder* enc = nullptr;
+    IWICBitmapFrameEncode* frame = nullptr;
+    IPropertyBag2* props = nullptr;
+    IWICBitmap* bmp = nullptr;
+    hr = CreateStreamOnHGlobal(nullptr, TRUE, &st);
+    if (SUCCEEDED(hr)) hr = f->CreateEncoder(GUID_ContainerFormatJpeg, nullptr, &enc);
+    if (SUCCEEDED(hr)) hr = enc->Initialize(st, WICBitmapEncoderNoCache);
+    if (SUCCEEDED(hr)) hr = enc->CreateNewFrame(&frame, &props);
+    if (SUCCEEDED(hr) && props) {
+        PROPBAG2 opt[2] = {};
+        VARIANT val[2];
+        opt[0].pstrName = (LPOLESTR)L"ImageQuality";
+        VariantInit(&val[0]);
+        val[0].vt = VT_R4;
+        val[0].fltVal = quality;
+        opt[1].pstrName = (LPOLESTR)L"JpegYCrCbSubsampling";
+        VariantInit(&val[1]);
+        val[1].vt = VT_UI1;
+        val[1].bVal = WICJpegYCrCbSubsampling444;
+        props->Write(2, opt, val);  // best effort: older WIC may not know the subsampling option
+    }
+    if (SUCCEEDED(hr)) hr = frame->Initialize(props);
+    if (SUCCEEDED(hr)) hr = frame->SetSize((UINT)w, (UINT)h);
+    if (SUCCEEDED(hr))
+        hr = f->CreateBitmapFromMemory((UINT)w, (UINT)h, GUID_WICPixelFormat32bppBGR, (UINT)w * 4, (UINT)w * 4 * h,
+                                       (BYTE*)px, &bmp);
+    if (SUCCEEDED(hr)) hr = frame->WriteSource(bmp, nullptr);  // the encoder converts to 24bpp
+    if (SUCCEEDED(hr)) hr = frame->Commit();
+    if (SUCCEEDED(hr)) hr = enc->Commit();
+    if (SUCCEEDED(hr)) {
+        STATSTG ss = {};
+        hr = st->Stat(&ss, STATFLAG_NONAME);
+        uint8_t* buf = SUCCEEDED(hr) ? (uint8_t*)mem_alloc((size_t)ss.cbSize.QuadPart) : nullptr;
+        LARGE_INTEGER zero = {};
+        ULONG got = 0;
+        if (!buf) hr = E_OUTOFMEMORY;
+        else if (FAILED(hr = st->Seek(zero, STREAM_SEEK_SET, nullptr)) ||
+                 FAILED(hr = st->Read(buf, (ULONG)ss.cbSize.QuadPart, &got)) || got != ss.cbSize.QuadPart) {
+            mem_free(buf);
+            if (SUCCEEDED(hr)) hr = E_FAIL;
+        } else {
+            *out = buf;
+            *len = got;
+        }
+    }
+    if (bmp) bmp->Release();
+    if (props) props->Release();
+    if (frame) frame->Release();
+    if (enc) enc->Release();
+    if (st) st->Release();
+    f->Release();
+    return hr;
+}
+
 HRESULT hbitmap_to_bgra(HBITMAP bmp, uint8_t** px, int* w, int* h, bool shell_bitmap) {
     DIBSECTION ds = {};
     if (GetObjectW(bmp, sizeof(ds), &ds) != sizeof(ds) || ds.dsBm.bmBitsPixel != 32 || !ds.dsBm.bmBits) {

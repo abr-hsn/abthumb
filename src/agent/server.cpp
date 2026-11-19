@@ -1,6 +1,7 @@
 // Named-pipe server: answers the shell extension (thumbnails, preview pane) and the CLI.
 #include "agent.h"
 #include <sddl.h>
+#include <objbase.h>
 
 namespace abt {
 
@@ -413,6 +414,8 @@ static bool connect_client(HANDLE p, HANDLE ev) {
 }
 
 static DWORD WINAPI server_thread(void* arg) {
+    // Cache reads decode JPEG with WIC on this thread (D-034).
+    HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     wchar_t* path = (wchar_t*)mem_alloc((ABT_MAX_PATH_CHARS + 1) * sizeof(wchar_t));
     HANDLE ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     HANDLE p = (HANDLE)arg;  // thread 0 receives the first instance
@@ -430,6 +433,7 @@ static DWORD WINAPI server_thread(void* arg) {
     if (p != INVALID_HANDLE_VALUE && p) CloseHandle(p);
     if (ev) CloseHandle(ev);
     mem_free(path);
+    if (SUCCEEDED(co)) CoUninitialize();
     return 0;
 }
 

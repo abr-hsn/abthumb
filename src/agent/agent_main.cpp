@@ -62,7 +62,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     SetPriorityClass(GetCurrentProcess(), NORMAL_PRIORITY_CLASS);
 
     const wchar_t* root = ABT_REG_ROOT;
-    uint64_t cap_mb = reg_get_dword(HKEY_CURRENT_USER, root, L"CacheMaxMB", 1024);
+    uint64_t cap_mb = reg_get_dword(HKEY_CURRENT_USER, root, L"CacheMaxMB", 5120);
     int fg = (int)reg_get_dword(HKEY_CURRENT_USER, root, L"ForegroundWorkers", 2);
     int bg = (int)reg_get_dword(HKEY_CURRENT_USER, root, L"BackgroundWorkers", (DWORD)default_bg_workers());
     int threads = (int)reg_get_dword(HKEY_CURRENT_USER, root, L"ServerThreads", 8);

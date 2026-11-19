@@ -3,6 +3,8 @@
 // Single process (the agent) owns it; internal locking makes it thread-safe.
 #include "agent.h"
 #include <stdlib.h>
+#include "abt_wic.h"
+#include "abt_decode.h"
 
 namespace abt {
 
@@ -11,8 +13,9 @@ static const uint32_t kRecMagic = 0x52544241u;  // "ABTR"
 static const uint32_t kIdxMagic = 0x49544241u;  // "ABTI"
 static const uint64_t kSegMax = 64ull << 20;
 static const uint32_t kMaxRec = 256u << 20;  // a 4096 px QOI can exceed kSegMax (then it gets its own segment)
-static const int kTiers[] = {256, 512, 1024, 2048, 4096};
+static const int kTiers[] = {256, 512, 768, 1200, 1600, 2560};  // previews stop at 1200-1600 (D-034)
 static const uint32_t kNegTier = 0xFFFFu;
+static const uint16_t kCodecQoi = 0, kCodecJpeg = 1;  // RecHdr.reserved: payload encoding
 static const int kMaxSegs = 4096;
 
 struct RecHdr {
@@ -478,7 +481,16 @@ bool cache_get(const FileKey& k, uint32_t page, int edge, abt_image* img, CacheE
     view->height = h.height;
     view->flags = h.flags;
     if (h.info_len == sizeof(abt_file_info)) memcpy(&view->info, body + sizeof(h), sizeof(abt_file_info));
-    bool ok = abt_qoi_decode(body + sizeof(h) + h.info_len, h.payload_len, img) == ABT_OK;
+    const uint8_t* payload = body + sizeof(h) + h.info_len;
+    bool ok;
+    if (h.reserved == kCodecJpeg) {
+        int long_edge = h.width > h.height ? h.width : h.height;
+        ok = SUCCEEDED(decode_image_bytes(payload, h.payload_len, long_edge, false, img));
+        if (ok && (img->w != h.width || img->h != h.height)) { abt_image_free(img); ok = false; }
+        if (ok) img->has_alpha = 0;
+    } else {
+        ok = h.reserved == kCodecQoi && abt_qoi_decode(payload, h.payload_len, img) == ABT_OK;
+    }
     mem_free(body);
     return ok;
 }
@@ -488,10 +500,22 @@ void cache_put(const FileKey& k, uint32_t page, int edge, const abt_image* img, 
     if (!g_open) return;
     uint8_t* qoi = nullptr;
     size_t qlen = 0;
+    uint16_t codec = kCodecQoi;
     uint32_t tier = (flags & CF_NEGATIVE) ? kNegTier : (uint32_t)tier_for(edge);
     if (!(flags & CF_NEGATIVE)) {
         if (!img || !img->px) return;
-        qlen = abt_qoi_encode(img->px, img->w, img->h, &qoi);
+        // Opaque pictures (almost all of them) are stored as JPEG at quality 90 with full-resolution
+        // colour: about a tenth of the lossless QOI size. Transparent ones stay lossless (D-034).
+        bool opaque = true;
+        for (size_t i = 0, n = (size_t)img->w * img->h; i < n && opaque; ++i) opaque = img->px[i * 4 + 3] == 255;
+        uint8_t* jpg = nullptr;
+        if (opaque && SUCCEEDED(encode_jpeg_bgra(img->px, img->w, img->h, 0.90f, &jpg, &qlen)) && qlen) {
+            qoi = (uint8_t*)malloc(qlen);
+            if (qoi) { memcpy(qoi, jpg, qlen); codec = kCodecJpeg; }
+            else qlen = 0;
+        }
+        mem_free(jpg);
+        if (!qoi) { qlen = abt_qoi_encode(img->px, img->w, img->h, &qoi); codec = kCodecQoi; }
         if (!qlen) return;
     }
     size_t rec_len = sizeof(RecHdr) + sizeof(abt_file_info) + qlen;
@@ -508,6 +532,7 @@ void cache_put(const FileKey& k, uint32_t page, int edge, const abt_image* img, 
     h.width = img && img->px ? (uint16_t)img->w : 0;
     h.height = img && img->px ? (uint16_t)img->h : 0;
     h.flags = flags;
+    h.reserved = codec;
     h.info_len = sizeof(abt_file_info);
     h.payload_len = (uint32_t)qlen;
     memcpy(rec + sizeof(h), &info, sizeof(info));
@@ -602,14 +627,29 @@ static void compact_segment_locked(uint32_t id) {
 void cache_maintenance() {
     AcquireSRWLockExclusive(&g_lock);
     if (!g_open) { ReleaseSRWLockExclusive(&g_lock); return; }
-    if (g_live_bytes > g_cap_bytes && g_count) {
+    // The budget is soft (D-034): the configured size (5 GB by default), but never so much that the
+    // cache drive drops under max(2 GB, 5 % of the volume) free. Unchanged files keep their entries
+    // until the least recently used ones have to go.
+    uint64_t cap = g_cap_bytes;
+    {
+        ULARGE_INTEGER avail = {}, total = {};
+        uint64_t disk_now = 0;
+        for (int i = 0; i < g_nsegs; ++i) disk_now += g_segs[i].size;
+        if (GetDiskFreeSpaceExW(g_dir, &avail, &total, nullptr)) {
+            uint64_t reserve = total.QuadPart / 20 > (2ull << 30) ? total.QuadPart / 20 : (2ull << 30);
+            uint64_t room = disk_now + avail.QuadPart > reserve ? disk_now + avail.QuadPart - reserve : 0;
+            if (room < (256ull << 20)) room = 256ull << 20;
+            if (room < cap) cap = room;
+        }
+    }
+    if (g_live_bytes > cap && g_count) {
         Entry** list = (Entry**)mem_alloc(sizeof(Entry*) * g_count);
         if (list) {
             uint32_t n = 0;
             for (uint32_t i = 0; i < g_cap; ++i)
                 if (g_tab[i].tier && g_tab[i].tier != kTomb) list[n++] = &g_tab[i];
             qsort(list, n, sizeof(Entry*), cmp_access);
-            uint64_t target = g_cap_bytes / 10 * 9;  // headroom so compaction can bring disk under the cap
+            uint64_t target = cap / 10 * 9;  // headroom so compaction can bring disk under the cap
             for (uint32_t i = 0; i < n && g_live_bytes > target; ++i) remove_entry(list[i]);
             mem_free(list);
         }
@@ -629,7 +669,7 @@ void cache_maintenance() {
         }
         if (!worst) break;
         bool sparse = worst->live * 2 < worst->size;
-        bool over = disk > g_cap_bytes && worst->live * 20 < worst->size * 19;  // < 95% live: worth moving
+        bool over = disk > cap && worst->live * 20 < worst->size * 19;  // < 95% live: worth moving
         if (!sparse && !over) break;
         compact_segment_locked(worst->id);
     }

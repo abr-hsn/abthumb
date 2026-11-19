@@ -92,7 +92,9 @@ Result* fetch(uint16_t msg, const wchar_t* path, int cx, int cy, int page, int g
     r->req_h = cy;
     r->quick = quick;
     // The first-paint thumbnail is a nicety: never let it hold up the real request for long.
-    r->hr = request_image(msg, path, (UINT)cx, (UINT)cy, (UINT)page, &resp, &r->px, 0, quick ? 3000 : 0);
+    // View -1 (whole artwork) is the agent's canvas page.
+    UINT agent_page = page < 0 ? (UINT)ABT_PAGE_CANVAS : (UINT)page;
+    r->hr = request_image(msg, path, (UINT)cx, (UINT)cy, agent_page, &resp, &r->px, 0, quick ? 3000 : 0);
     r->w = (int)resp.width;
     r->h = (int)resp.height;
     r->info = resp.info;
@@ -156,9 +158,9 @@ DWORD WINAPI request_thread(void* arg) {
         if (!path) continue;
         if (pixels) {
             // First paint of a new file: the thumbnail tier is usually cached already (sub-ms).
-            if (quick_done_for != file_gen && page == 0) {
+            if (quick_done_for != file_gen && page <= 0) {
                 quick_done_for = file_gen;
-                if (Result* q = fetch(ABT_MSG_THUMB, path, 256, 256, 0, gen, file_gen, true)) {
+                if (Result* q = fetch(ABT_MSG_THUMB, path, 256, 256, page, gen, file_gen, true)) {
                     if (q->info.page_count > (uint32_t)count) count = (int)min_u32(q->info.page_count, 100000);
                     post_result(s, q);
                 }
@@ -243,7 +245,10 @@ class PreviewHandler final : public IPreviewHandler,
     bool m_loading = false;   // the page on screen is not the page asked for yet
     abt_file_info m_info = {};
     bool m_have_info = false;
-    int m_page = 0, m_dir = 1;
+    // m_page -1 is the whole artwork (the canvas: every artboard and the art outside them), 0.. are
+    // artboards. The whole-artwork view exists only while it differs from artboard 1 (D-034).
+    int m_page = -1, m_dir = 1;
+    bool m_overview_ok = true;
     int m_gen = 0, m_file_gen = 0;
     int m_req_w = 0, m_req_h = 0;
     char m_error[100] = "";
@@ -275,13 +280,35 @@ class PreviewHandler final : public IPreviewHandler,
         m_empty[p >> 3] |= (uint8_t)(1u << (p & 7));
         ++m_empty_count;
     }
-    // First page from `from` stepping by dir that is not known to be empty, or -1.
-    int next_shown(int from, int dir) const {
-        for (int p = from, n = page_count(); p >= 0 && p < n; p += dir)
-            if (!is_empty(p)) return p;
-        return -1;
+    int first_view() const { return m_overview_ok ? -1 : 0; }
+    int view_count() const { return page_count() - first_view(); }  // whole artwork + artboards
+    // Previews never need more than about 1200 px (D-034): 1200 at 100 % scaling, up to 1600 on
+    // high-DPI screens. Smaller panes get exactly their size.
+    int cap_edge() const {
+        int d = dpi();
+        if (d < 96) d = 96;
+        if (d > 128) d = 128;
+        return MulDiv(1200, d, 96);
     }
-    bool can_go(int delta) const { return next_shown(m_page + delta, delta) >= 0; }
+    void capped(int* w, int* h) const {
+        int c = cap_edge(), l = *w > *h ? *w : *h;
+        if (l <= c) return;
+        *w = MulDiv(*w, c, l);
+        *h = MulDiv(*h, c, l);
+    }
+    // First view from `from` stepping by dir that is not known to be empty, or kNoView.
+    static const int kNoView = -1000;
+    int next_shown(int from, int dir) const {
+        for (int p = from, n = page_count(); p >= first_view() && p < n; p += dir)
+            if (!is_empty(p)) return p;
+        return kNoView;
+    }
+    bool can_go(int delta) const { return next_shown(m_page + delta, delta) != kNoView; }
+    // "Whole artwork" or "Artboard 3"
+    void view_name(wchar_t* out, size_t cap, int page) const {
+        if (page < 0) lstrcpynW(out, L"Whole artwork", (int)cap);
+        else _snwprintf_s(out, cap, _TRUNCATE, L"%s %d", page_noun(), page + 1);
+    }
 
     static HBITMAP bmp_from(const Result* r, bool* alpha) {
         void* bits = nullptr;
@@ -436,6 +463,7 @@ class PreviewHandler final : public IPreviewHandler,
         RECT a;
         image_area(&a);
         int w = a.right - a.left, h = a.bottom - a.top;
+        capped(&w, &h);
         return c->req_w >= w * 9 / 10 && c->req_h >= h * 9 / 10 && c->req_w <= w * 11 / 10 + 1 &&
                c->req_h <= h * 11 / 10 + 1;
     }
@@ -448,6 +476,7 @@ class PreviewHandler final : public IPreviewHandler,
         image_area(&a);
         int w = a.right - a.left, h = a.bottom - a.top;
         if (w < 16 || h < 16) return;
+        capped(&w, &h);
         ++m_gen;
         if (want_pixels) {
             m_req_w = w;
@@ -479,6 +508,20 @@ class PreviewHandler final : public IPreviewHandler,
             InvalidateRect(m_wnd, nullptr, FALSE);
             return;
         }
+        // The whole artwork is just artboard 1 (one artboard, no art outside it, or not Illustrator):
+        // drop the extra view and file the picture as artboard 1, so the arrows never show it twice.
+        if (r->page < 0 && !r->quick && SUCCEEDED(r->hr) && r->info.family &&
+            !(r->info.flags & ABT_INFO_CANVAS_BEYOND_PAGE1)) {
+            m_overview_ok = false;
+            r->page = 0;
+            if (m_page < 0) m_page = 0;
+        } else if (r->page < 0 && !r->quick && FAILED(r->hr) && m_page < 0 && r->gen == m_gen) {
+            // No picture of the whole artwork: start at the artboards instead.
+            m_overview_ok = false;
+            free_result(r);
+            go_page(0, 1);
+            return;
+        }
         bool current = r->gen == m_gen && r->page == m_page;
         if (r->info.family && (!r->quick || !m_have_info)) {
             uint32_t pages = m_have_info ? m_info.page_count : 0;
@@ -498,7 +541,8 @@ class PreviewHandler final : public IPreviewHandler,
             // The thumbnail is the whole document; for an Illustrator file with several artboards or
             // art outside artboard 1 it is not artboard 1, so it only stands in for it when it is
             // the same picture.
-            bool same_picture = !(r->info.flags & ABT_INFO_CANVAS_BEYOND_PAGE1);
+            bool same_picture = m_page < 0 || !(r->info.flags & ABT_INFO_CANVAS_BEYOND_PAGE1);
+            current = r->gen == m_gen && (r->page == m_page || (r->page <= 0 && m_page <= 0));
             if (current && SUCCEEDED(r->hr) && same_picture && (!m_bmp || m_quick) && m_loading) {
                 drop_quick();
                 m_bmp = bmp_from(r, &m_alpha);
@@ -536,8 +580,8 @@ class PreviewHandler final : public IPreviewHandler,
     // else back the other way; when every artboard is empty, show the whole-document thumbnail.
     void skip_empty() {
         int q = next_shown(m_page + m_dir, m_dir);
-        if (q < 0) q = next_shown(m_page - m_dir, -m_dir);
-        if (q >= 0) {
+        if (q == kNoView) q = next_shown(m_page - m_dir, -m_dir);
+        if (q != kNoView) {
             go_page(q, q > m_page ? 1 : -1);
             return;
         }
@@ -550,12 +594,12 @@ class PreviewHandler final : public IPreviewHandler,
     // Moves to page p (skipping pages known to be empty, in direction dir).
     void go_page(int p, int dir = 0) {
         int n = page_count();
-        if (p < 0) p = 0;
+        if (p < first_view()) p = first_view();
         if (p >= n) p = n - 1;
         if (!dir) dir = p >= m_page ? 1 : -1;
         int q = next_shown(p, dir);
-        if (q < 0) q = next_shown(p, -dir);
-        if (q < 0 || q == m_page) return;
+        if (q == kNoView) q = next_shown(p, -dir);
+        if (q == kNoView || q == m_page) return;
         m_dir = q > m_page ? 1 : -1;
         m_page = q;
         m_error[0] = 0;
@@ -665,7 +709,9 @@ class PreviewHandler final : public IPreviewHandler,
         SetBkMode(mdc, TRANSPARENT);
         HGDIOBJ of = SelectObject(mdc, m_font);
         COLORREF dim = mix(m_bg, m_fg, 55), faint = mix(m_bg, m_fg, 10), line = mix(m_bg, m_fg, 14);
-        int n = page_count();
+        int n = page_count(), views = view_count();
+        wchar_t vname[48];
+        view_name(vname, _countof(vname), m_page);
 
         RECT area;
         image_area(&area);
@@ -674,9 +720,11 @@ class PreviewHandler final : public IPreviewHandler,
         // has arrived, or when the file has no picture whatsoever) a text line. Never a blank artboard.
         wchar_t msg[200];
         if (m_bmp) {
-            draw_bitmap(mdc, area, m_bmp, m_bw, m_bh, m_alpha, m_quick, (BYTE)(m_loading ? 110 : 255));
+            // Renders stop at the 1200 px cap (D-034): those may be stretched to a bigger pane.
+            bool at_cap = (m_bw > m_bh ? m_bw : m_bh) >= cap_edge() * 9 / 10;
+            draw_bitmap(mdc, area, m_bmp, m_bw, m_bh, m_alpha, m_quick || at_cap, (BYTE)(m_loading ? 110 : 255));
             if (m_loading) {
-                _snwprintf_s(msg, _countof(msg), _TRUNCATE, L"Rendering %s %d\x2026", page_noun(), m_page + 1);
+                _snwprintf_s(msg, _countof(msg), _TRUNCATE, L"Rendering %s\x2026", vname);
                 draw_pill(mdc, area, msg);
             }
         } else if (m_path) {
@@ -684,12 +732,12 @@ class PreviewHandler final : public IPreviewHandler,
             if (m_error[0]) MultiByteToWideChar(CP_UTF8, 0, m_error, -1, err, _countof(err));
             if (m_all_empty)
                 lstrcpynW(msg, n > 1 ? L"No artwork on any artboard" : L"No artwork on the artboard", _countof(msg));
-            else if (err[0] && n > 1)
-                _snwprintf_s(msg, _countof(msg), _TRUNCATE, L"%s %d could not be shown: %s", page_noun(), m_page + 1, err);
+            else if (err[0] && views > 1)
+                _snwprintf_s(msg, _countof(msg), _TRUNCATE, L"%s could not be shown: %s", vname, err);
             else if (err[0])
                 _snwprintf_s(msg, _countof(msg), _TRUNCATE, L"Could not be shown: %s", err);
-            else if (n > 1)
-                _snwprintf_s(msg, _countof(msg), _TRUNCATE, L"Rendering %s %d\x2026", page_noun(), m_page + 1);
+            else if (views > 1)
+                _snwprintf_s(msg, _countof(msg), _TRUNCATE, L"Rendering %s\x2026", vname);
             else
                 lstrcpynW(msg, L"Rendering\x2026", _countof(msg));
             if (m_ph) {
@@ -706,7 +754,7 @@ class PreviewHandler final : public IPreviewHandler,
         }
 
         // Hover arrows over the image (multi-page files only).
-        if (n > 1 && (m_zone == Z_IMG_PREV || m_zone == Z_IMG_NEXT)) {
+        if (views > 1 && (m_zone == Z_IMG_PREV || m_zone == Z_IMG_NEXT)) {
             RECT ap, an;
             image_arrows(&ap, &an);
             bool prev = m_zone == Z_IMG_PREV;
@@ -730,7 +778,7 @@ class PreviewHandler final : public IPreviewHandler,
         RECT sep = {0, h - sh, w, h - sh + 1};
         fill(mdc, sep, line);
         RECT tr = {px(10), h - sh, w - px(10), h};
-        if (n > 1 && !m_all_empty) {
+        if (views > 1 && !m_all_empty) {
             RECT bp, bl, bn;
             strip_buttons(&bp, &bl, &bn);
             tr.right = bp.left - px(8);
@@ -740,7 +788,8 @@ class PreviewHandler final : public IPreviewHandler,
             draw_glyph(mdc, m_icons, 0xE76B, bp, cp ? m_fg : mix(m_bg, m_fg, 30));
             draw_glyph(mdc, m_icons, 0xE76C, bn, cn ? m_fg : mix(m_bg, m_fg, 30));
             wchar_t lab[32];
-            _snwprintf_s(lab, _countof(lab), _TRUNCATE, L"%d / %d", m_page + 1, n);
+            if (m_page < 0) _snwprintf_s(lab, _countof(lab), _TRUNCATE, L"All (%d)", n);
+            else _snwprintf_s(lab, _countof(lab), _TRUNCATE, L"%d / %d", m_page + 1, n);
             ::SetTextColor(mdc, m_fg);
             DrawTextW(mdc, lab, -1, &bl, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         }
@@ -749,10 +798,9 @@ class PreviewHandler final : public IPreviewHandler,
         if (m_all_empty) {
             size_t l = wcslen(text);
             _snwprintf_s(text + l, _countof(text) - l, _TRUNCATE, L"%s", l ? L"  \x00b7  whole document" : L"Whole document");
-        } else if (n > 1) {
+        } else if (views > 1) {
             size_t l = wcslen(text);
-            _snwprintf_s(text + l, _countof(text) - l, _TRUNCATE, L"%s%s %d", l ? L"  \x00b7  " : L"", page_noun(),
-                         m_page + 1);
+            _snwprintf_s(text + l, _countof(text) - l, _TRUNCATE, L"%s%s", l ? L"  \x00b7  " : L"", vname);
             if (m_empty_count) {
                 l = wcslen(text);
                 _snwprintf_s(text + l, _countof(text) - l, _TRUNCATE, L"  \x00b7  %d empty skipped", m_empty_count);
@@ -771,7 +819,7 @@ class PreviewHandler final : public IPreviewHandler,
     // ---- input
 
     int zone_at(int x, int y) const {
-        if (page_count() < 2) return Z_NONE;
+        if (view_count() < 2) return Z_NONE;
         RECT bp, bl, bn;
         strip_buttons(&bp, &bl, &bn);
         if (in_rect(bp, x, y)) return Z_BTN_PREV;
@@ -799,6 +847,7 @@ class PreviewHandler final : public IPreviewHandler,
         RECT a;
         image_area(&a);
         int w = a.right - a.left, h = a.bottom - a.top;
+        capped(&w, &h);
         // Re-render when the pane changed noticeably either way: growing needs more pixels, and
         // shrinking a large image with AlphaBlend looks rough. Smaller sizes come from the agent's
         // cache by downscaling, so this is cheap.
@@ -860,7 +909,7 @@ class PreviewHandler final : public IPreviewHandler,
             switch (wp) {
             case VK_RIGHT: case VK_DOWN: case VK_NEXT: self->go_page(self->m_page + 1); return 0;
             case VK_LEFT: case VK_UP: case VK_PRIOR: self->go_page(self->m_page - 1); return 0;
-            case VK_HOME: self->go_page(0); return 0;
+            case VK_HOME: self->go_page(self->first_view()); return 0;
             case VK_END: self->go_page(self->page_count() - 1); return 0;
             }
             break;
@@ -931,7 +980,8 @@ class PreviewHandler final : public IPreviewHandler,
         cache_clear();
         m_have_info = false;
         m_info = {};
-        m_page = 0;
+        m_page = -1;  // the whole artwork first (D-034); artboards only through the arrows
+        m_overview_ok = true;
         m_dir = 1;
         m_error[0] = 0;
         m_loading = false;
