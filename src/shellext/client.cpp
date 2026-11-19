@@ -3,6 +3,8 @@
 #include "abt_proto.h"
 #include "abt_wic.h"
 #include <shlwapi.h>
+#include <winnetwk.h>
+#pragma comment(lib, "mpr.lib")
 
 static int g_in_agent = -1;  // 1 when loaded inside abthumb-agent.exe (its own pre-warm calls)
 static SRWLOCK g_start_lock = SRWLOCK_INIT;
@@ -33,8 +35,23 @@ static bool start_agent() {
     return true;
 }
 
+// Mapped network drives belong to a logon session: the agent can run in another one (started by the
+// installer, or Explorer vs. an elevated session) and then "Z:\file.ai" does not exist for it. The
+// caller's session resolves the mapping, so send the UNC path instead (D-033).
+static const wchar_t* to_unc(const wchar_t* path, wchar_t* buf, DWORD cap_bytes) {
+    if (!iswalpha(path[0]) || path[1] != L':' || path[2] != L'\\') return path;
+    wchar_t root[4] = {path[0], L':', L'\\', 0};
+    if (GetDriveTypeW(root) != DRIVE_REMOTE) return path;
+    DWORD n = cap_bytes;
+    if (WNetGetUniversalNameW(path, UNIVERSAL_NAME_INFO_LEVEL, buf, &n) != NO_ERROR) return path;
+    const wchar_t* unc = ((UNIVERSAL_NAME_INFOW*)buf)->lpUniversalName;
+    return unc && unc[0] == L'\\' && unc[1] == L'\\' ? unc : path;
+}
+
 HRESULT request_image(uint16_t msg, const wchar_t* path, UINT cx, UINT cy, UINT page, abt_resp* resp, uint8_t** px,
                       uint32_t flags, DWORD timeout_ms) {
+    alignas(8) uint8_t unc_buf[(ABT_MAX_PATH_CHARS > 2048 ? 2048 : ABT_MAX_PATH_CHARS) * 2 + 64];
+    path = to_unc(path, (wchar_t*)unc_buf, (DWORD)sizeof(unc_buf));
     memset(resp, 0, sizeof(*resp));
     *px = nullptr;
     size_t plen = (size_t)lstrlenW(path);
