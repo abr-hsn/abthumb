@@ -128,11 +128,11 @@ HRESULT create_thumbnail_provider(REFIID riid, void** ppv) {
 void draw_placeholder(void* bits, int w, int h, const wchar_t* path, const wchar_t* line2) {
     const wchar_t* ext = abt::path_ext(path);
     COLORREF bg = RGB(90, 90, 90);
-    if (!lstrcmpiW(ext, L".ai") || !lstrcmpiW(ext, L".ait")) bg = RGB(255, 154, 0);
-    else if (!lstrcmpiW(ext, L".eps") || !lstrcmpiW(ext, L".epsf") || !lstrcmpiW(ext, L".epsi")) bg = RGB(200, 120, 40);
-    else if (!lstrcmpiW(ext, L".psd") || !lstrcmpiW(ext, L".psb") || !lstrcmpiW(ext, L".psdt") || !lstrcmpiW(ext, L".pdd"))
+    if (abt::ieq(ext, L".ai") || abt::ieq(ext, L".ait")) bg = RGB(255, 154, 0);
+    else if (abt::ieq(ext, L".eps") || abt::ieq(ext, L".epsf") || abt::ieq(ext, L".epsi")) bg = RGB(200, 120, 40);
+    else if (abt::ieq(ext, L".psd") || abt::ieq(ext, L".psb") || abt::ieq(ext, L".psdt") || abt::ieq(ext, L".pdd"))
         bg = RGB(49, 168, 255);
-    else if (!lstrcmpiW(ext, L".pdf")) bg = RGB(220, 40, 40);
+    else if (abt::ieq(ext, L".pdf")) bg = RGB(220, 40, 40);
 
     HDC dc = CreateCompatibleDC(nullptr);
     BITMAPINFO bi = {};
@@ -144,6 +144,11 @@ void draw_placeholder(void* bits, int w, int h, const wchar_t* path, const wchar
     // Draw into a temporary DIB we own, then copy (GDI needs the bitmap selected into a DC).
     void* tmp_bits = nullptr;
     HBITMAP tmp = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &tmp_bits, nullptr, 0);
+    if (!tmp || !tmp_bits) {  // out of GDI memory: leave the caller's pixels as they are
+        if (tmp) DeleteObject(tmp);
+        if (dc) DeleteDC(dc);
+        return;
+    }
     HGDIOBJ old = SelectObject(dc, tmp);
     RECT rc = {0, 0, w, h};
     HBRUSH br = CreateSolidBrush(bg);

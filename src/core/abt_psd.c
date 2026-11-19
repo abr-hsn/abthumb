@@ -27,7 +27,7 @@
 void abt_psd_unpackbits(const uint8_t* src, size_t n, uint8_t* dst, size_t want) {
     size_t i = 0, o = 0;
     while (i < n && o < want) {
-        int hdr = (int8_t)src[i++];
+        int hdr = (int8_t)src[i++]; /* NOLINT(bugprone-signed-char-misuse,cert-str34-c): PackBits header is signed */
         if (hdr >= 0) {
             size_t cnt = (size_t)hdr + 1;
             if (cnt > n - i) cnt = n - i;
@@ -79,6 +79,9 @@ void abt_psd_unpredict(uint8_t* buf, size_t rows, int w, int depth) {
         } else if (depth == 32) {
             for (size_t i = 1; i < rb; ++i) row[i] = (uint8_t)(row[i] + row[i - 1]);
             for (int x = 0; x < w; ++x)
+#ifdef _MSC_VER
+#pragma warning(suppress : 6386) /* /analyze false positive: here rb == 4 * w, tmp holds rb bytes */
+#endif
                 for (int k = 0; k < 4; ++k) tmp[(size_t)x * 4 + (size_t)k] = row[(size_t)k * (size_t)w + (size_t)x];
             memcpy(row, tmp, rb);
         }

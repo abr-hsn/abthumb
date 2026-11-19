@@ -239,7 +239,8 @@ static void csrc_free(csrc* s) { free(s->zip); free(s->scratch); memset(s, 0, si
 
 static int csrc_init(csrc* s, const ctx* c, const lchan* ch, int w, int h) {
     memset(s, 0, sizeof(*s));
-    if (ch->len < 2 || w < 1 || h < 1) return 0;
+    /* Each cs[k] owns its scratch/zip and the caller frees every source: the leak report below is a false positive. */
+    if (ch->len < 2 || w < 1 || h < 1) return 0; /* NOLINT(clang-analyzer-unix.Malloc) */
     s->d = c->d; s->n = c->n; s->psb = c->psb; s->w = w; s->h = h; s->depth = c->depth;
     s->end = ch->off + (size_t)ch->len;
     if (s->end > c->n) s->end = c->n;
@@ -647,7 +648,7 @@ static int find_double(const uint8_t* d, size_t n, const char* key8, double* out
     if (!p || (size_t)(p - d) + 16 > n) return 0;
     uint64_t u = ((uint64_t)abt_load_u32be(p + 8) << 32) | abt_load_u32be(p + 12);
     memcpy(out, &u, 8);
-    return *out == *out;
+    return *out == *out; /* NOLINT(misc-redundant-expression): NaN test, false for NaN */
 }
 
 /* Solid colour fill colour in document channel space (stored representation, 0..1). Returns 0 if unsupported. */
@@ -729,7 +730,7 @@ static edge* vmsk_edges(const ctx* c, const layer* L, size_t* ne, int* invert, i
         if (sel == 0 || sel == 3) {
             total = abt_load_u16be(d + pos + 2);
             left = total > 1024 ? 1024 : total;
-            if (total > 1024) { pos += 26; left = 0; total = 0; continue; }
+            if (total > 1024) { pos += 26; continue; }
             closed = sel == 0;
             pos += 26;
             /* read the knot records */

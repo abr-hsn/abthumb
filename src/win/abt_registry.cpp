@@ -159,11 +159,11 @@ void shell_describe(char* buf, size_t cap) {
         // Which hive provides it (machine-wide is what Explorer's surrogates see, D-023).
         wchar_t mk[256], m[64];
         _snwprintf_s(mk, _countof(mk), _TRUNCATE, L"%s\\%s\\ShellEx\\%s", kClasses, kExtensions[i], ABT_SHELLEX_THUMB_STR);
-        bool machine_ours = get_sz(HKEY_LOCAL_MACHINE, mk, nullptr, m, sizeof(m)) && !lstrcmpiW(m, ABT_CLSID_THUMB_STR);
+        bool machine_ours = get_sz(HKEY_LOCAL_MACHINE, mk, nullptr, m, sizeof(m)) && abt::ieq(m, ABT_CLSID_THUMB_STR);
         char line[256];
         int n = _snprintf_s(line, sizeof(line), _TRUNCATE, "%-6ls thumb=%ls%s preview=%ls%s%s\n", kExtensions[i],
-                            thumb[0] ? thumb : L"-", lstrcmpiW(thumb, ABT_CLSID_THUMB_STR) == 0 ? " (abthumb)" : "",
-                            prev[0] ? prev : L"-", lstrcmpiW(prev, ABT_CLSID_PREVIEW_STR) == 0 ? " (abthumb)" : "",
+                            thumb[0] ? thumb : L"-", abt::ieq(thumb, ABT_CLSID_THUMB_STR) ? " (abthumb)" : "",
+                            prev[0] ? prev : L"-", abt::ieq(prev, ABT_CLSID_PREVIEW_STR) ? " (abthumb)" : "",
                             machine_ours ? "  [machine-wide]" : "");
         if (n > 0 && used + (size_t)n < cap) {
             memcpy(buf + used, line, (size_t)n + 1);

@@ -421,7 +421,7 @@ static DWORD WINAPI server_thread(void* arg) {
     HANDLE p = (HANDLE)arg;  // thread 0 receives the first instance
     while (!g_stop && path && ev) {
         if (p == INVALID_HANDLE_VALUE || !p) p = create_instance(false);
-        if (p == INVALID_HANDLE_VALUE) { Sleep(100); continue; }
+        if (p == INVALID_HANDLE_VALUE || !p) { p = INVALID_HANDLE_VALUE; Sleep(100); continue; }
         if (connect_client(p, ev) && !g_stop) {
             handle_client(p, path, ev);
             wait_client_close(p, ev);

@@ -36,6 +36,21 @@ add_compile_options(
   /wd4200   # zero-sized arrays in structs
   /wd4201   # nameless struct/union
   "$<$<COMPILE_LANGUAGE:CXX>:/permissive-;/Zc:__cplusplus;/GR-;/EHs-c-;/D_HAS_EXCEPTIONS=0>")
+
+# Code-quality gates (D-035). ABT_WERROR: any /W4 warning fails the build. ABT_ANALYZE: MSVC static
+# analysis (/analyze) on our code only; SDK and third-party headers are external and silenced.
+option(ABT_WERROR "Treat compiler warnings as errors" OFF)
+option(ABT_ANALYZE "Run MSVC /analyze on our targets" OFF)
+if(ABT_WERROR)
+  add_compile_options(/WX)
+endif()
+if(ABT_ANALYZE)
+  add_compile_options(/analyze /analyze:external- /external:anglebrackets /external:W0
+    /external:env:INCLUDE /external:env:EXTERNAL_INCLUDE
+    # Noise for this code base: ignored lstrcpyn/logging return values, SAL annotation of exported entry points,
+    # GetTickCount for short relative timeouts, 25 KB stack buffers (render_shape).
+    /wd6031 /wd28251 /wd28159 /wd6262)
+endif()
 add_link_options(/DEBUG:FULL /guard:cf "$<$<NOT:$<CONFIG:Debug>>:/OPT:REF;/OPT:ICF;/INCREMENTAL:NO>")
 
 if(ABT_FUZZ)
@@ -55,7 +70,7 @@ add_library(abt_core STATIC
   third_party/miniz/miniz.c
 )
 target_compile_definitions(abt_core PRIVATE MINIZ_NO_STDIO MINIZ_NO_ARCHIVE_APIS MINIZ_NO_TIME)
-set_source_files_properties(third_party/miniz/miniz.c PROPERTIES COMPILE_OPTIONS "/W0")
+set_source_files_properties(third_party/miniz/miniz.c PROPERTIES COMPILE_OPTIONS "/W0;/analyze-")
 target_include_directories(abt_core PUBLIC src/core PRIVATE third_party/miniz)
 
 if(ABT_FUZZ)
@@ -141,6 +156,7 @@ add_executable(abt_tests
 target_include_directories(abt_tests PRIVATE tests/unit)
 target_compile_definitions(abt_tests PRIVATE ABT_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 target_link_libraries(abt_tests PRIVATE abt_core)
+target_compile_options(abt_tests PRIVATE /analyze-)  # test code: unchecked mallocs are fine, a NULL crash is a failure anyway
 
 # ---------------------------------------------------------------- agent
 add_executable(abthumb_agent WIN32

@@ -432,7 +432,8 @@ abt_status abt_epsi_decode(const uint8_t* d, size_t n, const abt_preview* pv, ab
         uint8_t* dst = out->px + (size_t)y * (size_t)w * 4;
         for (int x = 0; x < w; ++x) {
             size_t bit = (size_t)x * depth;
-            uint32_t s = (row[bit >> 3] >> (8 - depth - (bit & 7))) & max;
+            /* row[0..rowb) is fully written above (got == rowb) and bit >> 3 < rowb: analyzer false positive */
+            uint32_t s = (row[bit >> 3] >> (8 - depth - (bit & 7))) & max; /* NOLINT(clang-analyzer-core.UndefinedBinaryOperatorResult) */
             uint8_t g = (uint8_t)(s * 255 / max);
             dst[4 * x] = dst[4 * x + 1] = dst[4 * x + 2] = g;
             dst[4 * x + 3] = 255;

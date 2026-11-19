@@ -20,6 +20,10 @@ inline constexpr GUID CLSID_AbtPreviewHandler = {0xa4e31d04, 0x2524, 0x467b, {0x
 
 namespace abt {
 
+// ---- strings
+// Case-insensitive equality that ignores the user locale (lstrcmpiW would fail for ".AI" under Turkish settings).
+inline bool ieq(const wchar_t* a, const wchar_t* b) { return CompareStringOrdinal(a, -1, b, -1, TRUE) == CSTR_EQUAL; }
+
 // ---- timing
 inline uint64_t qpc() { LARGE_INTEGER v; QueryPerformanceCounter(&v); return (uint64_t)v.QuadPart; }
 double qpc_ms(uint64_t from, uint64_t to);

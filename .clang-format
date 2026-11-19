@@ -1,0 +1,30 @@
+# Matches the existing hand-written style (D-035). The codebase is NOT reformatted wholesale:
+# scripts/ci.ps1 only checks files changed against origin/main.
+BasedOnStyle: LLVM
+Language: Cpp
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ColumnLimit: 120
+BreakBeforeBraces: Attach
+PointerAlignment: Left
+DerivePointerAlignment: false
+AllowShortIfStatementsOnASingleLine: WithoutElse
+AllowShortLoopsOnASingleLine: true
+AllowShortBlocksOnASingleLine: Empty
+AllowShortCaseLabelsOnASingleLine: true
+AllowShortFunctionsOnASingleLine: Empty
+IndentCaseLabels: false
+NamespaceIndentation: None
+AlignAfterOpenBracket: Align
+AlignConsecutiveAssignments: None
+AlignConsecutiveDeclarations: None
+AlignTrailingComments: true
+SpacesBeforeTrailingComments: 2
+ReflowComments: false
+SortIncludes: Never
+IncludeBlocks: Preserve
+BinPackArguments: true
+BinPackParameters: true
+ContinuationIndentWidth: 4
+MaxEmptyLinesToKeep: 2

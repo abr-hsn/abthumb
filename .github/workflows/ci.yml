@@ -42,6 +42,32 @@ jobs:
             build/release/bin/*.dll
           retention-days: 14
 
+  quality:
+    # Static checks (D-035): /W4 /WX build, clang-format (advisory), cppcheck, clang-tidy, MSVC /analyze.
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # clang-format checks the files changed against origin/main
+
+      - name: Cache PDFium binaries (pinned by SHA-256 in cmake/pdfium.cmake)
+        uses: actions/cache@v4
+        with:
+          path: third_party/pdfium
+          key: pdfium-${{ hashFiles('cmake/pdfium.cmake') }}
+
+      - name: Install cppcheck
+        shell: pwsh
+        run: choco install cppcheck -y --no-progress
+
+      - name: Quality gates
+        shell: pwsh
+        # clang-format / clang-tidy come with Visual Studio's LLVM component. regress.ps1 needs local design files
+        # and the fuzz run is the next job, so both are skipped here.
+        run: |
+          $env:PATH = "$env:ProgramFiles\cppcheck;$env:PATH"
+          ./scripts/ci.ps1 -NoRegress -FuzzSeconds 0
+
   fuzz-smoke:
     runs-on: windows-2025
     steps:

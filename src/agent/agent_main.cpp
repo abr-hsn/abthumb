@@ -98,7 +98,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     pool_stop();
     server_stop();
     cache_close();
-    CloseHandle(g_quit_event);
+    if (g_quit_event) CloseHandle(g_quit_event);
     ReleaseMutex(mutex);
     CloseHandle(mutex);
     CoUninitialize();

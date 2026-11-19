@@ -421,6 +421,7 @@ bool cache_open(const wchar_t* dir, uint64_t cap_bytes) {
 void cache_close() {
     AcquireSRWLockExclusive(&g_lock);
     if (g_open) snapshot_write();
+#pragma warning(suppress : 6001)  // /analyze false positive: g_segs is static, and h is set for every i < g_nsegs
     for (int i = 0; i < g_nsegs; ++i) CloseHandle(g_segs[i].h);
     g_nsegs = 0;
     mem_free(g_tab);
@@ -443,7 +444,6 @@ bool cache_get(const FileKey& k, uint32_t page, int edge, abt_image* img, CacheE
         view->flags = e->flags;
         view->width = view->height = 0;
         InterlockedExchange(&e->last_access, now_minutes());
-        found = true;
         // Read info for the negative entry too (so callers can report why).
         Seg* s = seg_by_id(e->seg);
         if (s && pread(s->h, e->offset, &h, sizeof(h)) && h.info_len == sizeof(abt_file_info))

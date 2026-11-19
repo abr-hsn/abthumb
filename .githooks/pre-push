@@ -1,5 +1,5 @@
 #!/bin/sh
-# Runs the quick local CI (release build + unit tests) before every push.
+# Runs the quick local CI (build with /WX, unit tests, clang-format, cppcheck) before every push.
 # Enable once per clone:   git config core.hooksPath .githooks
 # Skip one push:           git push --no-verify     (or set ABT_SKIP_CI=1)
 # Tag pushes (releases) and branch deletes skip it: GitHub builds those itself.

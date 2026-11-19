@@ -58,6 +58,7 @@ void logf(const char* fmt, ...) {
     }
     if (g_log_file != INVALID_HANDLE_VALUE) {
         DWORD w;
+#pragma warning(suppress : 6387)  // /analyze: CreateFileW failure is INVALID_HANDLE_VALUE, never NULL
         WriteFile(g_log_file, buf, (DWORD)n, &w, nullptr);
     }
     ReleaseSRWLockExclusive(&g_log_lock);

@@ -21,7 +21,8 @@ static void enter_background_mode() {
     MEMORY_PRIORITY_INFORMATION mp = {MEMORY_PRIORITY_LOW};
     SetProcessInformation(GetCurrentProcess(), ProcessMemoryPriority, &mp, sizeof(mp));
     typedef LONG(NTAPI * SetInfoFn)(HANDLE, ULONG, PVOID, ULONG);
-    SetInfoFn set_info = (SetInfoFn)(void*)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtSetInformationProcess");
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    SetInfoFn set_info = ntdll ? (SetInfoFn)(void*)GetProcAddress(ntdll, "NtSetInformationProcess") : nullptr;
     if (set_info) {
         ULONG io_low = 1;          // IoPriorityLow
         set_info(GetCurrentProcess(), 33 /* ProcessIoPriority */, &io_low, sizeof(io_low));
@@ -31,7 +32,7 @@ static void enter_background_mode() {
 int wmain(int argc, wchar_t** argv) {
     bool background = false;
     for (int i = 1; i < argc; ++i)
-        if (!lstrcmpiW(argv[i], L"--background")) background = true;
+        if (abt::ieq(argv[i], L"--background")) background = true;
     // Never show error dialogs from a background renderer.
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
     // At low integrity (the agent's sandbox) %TEMP% is read-only to us; Ghostscript and any

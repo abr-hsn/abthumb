@@ -1,0 +1,47 @@
+# Focused, low-noise set (D-035). The code is deliberately C-like, so style-oriented families
+# (modernize, readability, cppcoreguidelines, ...) are off. Run through scripts/ci.ps1 over src/.
+Checks: >
+  -*,
+  bugprone-*,
+  clang-analyzer-*,
+  performance-*,
+  portability-*,
+  cert-err34-c,
+  cert-str34-c,
+  cert-flp30-c,
+  cert-msc50-cpp,
+  cert-msc51-cpp,
+  misc-misplaced-const,
+  misc-redundant-expression,
+  misc-static-assert,
+  misc-unused-parameters,
+  misc-unused-using-decls,
+  misc-definitions-in-headers,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-reserved-identifier,
+  -bugprone-narrowing-conversions,
+  -bugprone-implicit-widening-of-multiplication-result,
+  -bugprone-assignment-in-if-condition,
+  -bugprone-multi-level-implicit-pointer-conversion,
+  -bugprone-switch-missing-default-case,
+  -clang-analyzer-optin.performance.Padding,
+  -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,
+  -clang-analyzer-optin.core.EnumCastOutOfRange,
+  -performance-no-int-to-ptr,
+  -performance-enum-size,
+  -portability-avoid-pragma-once,
+  -bugprone-casting-through-void,
+  -bugprone-incorrect-roundings,
+  -bugprone-not-null-terminated-result,
+  -cert-err33-c,
+  -clang-analyzer-security.ArrayBound,
+  -clang-analyzer-optin.portability.UnixAPI
+WarningsAsErrors: ''
+HeaderFilterRegex: 'src[/\\]'
+FormatStyle: none
+# Notes on disabled checks:
+#   clang-analyzer-security.ArrayBound: path-sensitive and cannot see invariants established in other
+#     functions (every report so far was a false positive); ASan + the libFuzzer targets cover bounds.
+#   clang-analyzer-optin.portability.UnixAPI: malloc(0) is fine with the MSVC CRT.
+#   bugprone-not-null-terminated-result: we memcpy fixed-length keys, never C strings.
+#   cert-err33-c: ignoring printf/snprintf results is deliberate.

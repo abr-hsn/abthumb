@@ -44,7 +44,7 @@ bool ghostscript_available() {
     DWORD sz = sizeof(v);
     // Explicit override: HKCU\Software\abthumb\Ghostscript = path to gswin64c.exe, or "off".
     if (RegGetValueW(HKEY_CURRENT_USER, ABT_REG_ROOT, L"Ghostscript", RRF_RT_REG_SZ, nullptr, v, &sz) == ERROR_SUCCESS) {
-        if (!lstrcmpiW(v, L"off")) return false;
+        if (abt::ieq(v, L"off")) return false;
         if (GetFileAttributesW(v) != INVALID_FILE_ATTRIBUTES) { lstrcpynW(g_gs, v, MAX_PATH); g_gs_state = 1; return true; }
     }
     if (find_in_registry(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Artifex\\GPL Ghostscript", g_gs) ||

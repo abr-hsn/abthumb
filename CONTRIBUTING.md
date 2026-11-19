@@ -19,8 +19,16 @@ cd %TEMP% && <repo>\build\release\bin\abt_tests.exe
 build.cmd fuzz                         :: libFuzzer + ASan targets, see tests/fuzz/README.md
 ```
 
-`powershell -File scripts\ci.ps1` runs everything GitHub CI runs (build, unit tests, fuzz smoke run)
-in separate build trees; add `-Quick` for build and tests only. To run the quick check before every
+`powershell -File scripts\ci.ps1` runs everything GitHub CI runs, plus the slower quality gates, in
+separate build trees. `-Quick` (the pre-push hook) is the build with `/W4 /WX`, the unit tests,
+clang-format on the files you changed and cppcheck, about 10 s warm. The full run adds clang-tidy,
+an MSVC `/analyze` build, `scripts\regress.ps1` (blank-thumbnail check on real files, skipped when
+`D:\04-OUTPUT` is absent) and the fuzz run; `-NoTidy`, `-NoAnalyze`, `-NoRegress` and
+`-FuzzSeconds 0` skip single steps. Formatting is advisory (the old code is not reformatted):
+`clang-format -i --style=file <file>` fixes a file, `-StrictFormat` makes findings fail.
+Config lives in `.clang-format`, `.clang-tidy` and `scripts\cppcheck-suppressions.txt`; a false
+positive is suppressed narrowly with a comment saying why (`NOLINT(check)`,
+`// cppcheck-suppress id`, `#pragma warning(suppress: N)`). To run the quick check before every
 push, enable the hook once: `git config core.hooksPath .githooks`.
 
 Releases: bump `project(abthumb VERSION ...)` in CMakeLists.txt, then push a matching tag
@@ -42,11 +50,11 @@ with `powershell -File scripts\package.ps1`.
   obvious.
 * Every length, offset and count read from a file, a pipe or the cache is untrusted: check it
   before use, do size math in 64 bits, and cap allocations.
-* Builds must stay warning-free at `/W4`.
+* Builds must stay warning-free at `/W4` (CI builds use `/WX`), and clean under clang-tidy, cppcheck and `/analyze`.
 
 ## Pull requests
 * One topic per PR, with tests for parser changes (a small synthetic buffer in `tests/unit` is
   ideal) and a short fuzz run for anything in `src/core`.
-* CI must be green (build, unit tests, fuzz smoke run).
+* CI must be green (build, unit tests, quality gates, fuzz smoke run).
 * By contributing you agree that your contribution is licensed under the MIT licence of this
   project.

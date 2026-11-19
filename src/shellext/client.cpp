@@ -13,7 +13,7 @@ static bool in_agent() {
     if (g_in_agent < 0) {
         wchar_t exe[MAX_PATH] = L"";
         GetModuleFileNameW(nullptr, exe, MAX_PATH);
-        g_in_agent = !lstrcmpiW(PathFindFileNameW(exe), L"abthumb-agent.exe") ? 1 : 0;
+        g_in_agent = abt::ieq(PathFindFileNameW(exe), L"abthumb-agent.exe") ? 1 : 0;
     }
     return g_in_agent == 1;
 }

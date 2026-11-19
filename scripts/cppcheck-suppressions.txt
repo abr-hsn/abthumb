@@ -1,0 +1,14 @@
+# cppcheck suppressions (D-035). Prefer an inline "// cppcheck-suppress id" with a reason next to
+# the code; this file is for whole-path and project-wide false positives.
+*:third_party/*
+# Windows headers and system includes are not ours.
+*:*/Windows Kits/*
+*:*/Microsoft Visual Studio/*
+missingIncludeSystem
+unmatchedSuppression
+
+# The code is deliberately C-like (D-001): plain structs without constructors, zeroed with
+# memset or "= {}", C-style casts between handles and pointers.
+uninitMemberVarNoCtor
+dangerousTypeCast
+memsetClassFloat

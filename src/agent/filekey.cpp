@@ -57,7 +57,7 @@ bool file_key(const wchar_t* path, FileKey* k) {
             k->hi = hash64(&id.VolumeSerialNumber, 8, 0x41425431ull) ^ hash64(id.FileId.Identifier, 16, 1);
             k->lo = hash64(id.FileId.Identifier, 16, 0x5A17ull) ^ id.VolumeSerialNumber;
         } else {
-            wchar_t norm[MAX_PATH * 2];
+            wchar_t norm[MAX_PATH * 2] = {};
             int n = lstrlenW(path);
             if (n >= (int)_countof(norm)) n = (int)_countof(norm) - 1;
             for (int i = 0; i < n; ++i) norm[i] = (wchar_t)(DWORD_PTR)CharLowerW((LPWSTR)(DWORD_PTR)path[i]);

@@ -313,6 +313,7 @@ static void summary(const char* name, Series& s) {
     qsort(s.v, (size_t)s.n, sizeof(double), cmp_d);
     double sum = 0;
     for (int i = 0; i < s.n; ++i) sum += s.v[i];
+#pragma warning(suppress : 6385)  // /analyze false positive: s.n >= 1 here, so s.n - 1 is a valid index
     printf("  %-22s n=%-4d mean %8.2f  p50 %8.2f  p95 %8.2f  max %8.2f ms\n", name, s.n, sum / s.n, s.v[s.n / 2],
            s.v[(int)(s.n * 0.95) < s.n ? (int)(s.n * 0.95) : s.n - 1], s.v[s.n - 1]);
 }
