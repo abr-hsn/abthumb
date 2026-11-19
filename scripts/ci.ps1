@@ -116,7 +116,7 @@ if (-not $cpp) {
   $ErrorActionPreference = "Continue"
   & $cpp --enable=warning,performance,portability --inline-suppr --error-exitcode=1 --quiet `
     --suppressions-list="$root\scripts\cppcheck-suppressions.txt" --cppcheck-build-dir="$cppOut" `
-    -j 4 --std=c++20 --platform=win64 -DWIN32 -D_WIN32 -DUNICODE -D_UNICODE -D_M_X64 '-DABT_VERSION_STR=\"0.0.0\"' -DABT_VERSION_MAJOR=0 -DABT_VERSION_MINOR=0 -DABT_VERSION_PATCH=0 "-DIFACEMETHODIMP=HRESULT" "-DIFACEMETHODIMP_(t)=t" `
+    -j 4 --std=c++20 --platform=win64 -DWIN32 -D_WIN32 -DUNICODE -D_UNICODE -D_M_X64 --include="$root\scripts\cppcheck-defs.h" -DABT_VERSION_MAJOR=0 -DABT_VERSION_MINOR=0 -DABT_VERSION_PATCH=0 "-DIFACEMETHODIMP=HRESULT" "-DIFACEMETHODIMP_(t)=t" `
     --template="{file}:{line}: {severity}: {message} [{id}]" -I "$root\src\core" -I "$root\src\win" `
     -I "$root\src\render" -I "$root\src\agent" -I "$root\src\shellext" "$root\src" 2>&1 | ForEach-Object { "$_" } | Out-Host
   $code = $LASTEXITCODE
