@@ -293,6 +293,43 @@ static bool slot_spawn(Slot* s) {
     return true;
 }
 
+// Deadline kills per file, newest 64 files (ring). Returns the count including this one.
+static struct { uint64_t hi, lo, mtime; int n; } g_killed[64];
+static int g_killed_pos = 0;
+static SRWLOCK g_killed_lock = SRWLOCK_INIT;
+
+static int kill_count_bump(const FileKey& k) {
+    AcquireSRWLockExclusive(&g_killed_lock);
+    int n = 0;
+    for (auto& e : g_killed)
+        if (e.n && e.hi == k.hi && e.lo == k.lo && e.mtime == k.mtime) { n = ++e.n; break; }
+    if (!n) {
+        auto& e = g_killed[g_killed_pos];
+        g_killed_pos = (g_killed_pos + 1) % (int)_countof(g_killed);
+        e.hi = k.hi; e.lo = k.lo; e.mtime = k.mtime; e.n = n = 1;
+    }
+    ReleaseSRWLockExclusive(&g_killed_lock);
+    return n;
+}
+
+// Failures that say nothing about the file itself: it was locked, half-written, on a share that
+// dropped, or the machine ran short. They are retried the next time instead of negative-cached.
+static bool transient_error(HRESULT hr) {
+    if (hr == E_OUTOFMEMORY) return true;
+    if (HRESULT_FACILITY(hr) != FACILITY_WIN32) return false;
+    switch (HRESULT_CODE(hr)) {
+    case ERROR_SHARING_VIOLATION: case ERROR_LOCK_VIOLATION: case ERROR_ACCESS_DENIED:
+    case ERROR_FILE_NOT_FOUND: case ERROR_PATH_NOT_FOUND: case ERROR_EMPTY: case ERROR_READ_FAULT:
+    case ERROR_NOT_ENOUGH_MEMORY: case ERROR_COMMITMENT_LIMIT: case ERROR_TIMEOUT:
+    case ERROR_BAD_NETPATH: case ERROR_NETNAME_DELETED: case ERROR_NETWORK_UNREACHABLE: case ERROR_SEM_TIMEOUT:
+    case ERROR_UNEXP_NET_ERR: case ERROR_BAD_NET_NAME: case ERROR_NOT_CONNECTED: case ERROR_CONNECTION_ABORTED:
+    case ERROR_DEV_NOT_EXIST: case ERROR_NOT_READY: case ERROR_CLOUD_FILE_NOT_IN_SYNC:
+        return true;
+    default:
+        return false;
+    }
+}
+
 static void run_job(Slot* s, Job* j) {
     JobResult& r = j->res;
     memset(&r, 0, sizeof(r));
@@ -333,7 +370,9 @@ static void run_job(Slot* s, Job* j) {
         if (killed) InterlockedIncrement64(&g_kills); else InterlockedIncrement64(&g_crashes);
         if (s->proc) TerminateProcess(s->proc, 1);
         slot_close(s);
-        r.transient = killed && j->lane == LANE_FOREGROUND;  // may only mean a busy machine
+        // A deadline kill may only mean a busy machine or a slow disk: only a file that times out
+        // twice (in this agent's lifetime) is remembered as failing. A crash is the file's fault.
+        r.transient = killed && kill_count_bump(j->key) < 2;
         r.hr = killed ? HRESULT_FROM_WIN32(ERROR_TIMEOUT) : HRESULT_FROM_WIN32(ERROR_FILE_CORRUPT);
         lstrcpynA(r.reason, killed ? "render timed out" : "render worker crashed", sizeof(r.reason));
         return;
@@ -342,7 +381,7 @@ static void run_job(Slot* s, Job* j) {
     // The worker parses untrusted files, so its reply is untrusted too.
     r.hr = resp.hr;
     if (SUCCEEDED(r.hr) && !r.img.px && j->mode != ABT_MODE_PROBE) r.hr = E_FAIL;
-    if (r.hr == E_OUTOFMEMORY) r.transient = true;
+    if (transient_error(r.hr)) r.transient = true;
     r.info = resp.info;
     r.info.creator[sizeof(r.info.creator) - 1] = 0;
     r.info.version[sizeof(r.info.version) - 1] = 0;

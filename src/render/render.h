@@ -37,6 +37,7 @@ struct MappedFile {
     HANDLE file, map;
     const uint8_t* data;
     size_t size;
+    DWORD err;  // Win32 error when map_file fails (0-byte files: ERROR_EMPTY)
 };
 bool map_file(const wchar_t* path, MappedFile* mf);
 void unmap_file(MappedFile* mf);

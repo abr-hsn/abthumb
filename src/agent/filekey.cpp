@@ -34,6 +34,14 @@ bool file_key(const wchar_t* path, FileKey* k) {
     FILE_STANDARD_INFO si = {};
     bool ok = GetFileInformationByHandleEx(h, FileBasicInfo, &bi, sizeof(bi)) &&
               GetFileInformationByHandleEx(h, FileStandardInfo, &si, sizeof(si)) && !si.Directory;
+    // Cloud placeholders and offline files: reading them would start a download (or a tape recall),
+    // so they get no thumbnail from us. Opening for attributes only never triggers a recall.
+    if (ok && (bi.FileAttributes & (FILE_ATTRIBUTE_OFFLINE | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS |
+                                    FILE_ATTRIBUTE_RECALL_ON_OPEN))) {
+        CloseHandle(h);
+        SetLastError(ERROR_CLOUD_FILE_NOT_IN_SYNC);
+        return false;
+    }
     if (ok) {
         k->size = (uint64_t)si.EndOfFile.QuadPart;
         k->mtime = (uint64_t)bi.LastWriteTime.QuadPart;

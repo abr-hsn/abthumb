@@ -6,7 +6,7 @@
 
 namespace abt {
 
-static const uint32_t kRendererVersion = 1;  // bump when output changes: invalidates the cache
+static const uint32_t kRendererVersion = 2;  // 2: blank-preview fix (D-032). Bump when output changes: invalidates the cache
 static const uint32_t kRecMagic = 0x52544241u;  // "ABTR"
 static const uint32_t kIdxMagic = 0x49544241u;  // "ABTI"
 static const uint64_t kSegMax = 64ull << 20;

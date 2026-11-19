@@ -14,8 +14,18 @@ static void enter_background_mode() {
     pt.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
     pt.StateMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
     SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &pt, sizeof(pt));
-    // Low CPU, I/O and memory priority.
-    SetPriorityClass(GetCurrentProcess(), PROCESS_MODE_BACKGROUND_BEGIN);
+    // Low CPU and memory priority, and LOW (not very low) I/O priority. PROCESS_MODE_BACKGROUND_BEGIN
+    // sets very-low I/O, which a spinning disk starves whenever anything else reads: 14 MB PSDs on
+    // the owner's HDD hit the 20 s deadline and were never thumbnailed (D-033).
+    SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
+    MEMORY_PRIORITY_INFORMATION mp = {MEMORY_PRIORITY_LOW};
+    SetProcessInformation(GetCurrentProcess(), ProcessMemoryPriority, &mp, sizeof(mp));
+    typedef LONG(NTAPI * SetInfoFn)(HANDLE, ULONG, PVOID, ULONG);
+    SetInfoFn set_info = (SetInfoFn)(void*)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtSetInformationProcess");
+    if (set_info) {
+        ULONG io_low = 1;          // IoPriorityLow
+        set_info(GetCurrentProcess(), 33 /* ProcessIoPriority */, &io_low, sizeof(io_low));
+    }
 }
 
 int wmain(int argc, wchar_t** argv) {

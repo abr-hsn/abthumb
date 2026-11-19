@@ -166,6 +166,7 @@ HRESULT pipe_call(const abt_req& req, const wchar_t* path, DWORD timeout_ms, abt
             read_all_timeout(h, resp, sizeof(*resp), left(), ev)) {
             // The response may come from anything that managed to open a pipe with our name, and
             // callers turn width/height into DIB sizes, so validate in 64-bit with a hard cap.
+            resp->reason[sizeof(resp->reason) - 1] = 0;  // callers print it with %s
             const uint64_t want = (uint64_t)resp->width * resp->height * 4u;
             if (resp->magic != ABT_MAGIC || resp->version != ABT_PROTO_VERSION ||
                 resp->pixel_len > ABT_MAX_PIXEL_BYTES || resp->width > ABT_MAX_REPLY_DIM ||

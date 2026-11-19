@@ -12,17 +12,27 @@ bool map_file(const wchar_t* path, MappedFile* mf) {
     memset(mf, 0, sizeof(*mf));
     mf->file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
                            OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
-    if (mf->file == INVALID_HANDLE_VALUE) { mf->file = nullptr; return false; }
+    if (mf->file == INVALID_HANDLE_VALUE) { mf->file = nullptr; mf->err = GetLastError(); return false; }
     LARGE_INTEGER sz;
+    sz.QuadPart = -1;
     if (!GetFileSizeEx(mf->file, &sz) || sz.QuadPart <= 0 || (uint64_t)sz.QuadPart > (uint64_t)SIZE_MAX) {
+        DWORD e = GetLastError();
         CloseHandle(mf->file);
         mf->file = nullptr;
+        mf->err = sz.QuadPart == 0 ? ERROR_EMPTY : (e ? e : ERROR_FILE_TOO_LARGE);
         return false;
     }
     mf->map = CreateFileMappingW(mf->file, nullptr, PAGE_READONLY, 0, 0, nullptr);
-    if (!mf->map) { CloseHandle(mf->file); mf->file = nullptr; return false; }
+    if (!mf->map) { mf->err = GetLastError(); CloseHandle(mf->file); mf->file = nullptr; return false; }
     mf->data = (const uint8_t*)MapViewOfFile(mf->map, FILE_MAP_READ, 0, 0, 0);
-    if (!mf->data) { CloseHandle(mf->map); CloseHandle(mf->file); memset(mf, 0, sizeof(*mf)); return false; }
+    if (!mf->data) {
+        DWORD e = GetLastError();
+        CloseHandle(mf->map);
+        CloseHandle(mf->file);
+        memset(mf, 0, sizeof(*mf));
+        mf->err = e;
+        return false;
+    }
     mf->size = (size_t)sz.QuadPart;
     return true;
 }
@@ -105,6 +115,12 @@ static HRESULT decode_preview(const MappedFile& mf, const abt_preview& pv, int b
     default:
         break;
     }
+    // A blank preview (Illustrator 2026 sometimes writes an all-white 256 x 256 XMP thumbnail) is no
+    // picture of the file: report failure so the pipeline renders instead.
+    if (SUCCEEDED(hr) && abt_image_is_uniform(out, 6)) {
+        abt_image_free(out);
+        hr = HRESULT_FROM_WIN32(ERROR_EMPTY);
+    }
     if (SUCCEEDED(hr)) hr = fit_image(out, bw, bh, false);
     return hr;
 }
@@ -117,14 +133,16 @@ static void set_reason(RenderResult* rr, const char* s) { lstrcpynA(rr->reason, 
 
 // Illustrator: is the whole canvas (all art, on and off the artboards) just artboard 1? Only then
 // can PDF page 1 stand in for it; Illustrator's PDF pages hold each artboard's art clipped to that
-// artboard and nothing outside them (D-029). Art bounds are visual bounds, so a stroke that pokes a
-// little past the artboard edge (clipped in page 1, a sliver in the thumbnail) still counts as inside.
+// artboard and nothing outside them (D-029). The header's art bounds are in Illustrator's ruler space,
+// whose origin is not artboard 1's corner in every file (D-032), so only their size is compared:
+// art that fits in the artboard's size is taken to be on it. Art bounds are visual bounds, so a stroke
+// that pokes a little past the artboard edge still counts as inside.
 static bool ai_canvas_is_page1(const abt_probe& pr, int pages, float w0, float h0) {
     if (pages != 1) return false;
     const float* b = pr.bbox;
     if (b[0] == 0 && b[1] == 0 && b[2] == 0 && b[3] == 0) return true;  // bounds unknown: single artboard
-    float tol = 2.0f + 0.01f * (w0 > h0 ? w0 : h0);
-    return b[0] >= -tol && b[1] >= -tol && b[2] <= w0 + tol && b[3] <= h0 + tol;
+    float tol = 4.0f + 0.02f * (w0 > h0 ? w0 : h0);
+    return b[2] - b[0] <= w0 + tol && b[3] - b[1] <= h0 + tol;
 }
 
 // The whole-canvas thumbnail of a multi-artboard Illustrator file: Illustrator's own document
@@ -269,6 +287,52 @@ static void render_inner(const RenderRequest& rq, const MappedFile& mf, RenderRe
     default:
         break;
     }
+    // Artboard 1 has nothing visible on it but the art bounds said it held everything (the art sits off
+    // the artboard): Illustrator's document thumbnail, when it is not blank too, is the better picture.
+    if (SUCCEEDED(hr) && canvas && fam == ABT_FAM_AI_PDF && (rr->info.flags & ABT_INFO_PAGE_EMPTY) &&
+        !(rq.flags & ABT_RF_NO_EMBEDDED) && rq.mode != ABT_MODE_RENDER) {
+        abt_image page1 = rr->img;
+        rr->img = {};
+        if (ai_canvas_thumbnail(mf, pr, bw, bh, rr)) {
+            abt_image_free(&page1);
+            rr->info.flags &= ~(uint32_t)ABT_INFO_PAGE_EMPTY;
+            return;
+        }
+        rr->img = page1;
+    }
+    // Still nothing visible (artboard 1 is empty, the document thumbnail blank or missing): a thumbnail
+    // is never left white while another page or artboard has art, so show the first one that does.
+    if (SUCCEEDED(hr) && canvas && (fam == ABT_FAM_AI_PDF || fam == ABT_FAM_PDF) &&
+        (rr->info.flags & ABT_INFO_PAGE_EMPTY) && rr->info.page_count > 1) {
+        uint32_t last = rr->info.page_count < 16 ? rr->info.page_count : 16;  // bounded cost
+        for (uint32_t p = 1; p < last; ++p) {
+            RenderRequest r2 = rq;
+            r2.page = (int)p;
+            abt_image img = {};
+            abt_file_info inf = rr->info;
+            inf.flags &= ~(uint32_t)ABT_INFO_PAGE_EMPTY;
+            bool np = false;
+            if (FAILED(render_pdf(mf.data, mf.size, r2, fam, &img, &inf, &np))) break;  // e.g. deadline
+            if (!(inf.flags & ABT_INFO_PAGE_EMPTY)) {
+                abt_image_free(&rr->img);
+                rr->img = img;
+                rr->info.flags &= ~(uint32_t)ABT_INFO_PAGE_EMPTY;
+                _snprintf_s(rr->reason, sizeof(rr->reason), _TRUNCATE, "first artboard with art (%u)", p + 1);
+                break;
+            }
+            abt_image_free(&img);
+        }
+    }
+    // A white tile tells the user nothing (D-016): when no page has visible art and there is no
+    // usable document thumbnail (art only outside the artboards, saved by an Illustrator that wrote a
+    // blank thumbnail), Explorer shows its icon instead. Remembered until the file changes.
+    if (SUCCEEDED(hr) && canvas && (fam == ABT_FAM_AI_PDF || fam == ABT_FAM_PDF) &&
+        (rr->info.flags & ABT_INFO_PAGE_EMPTY)) {
+        abt_image_free(&rr->img);
+        rr->hr = HRESULT_FROM_WIN32(ERROR_NO_DATA);
+        set_reason(rr, "no visible art on the artboards and no usable document thumbnail");
+        return;
+    }
     if (SUCCEEDED(hr)) {
         rr->hr = S_OK;
         rr->source = ABT_SRC_RENDERED;
@@ -287,7 +351,10 @@ static void render_inner(const RenderRequest& rq, const MappedFile& mf, RenderRe
     if (!rr->reason[0]) _snprintf_s(rr->reason, sizeof(rr->reason), _TRUNCATE, "render failed 0x%08lx", hr);
 }
 
+static DWORD g_seh_code;  // one render at a time per worker process
+
 static int seh_filter(DWORD code) {
+    g_seh_code = code;
     return (code == EXCEPTION_IN_PAGE_ERROR || code == EXCEPTION_ACCESS_VIOLATION) ? EXCEPTION_EXECUTE_HANDLER
                                                                                      : EXCEPTION_CONTINUE_SEARCH;
 }
@@ -307,13 +374,16 @@ void render_file(const RenderRequest& rq, RenderResult* rr) {
     uint64_t t0 = qpc();
     MappedFile mf;
     if (!map_file(rq.path, &mf)) {
-        rr->hr = HRESULT_FROM_WIN32(GetLastError() ? GetLastError() : ERROR_OPEN_FAILED);
+        rr->hr = HRESULT_FROM_WIN32(mf.err ? mf.err : ERROR_OPEN_FAILED);
         set_reason(rr, "cannot open/map file");
     } else {
         if (!render_guarded(rq, mf, rr)) {
             abt_image_free(&rr->img);
-            rr->hr = HRESULT_FROM_WIN32(ERROR_FILE_CORRUPT);
-            set_reason(rr, "I/O error or corrupt data while reading");
+            // A read error of the mapped view (network drop, file shortened while being saved) says
+            // nothing about the file: ERROR_READ_FAULT is retried later instead of remembered.
+            const bool io = g_seh_code == EXCEPTION_IN_PAGE_ERROR;
+            rr->hr = HRESULT_FROM_WIN32(io ? ERROR_READ_FAULT : ERROR_FILE_CORRUPT);
+            set_reason(rr, io ? "I/O error while reading the file" : "corrupt data while reading");
         }
         unmap_file(&mf);
     }
@@ -334,7 +404,7 @@ HRESULT render_psd(const uint8_t* data, size_t size, const abt_probe& pr, const 
     o.rows_per_out = (rq.flags & ABT_RF_MAX_QUALITY) ? 0 : 4;
     abt_pixbuf pb = {};
     abt_status st = abt_psd_decode_composite(data, size, &pr, &o, &pb);
-    if (st == ABT_E_NOTFOUND) {
+    if (st == ABT_E_NOTFOUND || st == ABT_E_TRUNCATED) {  /* no merged image, or a cut-off one */
         st = abt_psd_composite_layers(data, size, &pr, &o, &pb);
         if (st == ABT_OK) lstrcpynA(reason, "composited from layers (no merged image)", (int)reason_cap);
         *approx = st == ABT_OK && pb.approx;

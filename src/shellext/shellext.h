@@ -21,7 +21,8 @@ void draw_placeholder(void* bits, int w, int h, const wchar_t* path, const wchar
 struct abt_resp;
 // One request to the agent (starts it on demand). *px is mem_alloc'd BGRA premultiplied.
 // flags: ABT_RF_* (only ABT_RF_PREFETCH is honoured for low-integrity callers such as prevhost).
+// timeout_ms: 0 = default (15 s thumbnails, 30 s previews, 3 s prefetch hints).
 HRESULT request_image(uint16_t msg, const wchar_t* path, UINT cx, UINT cy, UINT page, abt_resp* resp, uint8_t** px,
-                      uint32_t flags = 0);
+                      uint32_t flags = 0, DWORD timeout_ms = 0);
 // Premultiplied BGRA -> DIB section for the shell (straight alpha when transparent).
 HRESULT make_bitmap(const uint8_t* px, int w, int h, HBITMAP* out, WTS_ALPHATYPE* alpha);

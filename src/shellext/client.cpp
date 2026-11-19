@@ -34,7 +34,7 @@ static bool start_agent() {
 }
 
 HRESULT request_image(uint16_t msg, const wchar_t* path, UINT cx, UINT cy, UINT page, abt_resp* resp, uint8_t** px,
-                      uint32_t flags) {
+                      uint32_t flags, DWORD timeout_ms) {
     memset(resp, 0, sizeof(*resp));
     *px = nullptr;
     size_t plen = (size_t)lstrlenW(path);
@@ -46,15 +46,22 @@ HRESULT request_image(uint16_t msg, const wchar_t* path, UINT cx, UINT cy, UINT 
     req.page = page;
     req.flags = flags;
     if (in_agent()) req.flags |= ABT_RF_FROM_PREWARM;
-    const DWORD timeout = msg == ABT_MSG_PREVIEW ? 30000 : 15000;
+    const DWORD timeout = timeout_ms                      ? timeout_ms
+                          : (flags & ABT_RF_PREFETCH)    ? 3000
+                          : msg == ABT_MSG_PREVIEW       ? 30000
+                                                         : 15000;
     HRESULT hr = abt::pipe_call(req, path, timeout, resp, px);
     // Never start the agent from a low-integrity host (prevhost): it would inherit low integrity,
     // could not use its cache, and would hold the pipe name against the real agent.
     if (hr == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) && !in_agent() && !abt::is_below_medium_integrity()) {
         // No agent yet: start it once (serialised across threads) and retry for up to 3 s.
+        // A start that just failed is not retried for 30 s: otherwise every Explorer thumbnail thread
+        // would queue here, spawn another agent and wait 3 s.
+        static ULONGLONG s_start_failed_at = 0;
         AcquireSRWLockExclusive(&g_start_lock);
         hr = abt::pipe_call(req, path, timeout, resp, px);
-        if (hr == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) && start_agent()) {
+        bool recent_fail = s_start_failed_at && GetTickCount64() - s_start_failed_at < 30000;
+        if (hr == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) && !recent_fail && start_agent()) {
             wchar_t name[128];
             abt::pipe_name(name, _countof(name));
             for (int i = 0; i < 60; ++i) {
@@ -62,6 +69,9 @@ HRESULT request_image(uint16_t msg, const wchar_t* path, UINT cx, UINT cy, UINT 
                 Sleep(50);
             }
             hr = abt::pipe_call(req, path, timeout, resp, px);
+            s_start_failed_at = hr == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) ? GetTickCount64() : 0;
+        } else if (hr == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) && !recent_fail) {
+            s_start_failed_at = GetTickCount64();  // the agent exe could not be started at all
         }
         ReleaseSRWLockExclusive(&g_start_lock);
     }

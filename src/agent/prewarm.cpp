@@ -59,6 +59,9 @@ void prewarm_hint_folder(const wchar_t* folder, int edge) { add_hint(folder, edg
 
 static void add_hint(const wchar_t* folder, int edge) {
     if (reg_get_dword(HKEY_CURRENT_USER, ABT_REG_ROOT, L"Prewarm", 1) == 0) return;
+    // Never sweep a network or optical folder (D-033): it would pull every file over the wire and
+    // slow Explorer's own browsing of that share. Files Explorer asks for are still served.
+    if (is_slow_path(folder)) return;
     Hint h = {};
     lstrcpynW(h.folder, folder, MAX_PATH);
     h.edge = edge > 0 ? edge : 256;

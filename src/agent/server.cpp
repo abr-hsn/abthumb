@@ -64,12 +64,90 @@ static uint32_t flags_to_source(uint16_t f) {
     return s;
 }
 
+// ---- network shares that stopped answering (D-033)
+// Opening a file on a share whose server is gone can block for the SMB timeout (tens of seconds).
+// One slow or failed open marks the share as down for 30 s, and requests for it fail at once, so
+// Explorer threads and our pipe threads are not parked behind an unreachable server.
+struct DownShare {
+    wchar_t key[80];
+    ULONGLONG until;
+};
+static DownShare g_down[8];
+static SRWLOCK g_down_lock = SRWLOCK_INIT;
+
+// "server\share" or "X:" (mapped drive); empty for local paths.
+static void share_key(const wchar_t* path, wchar_t* out, size_t cap) {
+    out[0] = 0;
+    if (cap < 3 || !is_slow_path(path)) return;
+    const wchar_t* p = path;
+    if (!wcsncmp(p, L"\\\\?\\UNC\\", 8)) p += 8;
+    else if (!wcsncmp(p, L"\\\\?\\", 4)) { lstrcpynW(out, p + 4, 3); return; }
+    else if (!wcsncmp(p, L"\\\\", 2)) p += 2;
+    else { lstrcpynW(out, path, 3); return; }
+    const wchar_t* e = p;
+    int seps = 0;
+    while (*e && !(*e == L'\\' && ++seps == 2)) ++e;
+    size_t n = (size_t)(e - p);
+    if (n >= cap) n = cap - 1;
+    memcpy(out, p, n * sizeof(wchar_t));
+    out[n] = 0;
+}
+
+static bool share_down(const wchar_t* key) {
+    if (!key[0]) return false;
+    ULONGLONG now = GetTickCount64();
+    bool down = false;
+    AcquireSRWLockShared(&g_down_lock);
+    for (const DownShare& d : g_down)
+        if (d.until > now && !lstrcmpiW(d.key, key)) down = true;
+    ReleaseSRWLockShared(&g_down_lock);
+    return down;
+}
+
+static void mark_share_down(const wchar_t* key) {
+    if (!key[0]) return;
+    AcquireSRWLockExclusive(&g_down_lock);
+    int slot = 0;
+    for (int i = 0; i < (int)_countof(g_down); ++i) {
+        if (!lstrcmpiW(g_down[i].key, key)) { slot = i; break; }
+        if (g_down[i].until < g_down[slot].until) slot = i;
+    }
+    lstrcpynW(g_down[slot].key, key, (int)_countof(g_down[slot].key));
+    g_down[slot].until = GetTickCount64() + 30000;
+    ReleaseSRWLockExclusive(&g_down_lock);
+    logf("share %ls not answering: skipped for 30 s", key);
+}
+
+static bool network_error(DWORD e) {
+    switch (e) {
+    case ERROR_BAD_NETPATH: case ERROR_NETNAME_DELETED: case ERROR_NETWORK_UNREACHABLE:
+    case ERROR_HOST_UNREACHABLE: case ERROR_UNEXP_NET_ERR: case ERROR_SEM_TIMEOUT: case ERROR_BAD_NET_NAME:
+    case ERROR_NO_NET_OR_BAD_PATH: case ERROR_NOT_CONNECTED: case ERROR_CONNECTION_ABORTED:
+    case ERROR_NETWORK_BUSY: case ERROR_REM_NOT_LIST:
+        return true;
+    default:
+        return false;
+    }
+}
+
 static void serve_image(const abt_req& req, const wchar_t* path, abt_resp* resp, abt_image* img) {
     uint64_t t0 = qpc();
     InterlockedIncrement64(&g_stats.requests);
+    wchar_t share[80];
+    share_key(path, share, _countof(share));
+    if (share_down(share)) {
+        resp->hr = HRESULT_FROM_WIN32(ERROR_BAD_NETPATH);
+        lstrcpynA(resp->reason, "network share not answering (retried in 30 s)", sizeof(resp->reason));
+        InterlockedIncrement64(&g_stats.failures);
+        return;
+    }
     FileKey k;
-    if (!file_key(path, &k)) {
-        resp->hr = HRESULT_FROM_WIN32(GetLastError() ? GetLastError() : ERROR_FILE_NOT_FOUND);
+    uint64_t tk = qpc();
+    bool have_key = file_key(path, &k);
+    DWORD key_err = have_key ? 0 : GetLastError();
+    if (share[0] && ((!have_key && network_error(key_err)) || qpc_ms(tk, qpc()) > 3000.0)) mark_share_down(share);
+    if (!have_key) {
+        resp->hr = HRESULT_FROM_WIN32(key_err ? key_err : ERROR_FILE_NOT_FOUND);
         lstrcpynA(resp->reason, "cannot open file", sizeof(resp->reason));
         InterlockedIncrement64(&g_stats.failures);
         return;
@@ -116,25 +194,35 @@ static void serve_image(const abt_req& req, const wchar_t* path, abt_resp* resp,
         }
     } else {
         InterlockedIncrement64(&g_stats.misses);
+        // Files on a network share (D-033): the full render reads the whole file over the wire and must
+        // not hold a foreground worker that local files are waiting for. It goes to the background
+        // lane, and Explorer gets the embedded preview (a few KB) at once, upgraded when the render lands.
+        const bool slow = req.msg == ABT_MSG_THUMB && share[0] && !(req.flags & ABT_RF_FROM_PREWARM);
         Lane lane = req.msg == ABT_MSG_PREVIEW ? LANE_PREVIEW
                     : (req.flags & ABT_RF_FROM_PREWARM) ? LANE_VISIBLE
-                                                         : LANE_FOREGROUND;
-        Job* j = job_submit(path, k, page, edge, edge, info_only ? ABT_MODE_PROBE : ABT_MODE_AUTO, req.flags, lane);
+                    : slow ? LANE_FOLDER
+                           : LANE_FOREGROUND;
+        const uint32_t mode = info_only ? ABT_MODE_PROBE : ABT_MODE_AUTO;
+        Job* j = job_submit(path, k, page, edge, edge, mode, req.flags, lane);
         if (!j) {
             resp->hr = E_OUTOFMEMORY;
         } else {
-            DWORD wait = req.deadline_ms ? req.deadline_ms : (req.msg == ABT_MSG_PREVIEW ? 25000u : 12000u);
+            DWORD wait = req.deadline_ms ? req.deadline_ms
+                         : req.msg == ABT_MSG_PREVIEW ? 25000u
+                         : slow ? 5000u
+                                : 12000u;
             JobResult r = {};
             bool done = false;
             // Progressive upgrade (D-011): a thumbnail whose render is slow gets the embedded preview
             // now; the render keeps going, lands in our cache, and Explorer's entry is refreshed.
             if (req.msg == ABT_MSG_THUMB && !(req.flags & ABT_RF_FROM_PREWARM) && wait > 350) {
-                done = job_wait(j, 350, &r);
+                uint64_t tw = qpc();
+                done = !slow && job_wait(j, 350, &r);
                 if (!done) {
                     Job* fast = job_submit(path, k, page, edge, edge, ABT_MODE_FAST, req.flags | ABT_RF_NO_CACHE,
                                            LANE_FOREGROUND);
                     JobResult fr = {};  // untouched when job_wait times out
-                    if (fast && job_wait(fast, 1500, &fr) && SUCCEEDED(fr.hr) && fr.img.px) {
+                    if (fast && job_wait(fast, slow ? 2500 : 1500, &fr) && SUCCEEDED(fr.hr) && fr.img.px) {
                         resp->hr = S_OK;
                         resp->info = fr.info;
                         resp->source = fr.source | ABT_SRC_UPGRADE_PENDING;
@@ -147,7 +235,11 @@ static void serve_image(const abt_req& req, const wchar_t* path, abt_resp* resp,
                     }
                     if (fast) job_release(fast);
                     if (!j) goto finish;
-                    wait -= 350;
+                    // No usable embedded preview: Explorer is waiting for the render itself, so a
+                    // network file's job moves up to the foreground lane (if it is still queued).
+                    if (slow) job_release(job_submit(path, k, page, edge, edge, mode, req.flags, LANE_FOREGROUND));
+                    DWORD spent = (DWORD)qpc_ms(tw, qpc());
+                    wait = wait > spent + 100 ? wait - spent : 100;
                 }
             }
             if (done || job_wait(j, wait, &r)) {

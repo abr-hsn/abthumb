@@ -18,6 +18,9 @@ abt_status abt_image_alloc(abt_image* img, int w, int h); /* zero-filled (transp
 void abt_image_free(abt_image* img);
 void abt_image_fill(abt_image* img, uint8_t b, uint8_t g, uint8_t r, uint8_t a);
 int abt_image_scan_alpha(abt_image* img); /* sets and returns has_alpha */
+/* 1 if every channel of every pixel is within tol of the first pixel (a blank picture, e.g. the
+   all-white XMP thumbnail some Illustrator versions write). Empty images count as uniform. */
+int abt_image_is_uniform(const abt_image* img, int tol);
 
 /* Fit (sw, sh) inside an edge x edge box keeping aspect ratio. allow_up=0 never enlarges.
    Results are at least 1x1. */

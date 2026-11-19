@@ -48,8 +48,12 @@ void abt_psd_unpackbits(const uint8_t* src, size_t n, uint8_t* dst, size_t want)
 /* zlib inflate of up to `want` bytes. Partial output (stream longer than want) is fine.
    Returns 1 if at least something was produced; dst is zero-filled beyond what was written. */
 int abt_psd_inflate(const uint8_t* src, size_t n, uint8_t* dst, size_t want) {
+    /* miniz reports the output length only on a clean end of stream: zero first so a truncated
+       or corrupt stream never leaves uninitialised heap in the image. */
+    memset(dst, 0, want);
     mz_ulong dl = (mz_ulong)want;
-    int rc = mz_uncompress(dst, &dl, src, (mz_ulong)n);
+    mz_ulong sl = n > 0xFFFFFFFFu ? 0xFFFFFFFFu : (mz_ulong)n;
+    int rc = mz_uncompress(dst, &dl, src, sl);
     if (rc != MZ_OK && rc != MZ_BUF_ERROR && rc != MZ_DATA_ERROR) { memset(dst, 0, want); return 0; }
     if ((size_t)dl < want) memset(dst + dl, 0, want - dl);
     return dl > 0;

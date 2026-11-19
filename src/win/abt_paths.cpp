@@ -78,3 +78,21 @@ bool is_below_medium_integrity() {
 }
 
 }  // namespace abt
+
+namespace abt {
+
+bool is_slow_path(const wchar_t* path) {
+    if (!path || !path[0]) return false;
+    if (!wcsncmp(path, L"\\\\?\\", 4)) {
+        path += 4;
+        if (!_wcsnicmp(path, L"UNC\\", 4)) return true;
+    } else if (path[0] == L'\\' && path[1] == L'\\') {
+        return true;
+    }
+    if (!iswalpha(path[0]) || path[1] != L':') return false;
+    wchar_t root[4] = {path[0], L':', L'\\', 0};
+    UINT t = GetDriveTypeW(root);
+    return t == DRIVE_REMOTE || t == DRIVE_CDROM;
+}
+
+}  // namespace abt

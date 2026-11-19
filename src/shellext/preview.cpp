@@ -63,12 +63,15 @@ void shared_release(Shared* s) {
     }
 }
 
+inline uint32_t min_u32(uint32_t a, uint32_t b) { return a < b ? a : b; }
+
+// Posts under the lock: stop_thread clears notify with the lock held exclusively and then drains the
+// queue, so no post can land between the drain and the window's destruction (which would leak it).
 void post_result(Shared* s, Result* r) {
-    HWND w;
     AcquireSRWLockShared(&s->lock);
-    w = s->notify;
+    bool posted = s->notify && PostMessageW(s->notify, WM_APP_RESULT, 0, (LPARAM)r);
     ReleaseSRWLockShared(&s->lock);
-    if (!w || !PostMessageW(w, WM_APP_RESULT, 0, (LPARAM)r)) free_result(r);
+    if (!posted) free_result(r);
 }
 
 bool new_request_pending(Shared* s) {
@@ -88,7 +91,8 @@ Result* fetch(uint16_t msg, const wchar_t* path, int cx, int cy, int page, int g
     r->req_w = cx;
     r->req_h = cy;
     r->quick = quick;
-    r->hr = request_image(msg, path, (UINT)cx, (UINT)cy, (UINT)page, &resp, &r->px);
+    // The first-paint thumbnail is a nicety: never let it hold up the real request for long.
+    r->hr = request_image(msg, path, (UINT)cx, (UINT)cy, (UINT)page, &resp, &r->px, 0, quick ? 3000 : 0);
     r->w = (int)resp.width;
     r->h = (int)resp.height;
     r->info = resp.info;
@@ -155,12 +159,13 @@ DWORD WINAPI request_thread(void* arg) {
             if (quick_done_for != file_gen && page == 0) {
                 quick_done_for = file_gen;
                 if (Result* q = fetch(ABT_MSG_THUMB, path, 256, 256, 0, gen, file_gen, true)) {
-                    if (q->info.page_count > (uint32_t)count) count = (int)q->info.page_count;
+                    if (q->info.page_count > (uint32_t)count) count = (int)min_u32(q->info.page_count, 100000);
                     post_result(s, q);
                 }
+                if (new_request_pending(s)) { abt::mem_free(path); continue; }  // the user moved on
             }
             if (Result* r = fetch(ABT_MSG_PREVIEW, path, cx, cy, page, gen, file_gen, false)) {
-                if (r->info.page_count > (uint32_t)count) count = (int)r->info.page_count;
+                if (r->info.page_count > (uint32_t)count) count = (int)min_u32(r->info.page_count, 100000);
                 post_result(s, r);
             }
         }
@@ -514,9 +519,10 @@ class PreviewHandler final : public IPreviewHandler,
                 m_loading = false;
                 m_error[0] = 0;
             }
-        } else if (current) {
+        } else if (current && m_loading) {
             // Never leave another artboard on screen under this artboard's number; the placeholder
-            // (document thumbnail) is shown with the reason instead.
+            // (document thumbnail) is shown with the reason instead. (A failed re-render after a resize
+            // keeps the right artboard on screen: m_loading is false then.)
             drop_quick();
             m_bmp = nullptr;
             m_loading = false;

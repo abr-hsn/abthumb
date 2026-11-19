@@ -36,6 +36,10 @@ bool app_data_dir(wchar_t* out, size_t cap, const wchar_t* sub);
 bool module_dir(HMODULE mod, wchar_t* out, size_t cap);
 // Lowercase extension including the dot, or empty string.
 const wchar_t* path_ext(const wchar_t* path);
+// True for files behind a network or optical drive (UNC path, mapped network drive, CD/DVD):
+// reading them is slow and can stall, so they get short deadlines and no folder pre-warm.
+// Pure path + GetDriveType check, no I/O on the share itself.
+bool is_slow_path(const wchar_t* path);
 // UTF-16 -> UTF-8 into fixed buffer (truncates safely).
 void to_utf8(const wchar_t* w, char* out, size_t cap);
 

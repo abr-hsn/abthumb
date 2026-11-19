@@ -410,7 +410,8 @@ abt_status abt_epsi_decode(const uint8_t* d, size_t n, const abt_preview* pv, ab
     size_t rowb = ((size_t)w * depth + 7) / 8;
     const uint8_t* p = d + pv->offset;
     const uint8_t* end = p + pv->length;
-    if (pv->length / 2 < rowb) return ABT_E_TRUNCATED; /* not even one row of hex */
+    /* at least a quarter of the claimed rows must be there (a tiny preview cannot claim 16 Mpx) */
+    if ((uint64_t)(pv->length / 2) < (uint64_t)rowb * (uint64_t)((h + 3) / 4)) return ABT_E_TRUNCATED;
     abt_status st = abt_image_alloc(out, w, h);
     if (st != ABT_OK) return st;
     abt_image_fill(out, 255, 255, 255, 255);

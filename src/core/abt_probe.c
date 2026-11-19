@@ -313,7 +313,9 @@ abt_status abt_probe_pdf(const uint8_t* d, size_t n, abt_probe* out) {
     const uint8_t* xmp = abt_memmem(d, head, "<x:xmpmeta", 10);
     const uint8_t* xend = NULL;
     if (xmp) {
-        xend = abt_memmem(xmp, (size_t)(d + n - xmp), "</x:xmpmeta>", 12);
+        size_t xlim = (size_t)(d + n - xmp);
+        if (xlim > ((size_t)8 << 20)) xlim = (size_t)8 << 20; /* never fault in a whole huge file */
+        xend = abt_memmem(xmp, xlim, "</x:xmpmeta>", 12);
         size_t xlen = xend ? (size_t)(xend - xmp) + 12 : (size_t)(d + head - xmp);
         abt_xmp_find_thumbnails(d, n, (size_t)(xmp - d), xlen, out);
         abt_xmp_creator_tool(xmp, xlen, out->info.creator, sizeof(out->info.creator));
@@ -367,6 +369,11 @@ abt_status abt_probe_pdf(const uint8_t* d, size_t n, abt_probe* out) {
         }
     }
     if (abt_memmem(d, head, "/Encrypt", 8)) out->info.flags |= ABT_INFO_ENCRYPTED;
+    else if (n > head) { /* non-linearised PDF: the trailer (and /Encrypt) is at the end */
+        size_t t = n > ((size_t)1 << 20) ? n - ((size_t)1 << 20) : 0;
+        if (t < head) t = head;
+        if (abt_memmem(d + t, n - t, "/Encrypt", 8)) out->info.flags |= ABT_INFO_ENCRYPTED;
+    }
     int best = abt_probe_best_preview(out, 1 << 30);
     if (best >= 0) {
         out->info.preview_w = out->previews[best].width;

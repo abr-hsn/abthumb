@@ -25,7 +25,7 @@
 
 #define MAX_LAYERS 8192
 #define MAX_DEPTH 16
-#define ZIP_LIMIT ((size_t)32 << 20) /* per channel */
+#define ZIP_LIMIT ((size_t)128 << 20) /* per channel */
 #define MAX_EDGES 50000
 
 enum { SLOT_A = 4, SLOT_MASK = 5, NSLOT = 6 };
@@ -392,7 +392,10 @@ static fbuf* render_shape(ctx* c, const layer* L);
 /* Renders a pixel layer (colour + alpha + user mask, no opacity) into an fbuf in canvas coordinates. */
 static fbuf* render_layer(ctx* c, const layer* L) {
     geom g;
-    if (L->soco_len) return render_shape(c, L);
+    if (L->soco_len) { /* fill layer: draw its shape; if the colour or path is unusable, use its pixels */
+        fbuf* s = render_shape(c, L);
+        if (s || c->st != ABT_OK) return s;
+    }
     if (!make_geom(c, L->left, L->top, L->right, L->bottom, 0, 0, c->dw, c->dh, &g)) return NULL;
     int w = L->right - L->left, h = L->bottom - L->top;
     int nc = c->nch, comps = nc + 1;

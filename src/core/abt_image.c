@@ -37,6 +37,19 @@ int abt_image_scan_alpha(abt_image* img) {
     return any;
 }
 
+int abt_image_is_uniform(const abt_image* img, int tol) {
+    if (!img->px || img->w < 1 || img->h < 1) return 1;
+    size_t n = (size_t)img->w * img->h;
+    const uint8_t* p = img->px;
+    const uint8_t* q = p;
+    for (size_t i = 0; i < n; ++i, q += 4)
+        for (int c = 0; c < 4; ++c) {
+            int d = (int)q[c] - (int)p[c];
+            if (d > tol || d < -tol) return 0;
+        }
+    return 1;
+}
+
 void abt_fit(int sw, int sh, int edge, int allow_up, int* dw, int* dh) {
     if (sw < 1) sw = 1;
     if (sh < 1) sh = 1;

@@ -242,7 +242,20 @@ static void test_qoi_encode_limits(void) {
     free(out);
 }
 
+static void test_uniform(void) {
+    abt_image img = {0};
+    ABT_CHECK(abt_image_alloc(&img, 16, 9) == ABT_OK);
+    abt_image_fill(&img, 255, 255, 255, 255);
+    ABT_CHECK(abt_image_is_uniform(&img, 6));           /* all white: blank */
+    img.px[(5 * 16 + 7) * 4 + 1] = 251;               /* JPEG noise */
+    ABT_CHECK(abt_image_is_uniform(&img, 6));
+    img.px[(8 * 16 + 15) * 4 + 0] = 40;               /* one real pixel of art */
+    ABT_CHECK(!abt_image_is_uniform(&img, 6));
+    abt_image_free(&img);
+}
+
 void suite_core(void) {
+    test_uniform();
     test_qoi_roundtrip();
     test_resampler();
     test_base64();
