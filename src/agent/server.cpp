@@ -36,6 +36,7 @@ static HANDLE create_instance(bool first) {
     SECURITY_ATTRIBUTES sa = {sizeof(sa), g_sd, FALSE};
     return CreateNamedPipeW(g_name,
                             PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | (first ? FILE_FLAG_FIRST_PIPE_INSTANCE : 0),
+                            // NOLINTNEXTLINE(misc-redundant-expression): three of these are 0, named for clarity
                             PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
                             PIPE_UNLIMITED_INSTANCES, 1 << 16, 1 << 16, 0, g_sd ? &sa : nullptr);
 }
