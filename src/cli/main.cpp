@@ -33,7 +33,7 @@ static void usage() {
         stderr);
 }
 
-static bool arg_is(const wchar_t* a, const wchar_t* b) { return lstrcmpiW(a, b) == 0; }
+static bool arg_is(const wchar_t* a, const wchar_t* b) { return abt::ieq(a, b); }
 
 
 // Registration is deliberately not in this tool: use `regsvr32 abthumb.dll` (machine-wide when
@@ -93,7 +93,7 @@ static HRESULT shell_thumb(const wchar_t* path, const ShellTestOpts& o, HBITMAP*
 
 static int cmd_shelltest(int argc, wchar_t** argv) {
     ShellTestOpts o;
-    int first_path = -1, npaths = 0;
+    int npaths = 0;
     const wchar_t* paths[256];
     for (int i = 0; i < argc; ++i) {
         if (arg_is(argv[i], L"--size") && i + 1 < argc) o.size = _wtoi(argv[++i]);
@@ -103,7 +103,6 @@ static int cmd_shelltest(int argc, wchar_t** argv) {
         else if (arg_is(argv[i], L"--out") && i + 1 < argc) o.out = argv[++i];
         else if (npaths < 256) paths[npaths++] = argv[i];
     }
-    (void)first_path;
     if (!npaths) { usage(); return 2; }
     int failures = 0;
     for (int p = 0; p < npaths; ++p) {
@@ -138,7 +137,11 @@ static int cmd_shelltest(int argc, wchar_t** argv) {
                 if (SUCCEEDED(abt::hbitmap_to_bgra(bmp, &px, &bw, &bh, true))) {
                     wchar_t png[MAX_PATH];
                     _snwprintf_s(png, MAX_PATH, _TRUNCATE, L"%s\\%s_%d.png", o.out, PathFindFileNameW(full), o.size);
-                    abt::save_png_bgra(png, px, bw, bh, bw * 4, true);
+                    HRESULT shr = abt::save_png_bgra(png, px, bw, bh, bw * 4, true);
+                    if (FAILED(shr)) {
+                        fprintf(stderr, "cannot write %ls: 0x%08lx\n", png, shr);
+                        if (SUCCEEDED(hr)) hr = shr;  // counted as a failure below
+                    }
                     abt::mem_free(px);
                 }
             }
@@ -158,13 +161,6 @@ static const char* source_str(uint32_t s) {
     if (s & ABT_SRC_RENDERED) return "render";
     if (s & ABT_SRC_EMBEDDED) return (s & ABT_SRC_SCALED) ? "embedded(small)" : "embedded";
     return "-";
-}
-
-static bool is_supported(const wchar_t* path) {
-    const wchar_t* e = abt::path_ext(path);
-    for (int i = 0; i < abt::kExtensionCount; ++i)
-        if (!lstrcmpiW(e, abt::kExtensions[i])) return true;
-    return false;
 }
 
 struct RenderOpts {
@@ -193,12 +189,17 @@ static int render_one(const wchar_t* path, const RenderOpts& o, double* total_ms
     printf("%-44ls %-6s %-16s %4dx%-4d %8.2f ms  pages=%u  %s  [%s]\n", PathFindFileNameW(path),
            abt_family_str((abt_family)rr.info.family), source_str(rr.source), rr.img.w, rr.img.h, best,
            rr.info.page_count, rr.info.version, rr.reason);
+    bool save_failed = false;
     if (SUCCEEDED(rr.hr) && o.out && rr.img.px) {
         wchar_t png[MAX_PATH];
         _snwprintf_s(png, MAX_PATH, _TRUNCATE, L"%s\\%s_%d.png", o.out, PathFindFileNameW(path), o.cx);
-        abt::save_png_bgra(png, rr.img.px, rr.img.w, rr.img.h, rr.img.w * 4, true);
+        HRESULT shr = abt::save_png_bgra(png, rr.img.px, rr.img.w, rr.img.h, rr.img.w * 4, true);
+        if (FAILED(shr)) {
+            fprintf(stderr, "cannot write %ls: 0x%08lx\n", png, shr);
+            save_failed = true;
+        }
     }
-    int rc = SUCCEEDED(rr.hr) ? 0 : 1;
+    int rc = (SUCCEEDED(rr.hr) && !save_failed) ? 0 : 1;
     abt::render_result_free(&rr);
     return rc;
 }
@@ -221,7 +222,10 @@ static int cmd_render(int argc, wchar_t** argv) {
         else if (np < 512) paths[np++] = argv[i];
     }
     if (!np) { usage(); return 2; }
-    if (o.out) CreateDirectoryW(o.out, nullptr);
+    if (o.out && !CreateDirectoryW(o.out, nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) {
+        fprintf(stderr, "cannot create %ls: error %lu\n", o.out, GetLastError());
+        return 1;
+    }
     int fails = 0, count = 0;
     double total = 0;
     for (int p = 0; p < np; ++p) {
@@ -238,7 +242,7 @@ static int cmd_render(int argc, wchar_t** argv) {
                 if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
                 wchar_t f[MAX_PATH];
                 _snwprintf_s(f, MAX_PATH, _TRUNCATE, L"%s\\%s", full, fd.cFileName);
-                if (!is_supported(f)) continue;
+                if (!abt::is_supported_ext(f)) continue;
                 fails += render_one(f, o, &total);
                 ++count;
             } while (FindNextFileW(h, &fd));
@@ -314,7 +318,7 @@ static void summary(const char* name, Series& s) {
     for (int i = 0; i < s.n; ++i) sum += s.v[i];
 #pragma warning(suppress : 6385)  // /analyze false positive: s.n >= 1 here, so s.n - 1 is a valid index
     printf("  %-22s n=%-4d mean %8.2f  p50 %8.2f  p95 %8.2f  max %8.2f ms\n", name, s.n, sum / s.n, s.v[s.n / 2],
-           s.v[(int)(s.n * 0.95) < s.n ? (int)(s.n * 0.95) : s.n - 1], s.v[s.n - 1]);
+           s.v[(int)(s.n * 0.95)], s.v[s.n - 1]);
 }
 
 static double pipe_thumb_ms(const wchar_t* path, int size, uint32_t flags, HRESULT* hr_out, uint32_t* source) {
@@ -361,7 +365,7 @@ static int cmd_bench(int argc, wchar_t** argv) {
         do {
             if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY || np >= 4096) continue;
             _snwprintf_s(paths[np], MAX_PATH, _TRUNCATE, L"%s\\%s", dir, fd.cFileName);
-            if (is_supported(paths[np])) ++np;
+            if (abt::is_supported_ext(paths[np])) ++np;
         } while (FindNextFileW(h, &fd));
         FindClose(h);
     }
@@ -372,7 +376,7 @@ static int cmd_bench(int argc, wchar_t** argv) {
             while (np < 4096 && fgetws(line, MAX_PATH, lf)) {
                 size_t l = wcslen(line);
                 while (l && (line[l - 1] == L'\n' || line[l - 1] == L'\r')) line[--l] = 0;
-                if (l && is_supported(line)) lstrcpynW(paths[np++], line, MAX_PATH);
+                if (l && abt::is_supported_ext(line)) lstrcpynW(paths[np++], line, MAX_PATH);
             }
             fclose(lf);
         }
@@ -380,7 +384,7 @@ static int cmd_bench(int argc, wchar_t** argv) {
     for (int pi = 0; pi < np; ++pi) {
         {
             const wchar_t* f = paths[pi];
-            struct { const wchar_t* cFileName; } fd = {PathFindFileNameW(f)};
+            const wchar_t* fname = PathFindFileNameW(f);
             ++files;
             abt::RenderRequest rq = {};
             rq.path = f;
@@ -423,7 +427,7 @@ static int cmd_bench(int argc, wchar_t** argv) {
             }
             if (verbose)
                 printf("%-44ls auto %7.2f render %7.2f fast %7.2f wic %7.2f%s agent miss %7.2f hit %6.2f\n",
-                       fd.cFileName, okm[0] ? best[0] : -1, okm[1] ? best[1] : -1, okm[2] ? best[2] : -1,
+                       fname, okm[0] ? best[0] : -1, okm[1] ? best[1] : -1, okm[2] ? best[2] : -1,
                        wok ? wbest : -1, wok ? "" : "(no codec)", miss, hit);
         }
     }
@@ -440,8 +444,6 @@ static int cmd_bench(int argc, wchar_t** argv) {
     abt::render_shutdown();
     return 0;
 }
-
-static LRESULT CALLBACK host_wndproc(HWND h, UINT m, WPARAM w, LPARAM l) { return DefWindowProcW(h, m, w, l); }
 
 // Hosts our preview handler like Explorer's preview pane does (out of process via the
 // registered surrogate unless --inproc), captures the window into a PNG.
@@ -466,7 +468,7 @@ static int cmd_previewtest(int argc, wchar_t** argv) {
     GetFullPathNameW(file, MAX_PATH, full, nullptr);
 
     WNDCLASSW wc = {};
-    wc.lpfnWndProc = host_wndproc;
+    wc.lpfnWndProc = DefWindowProcW;
     wc.hInstance = GetModuleHandleW(nullptr);
     wc.lpszClassName = L"abthumbPreviewHost";
     wc.hbrBackground = (HBRUSH)GetStockObject(GRAY_BRUSH);
@@ -533,6 +535,12 @@ static int cmd_previewtest(int argc, wchar_t** argv) {
         else lstrcpynW(path, out, MAX_PATH);
         void* bits = nullptr;
         HBITMAP bmp = abt::create_dib32(w, h, &bits);
+        if (!bmp || !bits) {
+            fprintf(stderr, "cannot allocate %dx%d capture bitmap\n", w, h);
+            if (bmp) DeleteObject(bmp);
+            hr = E_OUTOFMEMORY;
+            break;
+        }
         HDC wdc = GetDC(host);
         HDC mdc = CreateCompatibleDC(wdc);
         HGDIOBJ old = SelectObject(mdc, bmp);
@@ -545,6 +553,7 @@ static int cmd_previewtest(int argc, wchar_t** argv) {
         for (int i = 0; i < w * h; ++i) ((uint8_t*)bits)[i * 4 + 3] = 255;
         HRESULT shr = abt::save_png_bgra(path, (const uint8_t*)bits, w, h, w * 4, false);
         printf("capture -> %ls: 0x%08lx\n", path, shr);
+        if (FAILED(shr) && SUCCEEDED(hr)) hr = shr;
         DeleteObject(bmp);
     }
     ph->Unload();

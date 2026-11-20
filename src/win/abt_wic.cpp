@@ -7,8 +7,9 @@ static INIT_ONCE g_wic_once = INIT_ONCE_STATIC_INIT;
 
 static BOOL CALLBACK wic_init(PINIT_ONCE, PVOID, PVOID*) {
     IWICImagingFactory* f = nullptr;
-    if (SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&f))))
-        g_wic = f;
+    if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&f))))
+        return FALSE;  // not cached: a later call retries
+    g_wic = f;
     return TRUE;
 }
 

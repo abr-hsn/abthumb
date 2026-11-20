@@ -8,6 +8,13 @@ const wchar_t* const kExtensions[] = {L".ai",  L".ait", L".eps", L".epsf", L".ep
                                       L".psd", L".psdt", L".pdd", L".psb", L".pdf"};
 const int kExtensionCount = (int)(sizeof(kExtensions) / sizeof(kExtensions[0]));
 
+bool is_supported_ext(const wchar_t* path) {
+    const wchar_t* e = path_ext(path);
+    for (int i = 0; i < kExtensionCount; ++i)
+        if (ieq(e, kExtensions[i])) return true;
+    return false;
+}
+
 static const wchar_t kClasses[] = L"Software\\Classes";
 static const wchar_t kBackupKey[] = ABT_REG_ROOT L"\\Backup";
 static const wchar_t kPreviewList[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\PreviewHandlers";
@@ -34,6 +41,9 @@ static void delete_if_empty(HKEY root, const wchar_t* subkey) {
     RegCloseKey(k);
     if (nsub == 0 && nval == 0) RegDeleteKeyW(root, subkey);
 }
+
+// Deleting something that is already gone is success.
+static LSTATUS absent_ok(LSTATUS s) { return (s == ERROR_FILE_NOT_FOUND || s == ERROR_PATH_NOT_FOUND) ? ERROR_SUCCESS : s; }
 
 struct Pair { const wchar_t* iid; const wchar_t* clsid; };
 static const Pair kPairs[2] = {{ABT_SHELLEX_THUMB_STR, ABT_CLSID_THUMB_STR}, {ABT_SHELLEX_PREVIEW_STR, ABT_CLSID_PREVIEW_STR}};
@@ -71,7 +81,8 @@ HRESULT shell_register(const wchar_t* dll_path, const RegisterOptions& opt) {
         wchar_t exe[MAX_PATH + 2];
         lstrcpynW(exe, dll_path, MAX_PATH);
         wchar_t* slash = wcsrchr(exe, L'\\');
-        if (slash) lstrcpyW(slash + 1, L"abthumb-preview.exe");
+        if (slash) _snwprintf_s(slash + 1, (size_t)(_countof(exe) - (size_t)(slash + 1 - exe)), _TRUNCATE, L"%s",
+                                L"abthumb-preview.exe");
         wchar_t quoted[MAX_PATH + 4];
         _snwprintf_s(quoted, _countof(quoted), _TRUNCATE, L"\"%s\"", exe);
         e |= set_sz(root, key, nullptr, quoted);
@@ -87,7 +98,7 @@ HRESULT shell_register(const wchar_t* dll_path, const RegisterOptions& opt) {
                 // Back up whatever we are about to replace. A slot that is already ours (repair,
                 // upgrade) keeps its backup; a slot another program took over since is backed up anew.
                 wchar_t old[256];
-                if (get_sz(root, key, nullptr, old, sizeof(old)) && old[0] && lstrcmpiW(old, pr.clsid) != 0) {
+                if (get_sz(root, key, nullptr, old, sizeof(old)) && old[0] && !abt::ieq(old, pr.clsid)) {
                     wchar_t name[96];
                     _snwprintf_s(name, _countof(name), _TRUNCATE, L"%s|%s", kExtensions[i], pr.iid);
                     e |= set_sz(root, kBackupKey, name, old);
@@ -109,6 +120,7 @@ HRESULT shell_register(const wchar_t* dll_path, const RegisterOptions& opt) {
 HRESULT shell_unregister(bool machine) {
     HKEY root = machine ? HKEY_LOCAL_MACHINE : HKEY_CURRENT_USER;
     wchar_t key[512];
+    LSTATUS e = ERROR_SUCCESS;
     for (int i = 0; i < kExtensionCount; ++i) {
         const wchar_t* ext = kExtensions[i];
         for (const Pair& pr : kPairs) {
@@ -116,14 +128,14 @@ HRESULT shell_unregister(bool machine) {
             for (int b = 0; b < 2; ++b) {
                 _snwprintf_s(key, _countof(key), _TRUNCATE, L"%s\\%s%s\\ShellEx\\%s", kClasses, bases[b], ext, pr.iid);
                 wchar_t cur[256];
-                if (!get_sz(root, key, nullptr, cur, sizeof(cur)) || lstrcmpiW(cur, pr.clsid) != 0) continue;
+                if (!get_sz(root, key, nullptr, cur, sizeof(cur)) || !abt::ieq(cur, pr.clsid)) continue;
                 wchar_t name[96], old[256];
                 _snwprintf_s(name, _countof(name), _TRUNCATE, L"%s|%s", ext, pr.iid);
                 if (b == 0 && machine && get_sz(root, kBackupKey, name, old, sizeof(old)) && old[0]) {
-                    set_sz(root, key, nullptr, old);  // give the slot back to the previous handler
-                    RegDeleteKeyValueW(root, kBackupKey, name);
+                    e |= set_sz(root, key, nullptr, old);  // give the slot back to the previous handler
+                    e |= absent_ok(RegDeleteKeyValueW(root, kBackupKey, name));
                 } else {
-                    RegDeleteKeyW(root, key);
+                    e |= absent_ok(RegDeleteKeyW(root, key));
                 }
             }
         }
@@ -138,20 +150,20 @@ HRESULT shell_unregister(bool machine) {
     static const wchar_t* const kClsids[2] = {ABT_CLSID_THUMB_STR, ABT_CLSID_PREVIEW_STR};
     for (const wchar_t* clsid : kClsids) {
         _snwprintf_s(key, _countof(key), _TRUNCATE, L"%s\\CLSID\\%s", kClasses, clsid);
-        RegDeleteTreeW(root, key);
-        RegDeleteKeyW(root, key);
+        e |= absent_ok(RegDeleteTreeW(root, key));
+        e |= absent_ok(RegDeleteKeyW(root, key));
     }
-    RegDeleteKeyValueW(root, kPreviewList, ABT_CLSID_PREVIEW_STR);
+    e |= absent_ok(RegDeleteKeyValueW(root, kPreviewList, ABT_CLSID_PREVIEW_STR));
     delete_if_empty(root, kBackupKey);
     SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, nullptr, nullptr);
-    return S_OK;
+    return e == ERROR_SUCCESS ? S_OK : HRESULT_FROM_WIN32(ERROR_CANTWRITE);
 }
 
 void shell_describe(char* buf, size_t cap) {
     size_t used = 0;
     buf[0] = 0;
     for (int i = 0; i < kExtensionCount; ++i) {
-        wchar_t key[256], thumb[64] = L"-", prev[64] = L"-";
+        wchar_t key[256], thumb[64], prev[64];
         _snwprintf_s(key, _countof(key), _TRUNCATE, L"%s\\ShellEx\\%s", kExtensions[i], ABT_SHELLEX_THUMB_STR);
         get_sz(HKEY_CLASSES_ROOT, key, nullptr, thumb, sizeof(thumb));
         _snwprintf_s(key, _countof(key), _TRUNCATE, L"%s\\ShellEx\\%s", kExtensions[i], ABT_SHELLEX_PREVIEW_STR);
