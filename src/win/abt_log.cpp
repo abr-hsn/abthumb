@@ -21,7 +21,8 @@ void log_init(const wchar_t* component) {
 
 static bool log_decide() {
     wchar_t env[8];
-    if (GetEnvironmentVariableW(L"ABTHUMB_LOG", env, 8) && env[0] == L'1') return true;
+    DWORD n = GetEnvironmentVariableW(L"ABTHUMB_LOG", env, 8);
+    if (n && n < 8 && env[0] == L'1') return true;
     return reg_get_dword(HKEY_CURRENT_USER, ABT_REG_ROOT, L"Log", 0) != 0;
 }
 
@@ -51,7 +52,7 @@ void logf(const char* fmt, ...) {
     if (g_log_file == INVALID_HANDLE_VALUE) {
         wchar_t dir[MAX_PATH], path[MAX_PATH];
         if (app_data_dir(dir, MAX_PATH, L"logs")) {
-            wsprintfW(path, L"%s\\%s.log", dir, g_component);
+            _snwprintf_s(path, MAX_PATH, _TRUNCATE, L"%s\\%s.log", dir, g_component);
             g_log_file = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                      nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
         }
