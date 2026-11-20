@@ -439,18 +439,9 @@ bool cache_get(const FileKey& k, uint32_t page, int edge, abt_image* img, CacheE
     uint8_t* body = nullptr;
     bool found = false;
     AcquireSRWLockShared(&g_lock);
-    Entry* e = find(k.hi, k.lo, page, kNegTier);
-    if (e && e->file_size == k.size && e->mtime == k.mtime) {
-        view->flags = e->flags;
-        view->width = view->height = 0;
-        InterlockedExchange(&e->last_access, now_minutes());
-        // Read info for the negative entry too (so callers can report why).
-        Seg* s = seg_by_id(e->seg);
-        if (s && pread(s->h, e->offset, &h, sizeof(h)) && h.info_len == sizeof(abt_file_info))
-            pread(s->h, e->offset + sizeof(h), &view->info, sizeof(abt_file_info));
-        ReleaseSRWLockShared(&g_lock);
-        return true;
-    }
+    Entry* e = nullptr;
+    // Real renditions first: a negative entry stored by a failed larger render must not hide a
+    // smaller rendition that is already on disk.
     for (int t : kTiers) {
         if (t < tier_for(edge)) continue;
         e = find(k.hi, k.lo, page, (uint32_t)t);
@@ -474,6 +465,20 @@ bool cache_get(const FileKey& k, uint32_t page, int edge, abt_image* img, CacheE
         }
         mem_free(body);
         body = nullptr;
+    }
+    if (!found) {
+        e = find(k.hi, k.lo, page, kNegTier);
+        if (e && e->file_size == k.size && e->mtime == k.mtime) {
+            view->flags = e->flags;
+            view->width = view->height = 0;
+            InterlockedExchange(&e->last_access, now_minutes());
+            // Read info for the negative entry too (so callers can report why).
+            Seg* s = seg_by_id(e->seg);
+            if (s && pread(s->h, e->offset, &h, sizeof(h)) && h.info_len == sizeof(abt_file_info))
+                pread(s->h, e->offset + sizeof(h), &view->info, sizeof(abt_file_info));
+            ReleaseSRWLockShared(&g_lock);
+            return true;
+        }
     }
     ReleaseSRWLockShared(&g_lock);
     if (!found) return false;

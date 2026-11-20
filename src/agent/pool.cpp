@@ -189,6 +189,7 @@ static void finish(Job* j) {
 // still read what the user can read (they must), but cannot write to the user's files, registry
 // or processes. Opt-out for troubleshooting: HKCU\Software\abthumb\WorkerLowIntegrity = 0.
 static HANDLE g_worker_token = nullptr;
+static volatile bool g_token_failed = false;  // set by any slot; the token itself is closed only in pool_stop
 
 static HANDLE make_worker_token() {
     if (!reg_get_dword(HKEY_CURRENT_USER, ABT_REG_ROOT, L"WorkerLowIntegrity", 1)) return nullptr;
@@ -260,13 +261,12 @@ static bool slot_spawn(Slot* s) {
     _snwprintf_s(cmd, _countof(cmd), _TRUNCATE, L"\"%s\"%s", g_worker_exe, s->background ? L" --background" : L"");
     PROCESS_INFORMATION pi = {};
     const DWORD cflags = CREATE_SUSPENDED | CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT;
-    if (ok && g_worker_token) {
+    if (ok && g_worker_token && !g_token_failed) {
         ok = CreateProcessAsUserW(g_worker_token, g_worker_exe, cmd, nullptr, nullptr, TRUE, cflags, nullptr, nullptr,
                                   &si.StartupInfo, &pi) != 0;
         if (!ok) {  // keep thumbnails working, but say so
             logf("low-integrity worker spawn failed (%lu); using a normal worker", GetLastError());
-            CloseHandle(g_worker_token);
-            g_worker_token = nullptr;
+            g_token_failed = true;
             ok = true;
         }
     }
@@ -492,6 +492,7 @@ bool pool_start(int fg, int bg) {
     if (bg < 0) bg = 0;
     if (fg + bg > (int)_countof(g_slots)) bg = (int)_countof(g_slots) - fg;
     g_worker_token = make_worker_token();
+    g_token_failed = false;
     logf("render workers: %s integrity", g_worker_token ? "low" : "normal");
     if (g_job_obj) {
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION li = {};
