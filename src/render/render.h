@@ -26,8 +26,6 @@ struct RenderResult {
     char reason[128];     // human-readable note (why a path was or was not taken)
 };
 
-// One-time per process (PDFium init is lazy inside).
-void render_init(bool background);
 void render_shutdown();
 void render_file(const RenderRequest& rq, RenderResult* rr);
 void render_result_free(RenderResult* rr);

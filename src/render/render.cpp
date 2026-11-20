@@ -125,10 +125,6 @@ static HRESULT decode_preview(const MappedFile& mf, const abt_preview& pv, int b
     return hr;
 }
 
-static bool g_background = false;
-
-void render_init(bool background) { g_background = background; }
-
 static void set_reason(RenderResult* rr, const char* s) { lstrcpynA(rr->reason, s, sizeof(rr->reason)); }
 
 // Illustrator: is the whole canvas (all art, on and off the artboards) just artboard 1? Only then

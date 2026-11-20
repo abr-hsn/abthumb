@@ -222,7 +222,6 @@ static int cmd_render(int argc, wchar_t** argv) {
     }
     if (!np) { usage(); return 2; }
     if (o.out) CreateDirectoryW(o.out, nullptr);
-    abt::render_init(false);
     int fails = 0, count = 0;
     double total = 0;
     for (int p = 0; p < np; ++p) {
@@ -347,7 +346,6 @@ static int cmd_bench(int argc, wchar_t** argv) {
         else if (nd < 64) dirs[nd++] = argv[i];
     }
     if (!nd && !list) { usage(); return 2; }
-    abt::render_init(false);
     static Series s_auto, s_render, s_fast, s_wic, s_miss, s_hit;
     int files = 0, wic_fail = 0, auto_fail = 0;
     // Collect paths: directory listings, then an optional UTF-8/UTF-16 list file (one path per line).
