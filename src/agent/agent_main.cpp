@@ -5,11 +5,9 @@
 
 namespace abt {
 
-static HANDLE g_quit_event = nullptr;
 static HWND g_hwnd = nullptr;
 
 void agent_request_quit() {
-    if (g_quit_event) SetEvent(g_quit_event);
     if (g_hwnd) PostMessageW(g_hwnd, WM_CLOSE, 0, 0);
 }
 
@@ -23,10 +21,12 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
         cache_maintenance();
         return 0;
     case WM_QUERYENDSESSION:
-        cache_maintenance();  // flush the index snapshot before logoff/shutdown
         return TRUE;
     case WM_ENDSESSION:
-        if (w) { cache_maintenance(); agent_request_quit(); }
+        if (w) {  // the session is really ending: flush the index snapshot, then quit
+            cache_maintenance();
+            agent_request_quit();
+        }
         return 0;
     case WM_CLOSE:
         DestroyWindow(h);
@@ -58,7 +58,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     HANDLE mutex = CreateMutexW(nullptr, TRUE, mutex_name);
     if (!mutex || GetLastError() == ERROR_ALREADY_EXISTS) return 0;
 
-    // Agent bookkeeping is light; keep its I/O at low priority but let it answer quickly.
+    // Reset any priority class inherited from whoever launched us (workers lower their own).
     SetPriorityClass(GetCurrentProcess(), NORMAL_PRIORITY_CLASS);
 
     const wchar_t* root = ABT_REG_ROOT;
@@ -69,7 +69,6 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
 
     wchar_t dir[MAX_PATH];
     if (!app_data_dir(dir, MAX_PATH, L"cache")) return 2;
-    g_quit_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     cache_open(dir, cap_mb << 20);
     pool_start(fg, bg);
     if (!server_start(threads)) {
@@ -98,7 +97,6 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     prewarm_stop();
     server_stop();
     cache_close();
-    if (g_quit_event) CloseHandle(g_quit_event);
     ReleaseMutex(mutex);
     CloseHandle(mutex);
     CoUninitialize();

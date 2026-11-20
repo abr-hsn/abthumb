@@ -20,7 +20,6 @@ struct Job {
     JobResult res;
     Job* next;   // queue link (singly linked FIFO per lane)
     Job* anext;  // active-list link
-    bool finished;
 };
 
 struct Slot {
@@ -142,6 +141,14 @@ bool job_wait(Job* j, DWORD timeout_ms, JobResult* out) {
     return true;
 }
 
+// Completion only: no image copy. *hr (optional) receives the job's result code, which the worker
+// stores before signalling done.
+bool job_wait_done(Job* j, DWORD timeout_ms, HRESULT* hr) {
+    if (WaitForSingleObject(j->done, timeout_ms) != WAIT_OBJECT_0) return false;
+    if (hr) *hr = j->res.hr;
+    return true;
+}
+
 int jobs_pending(Lane min_lane) {
     int n = 0;
     AcquireSRWLockShared(&g_lock);
@@ -175,7 +182,6 @@ static void finish(Job* j) {
     Job** pp = &g_active;
     while (*pp && *pp != j) pp = &(*pp)->anext;
     if (*pp) *pp = j->anext;
-    j->finished = true;
     ReleaseSRWLockExclusive(&g_lock);
     InterlockedIncrement64(&g_lane_done[j->lane]);
     SetEvent(j->done);
@@ -222,6 +228,15 @@ static void slot_close(Slot* s) {
     ReleaseSRWLockExclusive(&s->proc_lock);
     s->in_w = s->out_r = nullptr;
     s->pid = 0;
+}
+
+// Asks the worker to exit, kills it if it has not within wait_ms, then releases the slot's handles.
+static void slot_quit(Slot* s, DWORD wait_ms) {
+    abt_req q;
+    init_req(&q, ABT_MSG_QUIT, 0);
+    write_all(s->in_w, &q, sizeof(q));
+    if (WaitForSingleObject(s->proc, wait_ms) != WAIT_OBJECT_0) TerminateProcess(s->proc, 0);
+    slot_close(s);
 }
 
 static bool slot_spawn(Slot* s) {
@@ -437,12 +452,8 @@ static DWORD WINAPI slot_thread(void* p) {
         }
         if (!j) {  // idle timeout: let the worker go
             if (s->proc) {
-                abt_req q;
-                init_req(&q, ABT_MSG_QUIT, 0);
-                write_all(s->in_w, &q, sizeof(q));
-                WaitForSingleObject(s->proc, 2000);
                 logf("worker %lu idle exit", s->pid);
-                slot_close(s);
+                slot_quit(s, 2000);
             }
             idle_since = GetTickCount64();
             continue;
@@ -455,13 +466,7 @@ static DWORD WINAPI slot_thread(void* p) {
         finish(j);
         idle_since = GetTickCount64();
     }
-    if (s->proc) {
-        abt_req q;
-        init_req(&q, ABT_MSG_QUIT, 0);
-        write_all(s->in_w, &q, sizeof(q));
-        if (WaitForSingleObject(s->proc, 1000) != WAIT_OBJECT_0) TerminateProcess(s->proc, 0);
-        slot_close(s);
-    }
+    if (s->proc) slot_quit(s, 1000);
     CoUninitialize();
     return 0;
 }

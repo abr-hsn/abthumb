@@ -33,7 +33,15 @@ bool file_key(const wchar_t* path, FileKey* k) {
     FILE_BASIC_INFO bi = {};
     FILE_STANDARD_INFO si = {};
     bool ok = GetFileInformationByHandleEx(h, FileBasicInfo, &bi, sizeof(bi)) &&
-              GetFileInformationByHandleEx(h, FileStandardInfo, &si, sizeof(si)) && !si.Directory;
+              GetFileInformationByHandleEx(h, FileStandardInfo, &si, sizeof(si));
+    // Callers read GetLastError() after a false return: capture it before CloseHandle can clobber it.
+    DWORD err = 0;
+    if (!ok) {
+        err = GetLastError();
+    } else if (si.Directory) {
+        ok = false;
+        err = ERROR_DIRECTORY;
+    }
     // Cloud placeholders and offline files: reading them would start a download (or a tape recall),
     // so they get no thumbnail from us. Opening for attributes only never triggers a recall.
     if (ok && (bi.FileAttributes & (FILE_ATTRIBUTE_OFFLINE | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS |
@@ -60,12 +68,14 @@ bool file_key(const wchar_t* path, FileKey* k) {
             wchar_t norm[MAX_PATH * 2] = {};
             int n = lstrlenW(path);
             if (n >= (int)_countof(norm)) n = (int)_countof(norm) - 1;
-            for (int i = 0; i < n; ++i) norm[i] = (wchar_t)(DWORD_PTR)CharLowerW((LPWSTR)(DWORD_PTR)path[i]);
+            memcpy(norm, path, (size_t)n * sizeof(wchar_t));
+            CharLowerBuffW(norm, (DWORD)n);
             k->hi = hash64(norm, (size_t)n * 2, 0x7061746Bull);
             k->lo = hash64(norm, (size_t)n * 2, 0x68617368ull);
         }
     }
     CloseHandle(h);
+    if (!ok) SetLastError(err ? err : ERROR_INVALID_FUNCTION);
     return ok;
 }
 
