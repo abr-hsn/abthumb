@@ -142,8 +142,9 @@ struct CmykXform {
 
 static HPROFILE open_profile_file(const wchar_t* name) {
     wchar_t dir[MAX_PATH], path[MAX_PATH];
-    DWORD dir_bytes = sizeof(dir);
-    if (!GetColorDirectoryW(nullptr, dir, &dir_bytes)) return nullptr;
+    // GetColorDirectoryW is deprecated (C4996); a result longer than the buffer is a failure too.
+    DWORD n = ExpandEnvironmentStringsW(L"%SystemRoot%\\System32\\spool\\drivers\\color", dir, MAX_PATH);
+    if (!n || n > MAX_PATH) return nullptr;
     _snwprintf_s(path, MAX_PATH, _TRUNCATE, L"%s\\%s", dir, name);
     if (GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) return nullptr;
     PROFILE p = {PROFILE_FILENAME, path, (DWORD)((lstrlenW(path) + 1) * sizeof(wchar_t))};
