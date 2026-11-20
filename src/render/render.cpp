@@ -208,7 +208,8 @@ static void render_inner(const RenderRequest& rq, const MappedFile& mf, RenderRe
         set_reason(rr, "Illustrator 8 and older files are not supported");
         return;
     }
-    int bw = rq.cx > 0 ? rq.cx : 256, bh = rq.cy > 0 ? rq.cy : bw;
+    int bw, bh;
+    request_box(rq, &bw, &bh);
     bool allow_embedded = !(rq.flags & ABT_RF_NO_EMBEDDED) && rq.mode != ABT_MODE_RENDER && page == 0;
     int edge = bw > bh ? bw : bh;
     int best = abt_probe_best_preview(&pr, edge);
@@ -413,7 +414,8 @@ void render_result_free(RenderResult* rr) { abt_image_free(&rr->img); }
 HRESULT render_psd(const uint8_t* data, size_t size, const abt_probe& pr, const RenderRequest& rq, abt_image* out,
                    char* reason, size_t reason_cap, bool* approx) {
     *approx = false;
-    int bw = rq.cx > 0 ? rq.cx : 256, bh = rq.cy > 0 ? rq.cy : bw;
+    int bw, bh;
+    request_box(rq, &bw, &bh);
     abt_psd_opts o = {};
     fit_box((int)pr.info.px_width, (int)pr.info.px_height, bw, bh, false, &o.dst_w, &o.dst_h);
     o.rows_per_out = (rq.flags & ABT_RF_MAX_QUALITY) ? 0 : 4;

@@ -10,6 +10,8 @@ struct RegisterOptions {
 
 extern const wchar_t* const kExtensions[];
 extern const int kExtensionCount;
+// True if the file name / path ends in one of kExtensions (ordinal, case-insensitive).
+bool is_supported_ext(const wchar_t* path);
 
 // Registers the thumbnail provider and preview handler. Machine mode backs up any existing
 // handler entries it replaces (HKLM\Software\abthumb\Backup) so unregister can restore them.

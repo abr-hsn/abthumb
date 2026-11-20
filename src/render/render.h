@@ -17,6 +17,12 @@ struct RenderRequest {
     uint32_t deadline_ms; // 0 = none
 };
 
+// Requested box with defaults: cx falls back to 256, cy to cx.
+inline void request_box(const RenderRequest& rq, int* bw, int* bh) {
+    *bw = rq.cx > 0 ? rq.cx : 256;
+    *bh = rq.cy > 0 ? rq.cy : *bw;
+}
+
 struct RenderResult {
     HRESULT hr;
     abt_image img;        // BGRA premultiplied, fits in the box
@@ -50,7 +56,6 @@ bool pdf_layout(const uint8_t* data, size_t size, int* pages, float* w0, float* 
 
 // EPS / PostScript AI through an installed Ghostscript (D-004). S_FALSE-like E_NOTIMPL if absent.
 HRESULT render_ghostscript(const wchar_t* path, const abt_probe& pr, const RenderRequest& rq, abt_image* out);
-bool ghostscript_available();
 
 // PSD / PSB composite or layer fallback.
 HRESULT render_psd(const uint8_t* data, size_t size, const abt_probe& pr, const RenderRequest& rq, abt_image* out,

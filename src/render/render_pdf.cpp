@@ -50,9 +50,9 @@ static bool is_ai_placeholder(FPDF_PAGE page) {
         // ASCII-fold and search for "without PDF"
         char a[4096];
         int m = 0;
-        for (int i = 0; i < got && m < 4095; ++i) a[m++] = (char)(buf[i] < 128 ? buf[i] : ' ');
+        for (int i = 0; i < got; ++i) a[m++] = (char)(buf[i] < 128 ? buf[i] : ' ');
         a[m] = 0;
-        hit = strstr(a, "without PDF") != nullptr || strstr(a, "without PDF Content") != nullptr;
+        hit = strstr(a, "without PDF") != nullptr;
     }
     FPDFText_ClosePage(tp);
     return hit;
@@ -98,7 +98,7 @@ HRESULT render_pdf(const uint8_t* data, size_t size, const RenderRequest& rq, ab
         return HRESULT_FROM_WIN32(ERROR_INVALID_INDEX);
     }
     HRESULT hr = E_FAIL;
-    FPDF_PAGE page = pages > 0 ? FPDF_LoadPage(doc, index) : nullptr;
+    FPDF_PAGE page = FPDF_LoadPage(doc, index);
     if (page) {
         float pw = FPDF_GetPageWidthF(page), ph = FPDF_GetPageHeightF(page);
         info->pt_width = pw;  // size of the page / artboard shown
@@ -106,7 +106,8 @@ HRESULT render_pdf(const uint8_t* data, size_t size, const RenderRequest& rq, ab
         if (fam == ABT_FAM_AI_PDF && index == 0 && is_ai_placeholder(page)) {
             *no_pdf_content = true;
         } else if (pw > 0 && ph > 0) {
-            int bw = rq.cx > 0 ? rq.cx : 256, bh = rq.cy > 0 ? rq.cy : bw;
+            int bw, bh;
+            request_box(rq, &bw, &bh);
             double s = fmin(bw / (double)pw, bh / (double)ph);  // vector: enlarging is exact
             int dw = (int)floor(pw * s + 0.5), dh = (int)floor(ph * s + 0.5);
             if (dw < 1) dw = 1;

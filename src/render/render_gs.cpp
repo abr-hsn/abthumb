@@ -28,7 +28,7 @@ static bool find_in_registry(HKEY root, const wchar_t* base, wchar_t* out) {
         if (RegGetValueW(k, best, L"GS_DLL", RRF_RT_REG_SZ, nullptr, dll, &sz) == ERROR_SUCCESS) {
             wchar_t* slash = wcsrchr(dll, L'\\');
             if (slash) {
-                lstrcpyW(slash + 1, L"gswin64c.exe");
+                lstrcpynW(slash + 1, L"gswin64c.exe", (int)(MAX_PATH - (slash + 1 - dll)));  // bounded; truncation fails the attribute check
                 if (GetFileAttributesW(dll) != INVALID_FILE_ATTRIBUTES) { lstrcpynW(out, dll, MAX_PATH); ok = true; }
             }
         }
@@ -37,7 +37,7 @@ static bool find_in_registry(HKEY root, const wchar_t* base, wchar_t* out) {
     return ok;
 }
 
-bool ghostscript_available() {
+static bool ghostscript_available() {
     if (g_gs_state >= 0) return g_gs_state == 1;
     g_gs_state = 0;
     wchar_t v[MAX_PATH];
@@ -94,7 +94,8 @@ HRESULT render_ghostscript(const wchar_t* path, const abt_probe& pr, const Rende
     if (!ghostscript_available()) return E_NOTIMPL;
     float bw_pt = pr.bbox[2] - pr.bbox[0], bh_pt = pr.bbox[3] - pr.bbox[1];
     if (bw_pt <= 0 || bh_pt <= 0) { bw_pt = 612; bh_pt = 792; }
-    int bw = rq.cx > 0 ? rq.cx : 256, bh = rq.cy > 0 ? rq.cy : bw;
+    int bw, bh;
+    request_box(rq, &bw, &bh);
     double s = fmin(bw / (double)bw_pt, bh / (double)bh_pt);
     double dpi = 72.0 * s;
     if (dpi < 1) dpi = 1;

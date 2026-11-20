@@ -120,7 +120,7 @@ HRESULT decode_wmf(const uint8_t* data, size_t n, int edge, abt_image* out) {
         SetStretchBltMode(dc, HALFTONE);
         PlayEnhMetaFile(dc, emf, &rc);
         GdiFlush();
-        if (dib && abt_image_alloc(out, dw, dh) == ABT_OK && out->px) {
+        if (abt_image_alloc(out, dw, dh) == ABT_OK) {
             memcpy(out->px, dib, (size_t)dw * dh * 4);
             for (int i = 0; i < dw * dh; ++i) out->px[i * 4 + 3] = 255;
             hr = S_OK;
@@ -142,7 +142,8 @@ struct CmykXform {
 
 static HPROFILE open_profile_file(const wchar_t* name) {
     wchar_t dir[MAX_PATH], path[MAX_PATH];
-    if (!ExpandEnvironmentStringsW(L"%SystemRoot%\\System32\\spool\\drivers\\color", dir, MAX_PATH)) return nullptr;
+    DWORD dir_bytes = sizeof(dir);
+    if (!GetColorDirectoryW(nullptr, dir, &dir_bytes)) return nullptr;
     _snwprintf_s(path, MAX_PATH, _TRUNCATE, L"%s\\%s", dir, name);
     if (GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) return nullptr;
     PROFILE p = {PROFILE_FILENAME, path, (DWORD)((lstrlenW(path) + 1) * sizeof(wchar_t))};
