@@ -1,6 +1,7 @@
 #include "abt_decode.h"
 #include "abt_wic.h"
 #include "abt_reader.h"
+#include "abt_proto.h"
 #include <icm.h>
 #include <stdlib.h>
 
@@ -54,6 +55,8 @@ HRESULT decode_image_bytes(const uint8_t* data, size_t n, int edge, bool bgr_swa
                                   WICBitmapPaletteTypeCustom);
     }
     uint8_t* px = nullptr;
+    // A hostile embedded preview may claim up to 32768 x 32768 (w * h * 4 also wraps the UINT below).
+    if (SUCCEEDED(hr) && (uint64_t)w * h * 4 > ABT_MAX_PIXEL_BYTES) hr = E_FAIL;
     if (SUCCEEDED(hr)) {
         px = (uint8_t*)malloc((size_t)w * h * 4);
         hr = px ? conv->CopyPixels(nullptr, w * 4, w * h * 4, px) : E_OUTOFMEMORY;
