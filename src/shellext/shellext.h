@@ -14,9 +14,6 @@ const ExposeFlags& expose_flags();
 HRESULT create_thumbnail_provider(REFIID riid, void** ppv);
 HRESULT create_preview_handler(REFIID riid, void** ppv);
 
-// Draws the step-2 placeholder: label + size on a colour keyed by extension. BGRA, alpha 255.
-void draw_placeholder(void* bits, int w, int h, const wchar_t* path, const wchar_t* line2);
-
 #include <thumbcache.h>
 struct abt_resp;
 // One request to the agent (starts it on demand). *px is mem_alloc'd BGRA premultiplied.
