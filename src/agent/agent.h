@@ -33,6 +33,9 @@ void cache_close();
 // Returns true and fills img (+view) if a valid rendition with tier >= the tier for `edge` exists.
 // Negative entries return true with img->px == nullptr and view->flags & CF_NEGATIVE.
 bool cache_get(const FileKey& k, uint32_t page, int edge, abt_image* img, CacheEntryView* view);
+// Same lookup order and freshness tests as cache_get, but only consults the index (plus the small
+// info block when view is non-null): no body read, CRC check or decode. view may be null.
+bool cache_has(const FileKey& k, uint32_t page, int edge, CacheEntryView* view);
 void cache_put(const FileKey& k, uint32_t page, int edge, const abt_image* img, uint16_t flags,
                const abt_file_info& info);
 void cache_maintenance();   // eviction + compaction + index snapshot (call periodically)
@@ -58,6 +61,8 @@ Job* job_submit(const wchar_t* path, const FileKey& k, uint32_t page, int cx, in
                 Lane lane);
 // Waits for completion; returns false on timeout. On success copies the result (caller frees img).
 bool job_wait(Job* j, DWORD timeout_ms, JobResult* out);
+// Like job_wait but copies nothing; *hr (may be null) gets the result code.
+bool job_wait_done(Job* j, DWORD timeout_ms, HRESULT* hr);
 void job_release(Job* j);
 int jobs_pending(Lane min_lane);  // queued jobs in lanes >= min_lane
 

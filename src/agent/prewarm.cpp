@@ -32,13 +32,6 @@ static volatile LONG64 g_generation = 0;  // bumps on every new hint (lets long 
 
 bool prewarm_allowed() { return g_allowed != 0; }
 
-static bool supported(const wchar_t* name) {
-    const wchar_t* e = path_ext(name);
-    for (int i = 0; i < kExtensionCount; ++i)
-        if (!lstrcmpiW(e, kExtensions[i])) return true;
-    return false;
-}
-
 static volatile LONG g_typical_edge = 0;  // most recent size Explorer actually asked for
 
 int prewarm_typical_edge() { return g_typical_edge ? (int)g_typical_edge : 256; }
@@ -140,9 +133,8 @@ static bool take_upgrade(Upgrade* out) {
 // Waits for the render, then replaces Explorer's cached (embedded-preview) entry and tells
 // Explorer to repaint the item.
 static void process_upgrade(Upgrade& u, IThumbnailCache* tc) {
-    JobResult r;
-    bool ok = job_wait(u.job, 60000, &r) && SUCCEEDED(r.hr);
-    if (ok) abt_image_free(&r.img);
+    HRESULT hr = E_FAIL;
+    bool ok = job_wait_done(u.job, 60000, &hr) && SUCCEEDED(hr);
     job_release(u.job);
     if (!ok || !tc) return;
     IShellItem* item = nullptr;
@@ -205,7 +197,7 @@ static void process_folder(const Hint& h, IThumbnailCache* tc) {
     do {
         if (fd.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_OFFLINE | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS))
             continue;  // never trigger cloud-file downloads
-        if (!supported(fd.cFileName) || n >= kMax || !names) continue;
+        if (!is_supported_ext(fd.cFileName) || n >= kMax || !names) continue;
         size_t l = (size_t)lstrlenW(fd.cFileName) + 1;
         names[n] = (wchar_t*)mem_alloc(l * sizeof(wchar_t));
         if (names[n]) memcpy(names[n++], fd.cFileName, l * sizeof(wchar_t));
@@ -229,10 +221,7 @@ static void process_folder(const Hint& h, IThumbnailCache* tc) {
             _snwprintf_s(path, MAX_PATH, _TRUNCATE, L"%s\\%s", h.folder, names[i]);
             FileKey k;
             if (!file_key(path, &k)) continue;
-            abt_image img = {};
-            CacheEntryView v;
-            if (cache_get(k, ABT_PAGE_CANVAS, h.edge, &img, &v)) {  // already done
-                abt_image_free(&img);
+            if (cache_has(k, ABT_PAGE_CANVAS, h.edge, nullptr)) {  // already done
                 InterlockedIncrement64(&g_skipped_cached);
                 continue;
             }
@@ -250,8 +239,7 @@ static void process_folder(const Hint& h, IThumbnailCache* tc) {
         for (int i = base; i < end && !g_stop; ++i) {
             Job* j = pending[i - base];
             if (j) {
-                JobResult r;
-                if (job_wait(j, 30000, &r)) abt_image_free(&r.img);
+                job_wait_done(j, 30000, nullptr);
                 job_release(j);
                 pending[i - base] = nullptr;
             }

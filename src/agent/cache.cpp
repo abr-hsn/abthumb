@@ -224,19 +224,12 @@ static void seg_scan(Seg* s, uint64_t from) {
         if (h.renderer_ver == kRendererVersion) {
             Entry* e = insert_slot(h.key_hi, h.key_lo, h.page, h.tier);
             if (e) {
-                if (e->tier && e->tier != kTomb && e->rec_len && e->key_hi == h.key_hi) {
-                    // replacing an older record of the same slot (count already includes it)
-                    Seg* os = seg_by_id(e->seg);
-                    if (os) os->live -= e->rec_len;
-                    g_live_bytes -= e->rec_len;
-                }
+                // Live-byte counters are not maintained here: cache_open recomputes them from the index.
                 e->key_hi = h.key_hi; e->key_lo = h.key_lo; e->page = h.page; e->tier = h.tier;
                 e->file_size = h.file_size; e->mtime = h.mtime;
                 e->seg = s->id; e->offset = off; e->rec_len = h.rec_len;
                 e->width = h.width; e->height = h.height; e->flags = h.flags;
                 e->last_access = now_minutes();
-                s->live += h.rec_len;
-                g_live_bytes += h.rec_len;
             }
         }
         off += h.rec_len;
@@ -498,6 +491,50 @@ bool cache_get(const FileKey& k, uint32_t page, int edge, abt_image* img, CacheE
     }
     mem_free(body);
     return ok;
+}
+
+// Reads the info block of a record (header first, to check the length); lock held.
+static void read_info(const Entry* e, CacheEntryView* view) {
+    Seg* s = seg_by_id(e->seg);
+    RecHdr h = {};
+    if (s && pread(s->h, e->offset, &h, sizeof(h)) && h.magic == kRecMagic && h.info_len == sizeof(abt_file_info))
+        pread(s->h, e->offset + sizeof(h), &view->info, sizeof(abt_file_info));
+}
+
+bool cache_has(const FileKey& k, uint32_t page, int edge, CacheEntryView* view) {
+    if (!g_open) return false;
+    bool found = false;
+    AcquireSRWLockShared(&g_lock);
+    Entry* e = nullptr;
+    // Same order as cache_get: real renditions first, then the negative entry.
+    for (int t : kTiers) {
+        if (t < tier_for(edge)) continue;
+        e = find(k.hi, k.lo, page, (uint32_t)t);
+        if (!e || e->file_size != k.size || e->mtime != k.mtime) continue;
+        Seg* s = seg_by_id(e->seg);
+        if (!s || e->rec_len < sizeof(RecHdr) || e->rec_len > kMaxRec) continue;
+        found = true;
+        break;
+    }
+    bool negative = false;
+    if (!found) {
+        e = find(k.hi, k.lo, page, kNegTier);
+        negative = e && e->file_size == k.size && e->mtime == k.mtime;
+        found = negative;
+    }
+    if (found) {
+        InterlockedExchange(&e->last_access, now_minutes());
+        if (!negative) g_dirty = true;
+        if (view) {
+            memset(&view->info, 0, sizeof(view->info));
+            view->flags = e->flags;
+            view->width = negative ? 0 : e->width;
+            view->height = negative ? 0 : e->height;
+            read_info(e, view);
+        }
+    }
+    ReleaseSRWLockShared(&g_lock);
+    return found;
 }
 
 void cache_put(const FileKey& k, uint32_t page, int edge, const abt_image* img, uint16_t flags,

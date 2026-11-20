@@ -165,8 +165,7 @@ static void serve_image(const abt_req& req, const wchar_t* path, abt_resp* resp,
     if (req.msg == ABT_MSG_PREVIEW && (req.flags & ABT_RF_PREFETCH)) {
         // Neighbouring artboards for the preview pane: start the render and answer at once. The
         // pane's real request later finds it in the cache or joins the job still in flight.
-        if (cache_get(k, page, edge, img, &view)) {
-            abt_image_free(img);
+        if (cache_has(k, page, edge, &view)) {
             resp->hr = (view.flags & CF_NEGATIVE) ? S_FALSE : S_OK;
             resp->info = view.info;  // lets the pane learn that a page is empty before showing it
             lstrcpynA(resp->reason, "prefetch: cached", sizeof(resp->reason));
