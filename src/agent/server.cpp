@@ -452,7 +452,7 @@ bool server_start(int threads) {
     if (threads < 1) threads = 1;
     if (threads > (int)_countof(g_threads)) threads = (int)_countof(g_threads);
     for (int i = 0; i < threads; ++i) {
-        g_threads[g_nthreads] = CreateThread(nullptr, 64 << 10, server_thread, i == 0 ? g_first : INVALID_HANDLE_VALUE,
+        g_threads[g_nthreads] = CreateThread(nullptr, 512 << 10, server_thread, i == 0 ? g_first : INVALID_HANDLE_VALUE,
                                              STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
         if (g_threads[g_nthreads]) ++g_nthreads;
     }
