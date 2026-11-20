@@ -120,7 +120,7 @@ HRESULT decode_wmf(const uint8_t* data, size_t n, int edge, abt_image* out) {
         SetStretchBltMode(dc, HALFTONE);
         PlayEnhMetaFile(dc, emf, &rc);
         GdiFlush();
-        if (abt_image_alloc(out, dw, dh) == ABT_OK) {
+        if (dib && abt_image_alloc(out, dw, dh) == ABT_OK && out->px) {  // checks keep /analyze (C6387) quiet
             memcpy(out->px, dib, (size_t)dw * dh * 4);
             for (int i = 0; i < dw * dh; ++i) out->px[i * 4 + 3] = 255;
             hr = S_OK;
