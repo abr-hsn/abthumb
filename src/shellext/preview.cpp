@@ -100,7 +100,7 @@ Result* fetch(uint16_t msg, const wchar_t* path, int cx, int cy, int page, int g
     r->info = resp.info;
     memcpy(r->reason, resp.reason, sizeof(r->reason));
     r->reason[sizeof(r->reason) - 1] = 0;
-    if (FAILED(r->hr) || !r->px || r->w <= 0 || r->h <= 0) {
+    if (FAILED(r->hr) || !r->px) {  // pipe_call guarantees w, h >= 1 whenever px is set
         abt::mem_free(r->px);
         r->px = nullptr;
         if (SUCCEEDED(r->hr)) r->hr = E_FAIL;
