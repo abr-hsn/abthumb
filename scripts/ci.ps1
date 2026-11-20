@@ -139,7 +139,8 @@ if (-not $Quick) {
       $srcs = Source-Files @(".c", ".cpp") | Where-Object { $_ -like 'src/*' } | ForEach-Object { "$root\$($_ -replace '/', '\')" }
       $ErrorActionPreference = "Continue"
       $fail = 0
-      # A few parallel processes: clang-tidy is single-threaded per file.
+      # A few parallel processes: clang-tidy is single-threaded per file. The VS-bundled clang can lag the
+      # MSVC STL (STL1000 "expected Clang N or newer"); the STL check is irrelevant to static analysis.
       $procs = @()
       $logDir = "$b\tidy-logs"; New-Item -ItemType Directory -Force $logDir | Out-Null
       Remove-Item "$logDir\*" -Force -ErrorAction SilentlyContinue
@@ -151,7 +152,7 @@ if (-not $Quick) {
         while ($queue.Count -and $running.Count -lt 6) {
           $s = $queue.Dequeue(); $i++
           $log = "$logDir\$i.txt"
-          $p = Start-Process -FilePath $tidy -ArgumentList @("-p", "`"$b`"", "--quiet", "`"$s`"") -NoNewWindow -PassThru `
+          $p = Start-Process -FilePath $tidy -ArgumentList @("-p", "`"$b`"", "--quiet", "--extra-arg=-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH", "`"$s`"") -NoNewWindow -PassThru `
                  -RedirectStandardOutput $log -RedirectStandardError "$log.err"
           $null = $p.Handle  # keeps the exit code readable after exit (PS 5.1 quirk)
           $running += [pscustomobject]@{ P = $p; Log = $log; Src = $s }
