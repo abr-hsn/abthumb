@@ -174,7 +174,7 @@ int abt_xmp_find_thumbnails(const uint8_t* file, size_t fsize, size_t off, size_
         if (data && !data_end) break; /* unterminated: rescanning from the next hit would be quadratic */
         if (data && data_end > data) {
             /* width/height are siblings written before the image in Adobe's XMP; search a window around it */
-            const uint8_t* lo = hit - 1024 > base ? hit - 1024 : base;
+            const uint8_t* lo = (size_t)(hit - base) > 1024 ? hit - 1024 : base;
             abt_preview pv;
             memset(&pv, 0, sizeof(pv));
             pv.kind = ABT_PV_JPEG;
@@ -240,8 +240,7 @@ int abt_xmp_creator_tool(const uint8_t* d, size_t n, char* out, size_t cap) {
 
 /* ------------------------------------------------------------------ PDF / AI 9+ */
 
-/* Up to n decimal numbers separated by spaces/tabs (optional sign and fraction). Returns count. */
-static int parse_reals(const uint8_t* p, const uint8_t* e, double* v, int n) {
+int abt_parse_reals(const uint8_t* p, const uint8_t* e, double* v, int n) {
     int k = 0;
     while (k < n) {
         while (p < e && (*p == ' ' || *p == '\t')) ++p;
@@ -285,7 +284,7 @@ static void ai_art_bounds(const uint8_t* d, size_t n, abt_probe* out) {
     const uint8_t* lim = ps + win;
     while (e < lim && *e != '\r' && *e != '\n') ++e;
     double v[4];
-    if (parse_reals(b + skip, e, v, 4) != 4) return;
+    if (abt_parse_reals(b + skip, e, v, 4) != 4) return;
     for (int i = 0; i < 4; ++i)
         if (!(v[i] > -1e7 && v[i] < 1e7)) return;
     if (!(v[2] > v[0] && v[3] > v[1])) return;

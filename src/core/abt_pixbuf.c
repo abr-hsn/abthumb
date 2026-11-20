@@ -108,9 +108,7 @@ abt_status abt_pixbuf_to_bgra(const abt_pixbuf* pb, abt_cmyk_to_rgb_fn cmyk, voi
         free(cb); free(rb);
         break;
     }
-    default:
-        abt_image_free(out);
-        return ABT_E_UNSUPPORTED;
+    default: break; /* unreachable: cs validated above */
     }
     abt_image_scan_alpha(out);
     return ABT_OK;

@@ -6,14 +6,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Preview flag (private to EPS): the preview offset/length covers the hex text of a
-   "%BeginPhotoshop" block (lines "% 3842494D..."), not raw bytes. The JPEG inside is Photoshop
-   image resource 1036 and must be extracted with abt_eps_psres_jpeg(). */
-/* ABT_PVF_HEX_PSRES is defined in abt_probe.h */
-
-/* Decodes the hex block of pv, finds resource 1036 and returns a malloc'd copy of its JFIF bytes
-   (caller frees). Returns the byte count, 0 on failure. */
-
 #define DSC_HEADER_SCAN   (256u << 10)  /* header comments are scanned in this much of the PS section */
 #define PREVIEW_SCAN      (1u << 20)    /* %%BeginPreview / %BeginPhotoshop searched in this much */
 #define XMP_HEAD_SCAN     (4u << 20)
@@ -60,25 +52,6 @@ static const uint8_t* next_line(const uint8_t* p, const uint8_t* end) {
 static int starts(const uint8_t* p, const uint8_t* end, const char* s) {
     size_t l = strlen(s);
     return (size_t)(end - p) >= l && memcmp(p, s, l) == 0;
-}
-
-/* Parses up to n decimal numbers (ints or floats, optional sign). Returns how many were read. */
-static int parse_nums(const uint8_t* p, const uint8_t* e, double* v, int n) {
-    int k = 0;
-    while (k < n) {
-        while (p < e && (*p == ' ' || *p == '\t')) ++p;
-        int neg = 0, any = 0;
-        double x = 0, scale = 0.1;
-        if (p < e && (*p == '-' || *p == '+')) neg = *p++ == '-';
-        while (p < e && *p >= '0' && *p <= '9') { x = x * 10 + (*p++ - '0'); any = 1; }
-        if (p < e && *p == '.') {
-            ++p;
-            while (p < e && *p >= '0' && *p <= '9') { x += (*p++ - '0') * scale; scale /= 10; any = 1; }
-        }
-        if (!any) break;
-        v[k++] = neg ? -x : x;
-    }
-    return k;
 }
 
 /* ------------------------------------------------------------------ DOS EPS previews */
@@ -185,7 +158,7 @@ size_t abt_eps_psres_jpeg(const uint8_t* file, size_t n, const abt_preview* pv, 
     const uint8_t *res, *jpg;
     size_t rlen, jlen = 0;
     uint32_t w, h;
-    if (psres_find(buf, blen, 1036, &res, &rlen) && thumb1036(res, rlen, &w, &h, &jpg, &jlen) && jlen) {
+    if (psres_find(buf, blen, 1036, &res, &rlen) && thumb1036(res, rlen, &w, &h, &jpg, &jlen)) {
         *jpeg = (uint8_t*)malloc(jlen);
         if (*jpeg) memcpy(*jpeg, jpg, jlen);
         else jlen = 0;
@@ -239,7 +212,7 @@ static void parse_bbox(const uint8_t* p, const uint8_t* e, double* v, int* have,
     double t[4];
     while (p < e && (*p == ' ' || *p == '\t')) ++p;
     if (starts(p, e, "(atend)")) { *atend = 1; return; }
-    if (parse_nums(p, e, t, 4) == 4) { memcpy(v, t, sizeof(t)); *have = 1; }
+    if (abt_parse_reals(p, e, t, 4) == 4) { memcpy(v, t, sizeof(t)); *have = 1; }
 }
 
 static void scan_header(const uint8_t* ps, size_t psn, dsc* h) {
@@ -300,7 +273,7 @@ static void scan_epsi(abt_probe* out, const uint8_t* d, const uint8_t* ps, size_
     if (!b) return;
     const uint8_t* e = line_end(b, end);
     double v[4];
-    if (parse_nums(b + 15, e, v, 3) < 3) return;
+    if (abt_parse_reals(b + 15, e, v, 3) < 3) return;
     if (!(v[0] >= 1 && v[0] <= ABT_MAX_DIM && v[1] >= 1 && v[1] <= ABT_MAX_DIM && v[2] >= 1 && v[2] <= 8)) return;
     uint32_t depth = (uint32_t)v[2];
     if (depth != 1 && depth != 2 && depth != 4 && depth != 8) return;
