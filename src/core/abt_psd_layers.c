@@ -350,11 +350,9 @@ static float* make_mask_plane(ctx* c, const layer* L, int rx0, int ry0, int rx1,
     if (!pl) { c->st = ABT_E_NOMEM; return NULL; }
     float def = L->mdef / 255.0f;
     for (size_t i = 0; i < pw * ph; ++i) pl[i] = def;
-    geom g;
-    long long mwl = (long long)L->mright - L->mleft, mhl = (long long)L->mbottom - L->mtop;
-    if (L->ch[SLOT_MASK].len < 2 || mwl <= 0 || mhl <= 0 || mwl > 300000 || mhl > 300000) return pl;
-    int mw = (int)mwl, mh = (int)mhl;
+    geom g; /* make_geom rejects empty or oversized mask rectangles */
     if (!make_geom(c, L->mleft, L->mtop, L->mright, L->mbottom, rx0, ry0, rx1, ry1, &g)) return pl;
+    int mw = L->mright - L->mleft, mh = L->mbottom - L->mtop;
     csrc s;
     if (!csrc_init(&s, c, &L->ch[SLOT_MASK], mw, mh)) return pl;
     int vw = g.vx1 - g.vx0, vh = g.vy1 - g.vy0, cw = g.sr - g.sl, chh = g.sb - g.st;

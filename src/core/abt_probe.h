@@ -87,6 +87,10 @@ int abt_xmp_creator_tool(const uint8_t* data, size_t size, char* out, size_t cap
 /* Reads a numeric XMP property (element or attribute form), 0 if absent. */
 float abt_xmp_float(const uint8_t* data, size_t size, const char* name);
 
+/* Up to n decimal numbers in [p, e) separated by spaces/tabs (optional sign and fraction; digits past
+   the 11th of the integer part are ignored). Returns how many were read. */
+int abt_parse_reals(const uint8_t* p, const uint8_t* e, double* v, int n);
+
 /* base64 decode tolerant of whitespace and XML character references (&#xA; &#10;).
    Returns decoded byte count; output buffer must hold at least len*3/4+3 bytes. */
 size_t abt_base64_decode(const uint8_t* in, size_t len, uint8_t* out);
