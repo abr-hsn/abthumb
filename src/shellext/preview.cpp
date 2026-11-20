@@ -136,6 +136,14 @@ void prefetch_neighbours(Shared* s, const wchar_t* path, int cx, int cy, int pag
     }
 }
 
+// mem_alloc'd copy of a NUL-terminated path, or null.
+wchar_t* dup_path(const wchar_t* p) {
+    size_t n = (size_t)lstrlenW(p) + 1;
+    wchar_t* d = (wchar_t*)abt::mem_alloc(n * sizeof(wchar_t));
+    if (d) memcpy(d, p, n * sizeof(wchar_t));
+    return d;
+}
+
 DWORD WINAPI request_thread(void* arg) {
     Shared* s = (Shared*)arg;
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
@@ -147,11 +155,7 @@ DWORD WINAPI request_thread(void* arg) {
         int gen = s->gen, file_gen = s->file_gen, cx = s->cx, cy = s->cy, page = s->page;
         int count = s->count, dir = s->dir;
         wchar_t* path = nullptr;
-        if (has && s->path) {
-            size_t n = (size_t)lstrlenW(s->path) + 1;
-            path = (wchar_t*)abt::mem_alloc(n * sizeof(wchar_t));
-            if (path) memcpy(path, s->path, n * sizeof(wchar_t));
-        }
+        if (has && s->path) path = dup_path(s->path);
         s->has_req = false;
         ReleaseSRWLockExclusive(&s->lock);
         if (stop) { abt::mem_free(path); break; }
@@ -420,14 +424,9 @@ class PreviewHandler final : public IPreviewHandler,
     }
     // Takes the pixels of a result into a cached bitmap; returns the slot (or null).
     PageBmp* cache_put(Result* r) {
-        void* bits = nullptr;
-        HBITMAP bmp = abt::create_dib32(r->w, r->h, &bits);
-        if (!bmp) return nullptr;
-        size_t n = (size_t)r->w * r->h;
-        memcpy(bits, r->px, n * 4);  // premultiplied: ready for AlphaBlend
         bool alpha = false;
-        for (size_t i = 0; i < n; ++i)
-            if (r->px[i * 4 + 3] != 255) { alpha = true; break; }
+        HBITMAP bmp = bmp_from(r, &alpha);
+        if (!bmp) return nullptr;
         PageBmp* slot = nullptr;
         for (int i = 0; i < kPageCache; ++i) {  // replace the same page, else a free slot, else the LRU
             PageBmp& c = m_cache[i];
@@ -493,9 +492,7 @@ class PreviewHandler final : public IPreviewHandler,
         m_shared->want_pixels = want_pixels;
         m_shared->has_req = true;
         abt::mem_free(m_shared->path);
-        size_t n = (size_t)lstrlenW(m_path) + 1;
-        m_shared->path = (wchar_t*)abt::mem_alloc(n * sizeof(wchar_t));
-        if (m_shared->path) memcpy(m_shared->path, m_path, n * sizeof(wchar_t));
+        m_shared->path = dup_path(m_path);
         ReleaseSRWLockExclusive(&m_shared->lock);
         SetEvent(m_shared->wake);
     }

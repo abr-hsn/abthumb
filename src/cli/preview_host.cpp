@@ -17,7 +17,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
     wchar_t dir[MAX_PATH], dll[MAX_PATH];
-    abt::module_dir(nullptr, dir, MAX_PATH);
+    if (!abt::module_dir(nullptr, dir, MAX_PATH)) { CoUninitialize(); return 2; }
     _snwprintf_s(dll, MAX_PATH, _TRUNCATE, L"%s\\abthumb.dll", dir);
     HMODULE mod = LoadLibraryExW(dll, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
     if (!mod) { abt::logf("cannot load %ls (%lu)", dll, GetLastError()); return 2; }

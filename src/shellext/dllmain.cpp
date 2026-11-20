@@ -9,25 +9,6 @@ static LONG g_dll_refs = 0;
 void dll_addref() { InterlockedIncrement(&g_dll_refs); }
 void dll_release() { InterlockedDecrement(&g_dll_refs); }
 
-static ExposeFlags g_expose = {false, true, true};
-static INIT_ONCE g_expose_once = INIT_ONCE_STATIC_INIT;
-
-// The shell prefers IInitializeWithStream when offered, and a stream only carries the file
-// name, not the path (E1). We need the path (cache key, worker reads the file), so the stream
-// interface is off unless HKCU\Software\abthumb\Debug\Stream=1.
-static BOOL CALLBACK expose_init(PINIT_ONCE, PVOID, PVOID*) {
-    const wchar_t* k = ABT_REG_ROOT L"\\Debug";
-    g_expose.stream = abt::reg_get_dword(HKEY_CURRENT_USER, k, L"Stream", 0) != 0;
-    g_expose.item = abt::reg_get_dword(HKEY_CURRENT_USER, k, L"NoItem", 0) == 0;
-    g_expose.file = abt::reg_get_dword(HKEY_CURRENT_USER, k, L"NoFile", 0) == 0;
-    return TRUE;
-}
-
-const ExposeFlags& expose_flags() {
-    InitOnceExecuteOnce(&g_expose_once, expose_init, nullptr, nullptr);
-    return g_expose;
-}
-
 namespace {
 
 typedef HRESULT (*CreateFn)(REFIID, void**);

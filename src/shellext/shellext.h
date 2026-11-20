@@ -7,10 +7,6 @@ extern HINSTANCE g_dll;
 void dll_addref();
 void dll_release();
 
-// Debug switches for experiment E1 (HKCU\Software\abthumb\Debug: NoStream/NoItem/NoFile = 1).
-struct ExposeFlags { bool stream, item, file; };
-const ExposeFlags& expose_flags();
-
 HRESULT create_thumbnail_provider(REFIID riid, void** ppv);
 HRESULT create_preview_handler(REFIID riid, void** ppv);
 
