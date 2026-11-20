@@ -386,6 +386,7 @@ abt_status abt_qoi_decode(const uint8_t* d, size_t n, abt_image* out) {
     if (w == 0 || h == 0 || (uint64_t)w * h > (uint64_t)(n - 22) * 62u) return ABT_E_FORMAT;
     abt_status st = abt_image_alloc(out, (int)w, (int)h);
     if (st) return st;
+    if (!out->px) return ABT_E_NOMEM; /* never true after ABT_OK; keeps /analyze (C6387) from flagging memcpy */
     size_t npx = (size_t)w * h, p = 14, end = n - 8;
     uint8_t index[64][4];
     memset(index, 0, sizeof(index));
