@@ -77,7 +77,7 @@ Lanes in strict priority: `FOREGROUND` (Explorer waiting) > `PREVIEW` > `VISIBLE
 
 ## 4. DLL
 
-* `ThumbnailProvider` (`IThumbnailProvider`, `IInitializeWithItem`, `IInitializeWithStream`, `IInitializeWithFile`): send THUMB, create a top-down 32 bpp DIB section, copy, return `WTSAT_ARGB` when the image has alpha else `WTSAT_RGB`.
+* `ThumbnailProvider` (`IThumbnailProvider`, `IInitializeWithItem`, `IInitializeWithFile` (no `IInitializeWithStream`, D-007)): send THUMB, create a top-down 32 bpp DIB section, copy, return `WTSAT_ARGB` when the image has alpha else `WTSAT_RGB`.
 * `PreviewHandler` (`IPreviewHandler`, `IInitializeWithItem/File/Stream`, `IObjectWithSite`, `IOleWindow`, `IPreviewHandlerVisuals`): child window, render request at pane device pixels on a background thread, re-request on resize (debounced 120 ms) when the pane grows past the current image, page navigation with arrow keys / wheel, info strip (format, version, size, colour mode, artboards/pages).
 * Fallback if the stream path is used (non-file items): the DLL copies the stream into a temporary file under `%LOCALAPPDATA%\abthumb\tmp` and sends that path (rare; such items are not cached).
 
