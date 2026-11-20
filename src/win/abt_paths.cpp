@@ -37,13 +37,6 @@ const wchar_t* path_ext(const wchar_t* path) {
     return dot ? dot : L"";
 }
 
-void to_utf8(const wchar_t* w, char* out, size_t cap) {
-    if (!cap) return;
-    int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, out, (int)cap, nullptr, nullptr);
-    if (n <= 0) out[0] = 0;
-    out[cap - 1] = 0;
-}
-
 DWORD reg_get_dword(HKEY root, const wchar_t* key, const wchar_t* name, DWORD def) {
     DWORD v = 0, sz = sizeof(v);
     if (RegGetValueW(root, key, name, RRF_RT_REG_DWORD, nullptr, &v, &sz) == ERROR_SUCCESS) return v;

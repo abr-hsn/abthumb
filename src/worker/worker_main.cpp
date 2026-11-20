@@ -53,7 +53,6 @@ int wmain(int argc, wchar_t** argv) {
     abt::log_init(L"worker");
     if (background) enter_background_mode();
     if (FAILED(CoInitializeEx(nullptr, COINIT_MULTITHREADED))) return 1;
-    abt::render_init(background);
 
     HANDLE in = GetStdHandle(STD_INPUT_HANDLE);
     HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);

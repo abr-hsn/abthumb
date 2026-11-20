@@ -44,8 +44,6 @@ const wchar_t* path_ext(const wchar_t* path);
 // reading them is slow and can stall, so they get short deadlines and no folder pre-warm.
 // Pure path + GetDriveType check, no I/O on the share itself.
 bool is_slow_path(const wchar_t* path);
-// UTF-16 -> UTF-8 into fixed buffer (truncates safely).
-void to_utf8(const wchar_t* w, char* out, size_t cap);
 
 // ---- registry helpers
 DWORD reg_get_dword(HKEY root, const wchar_t* key, const wchar_t* name, DWORD def);
