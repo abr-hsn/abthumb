@@ -3,10 +3,25 @@
 $ErrorActionPreference = "SilentlyContinue"
 $dir = Join-Path $env:LOCALAPPDATA "Microsoft\Windows\Explorer"
 $me = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-# Only this user's Explorer processes.
-Get-CimInstance Win32_Process -Filter "Name='explorer.exe'" | Where-Object {
-    (Invoke-CimMethod -InputObject $_ -MethodName GetOwnerSid).Sid -eq $me
-} | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
-Start-Sleep -Milliseconds 800
-Get-ChildItem $dir -Filter "thumbcache_*.db" | ForEach-Object { Remove-Item $_.FullName -Force }
-Start-Process (Join-Path $env:SystemRoot "explorer.exe")
+
+function Get-MyExplorer {
+    Get-CimInstance Win32_Process -Filter "Name='explorer.exe'" | Where-Object {
+        (Invoke-CimMethod -InputObject $_ -MethodName GetOwnerSid).Sid -eq $me
+    }
+}
+
+# Stop only this user's Explorer processes and retry cache deletion briefly (Windows may release
+# handles slightly after exit or auto-restart Explorer).
+Get-MyExplorer | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+for ($attempt = 0; $attempt -lt 6; $attempt++) {
+    Start-Sleep -Milliseconds 300
+    $left = @(Get-ChildItem $dir -Filter "thumbcache_*.db")
+    if (-not $left.Count) { break }
+    foreach ($f in $left) { Remove-Item -LiteralPath $f.FullName -Force }
+}
+
+# Only start Explorer if Winlogon's AutoRestartShell did not already bring it back (avoids popping
+# an unexpected File Explorer window on Windows 11).
+if (-not @(Get-MyExplorer).Count) {
+    Start-Process (Join-Path $env:SystemRoot "explorer.exe")
+}

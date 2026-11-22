@@ -17,14 +17,11 @@ using namespace abt;
 
 static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     switch (m) {
-    case WM_TIMER:
-        cache_maintenance();
-        return 0;
     case WM_QUERYENDSESSION:
         return TRUE;
     case WM_ENDSESSION:
-        if (w) {  // the session is really ending: flush the index snapshot, then quit
-            cache_maintenance();
+        if (w) {  // the session is really ending: flush snapshot only (no 2s compaction), then quit
+            cache_flush_snapshot();
             agent_request_quit();
         }
         return 0;
@@ -38,12 +35,19 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     return DefWindowProcW(h, m, w, l);
 }
 
-static int default_bg_workers() {
-    // Hybrid CPUs: background work runs on E-cores under EcoQoS; keep it modest either way.
+static int default_fg_workers() {
     SYSTEM_INFO si;
     GetSystemInfo(&si);
-    int n = (int)si.dwNumberOfProcessors / 8;
-    return n < 1 ? 1 : (n > 3 ? 3 : n);
+    int n = (int)si.dwNumberOfProcessors / 4;
+    return n < 2 ? 2 : (n > 6 ? 6 : n);
+}
+
+static int default_bg_workers() {
+    // Hybrid CPUs: background work runs on E-cores under EcoQoS; scale modestly with core count.
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    int n = (int)si.dwNumberOfProcessors / 4;
+    return n < 1 ? 1 : (n > 4 ? 4 : n);
 }
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
@@ -56,26 +60,39 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     pipe_name(pipe, _countof(pipe));
     _snwprintf_s(mutex_name, _countof(mutex_name), _TRUNCATE, L"Local\\abthumb.agent.%s", pipe + 9);
     HANDLE mutex = CreateMutexW(nullptr, TRUE, mutex_name);
-    if (!mutex || GetLastError() == ERROR_ALREADY_EXISTS) return 0;
+    if (!mutex || GetLastError() == ERROR_ALREADY_EXISTS) {
+        if (mutex) CloseHandle(mutex);
+        CoUninitialize();
+        return 0;
+    }
 
     // Reset any priority class inherited from whoever launched us (workers lower their own).
     SetPriorityClass(GetCurrentProcess(), NORMAL_PRIORITY_CLASS);
 
     const wchar_t* root = ABT_REG_ROOT;
     uint64_t cap_mb = reg_get_dword(HKEY_CURRENT_USER, root, L"CacheMaxMB", 5120);
-    int fg = (int)reg_get_dword(HKEY_CURRENT_USER, root, L"ForegroundWorkers", 2);
+    int fg = (int)reg_get_dword(HKEY_CURRENT_USER, root, L"ForegroundWorkers", (DWORD)default_fg_workers());
     int bg = (int)reg_get_dword(HKEY_CURRENT_USER, root, L"BackgroundWorkers", (DWORD)default_bg_workers());
     int threads = (int)reg_get_dword(HKEY_CURRENT_USER, root, L"ServerThreads", 8);
 
     wchar_t dir[MAX_PATH];
-    if (!app_data_dir(dir, MAX_PATH, L"cache")) return 2;
+    if (!app_data_dir(dir, MAX_PATH, L"cache")) {
+        ReleaseMutex(mutex);
+        CloseHandle(mutex);
+        CoUninitialize();
+        return 2;
+    }
     cache_open(dir, cap_mb << 20);
     pool_start(fg, bg);
     if (!server_start(threads)) {
         pool_stop();
         cache_close();
+        ReleaseMutex(mutex);
+        CloseHandle(mutex);
+        CoUninitialize();
         return 3;
     }
+    cache_maintenance_start();
     prewarm_start();
     logf("agent started: cache %llu MB, %d fg + %d bg workers", (unsigned long long)cap_mb, fg, bg);
 
@@ -85,7 +102,6 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     wc.lpszClassName = L"abthumbAgent";
     RegisterClassW(&wc);
     g_hwnd = CreateWindowExW(0, wc.lpszClassName, L"abthumb agent", 0, 0, 0, 0, 0, nullptr, nullptr, inst, nullptr);
-    SetTimer(g_hwnd, 1, 60 * 1000, nullptr);  // cache maintenance + snapshot every minute
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
         TranslateMessage(&msg);
@@ -95,8 +111,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     // Pool first: it cancels queued jobs, which wakes pipe threads waiting on them.
     pool_stop();
     prewarm_stop();
-    server_stop();
-    cache_close();
+    bool server_clean = server_stop();
+    cache_maintenance_stop();
+    if (server_clean) cache_close();
+    else cache_flush_snapshot();
     ReleaseMutex(mutex);
     CloseHandle(mutex);
     CoUninitialize();

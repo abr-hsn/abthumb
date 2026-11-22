@@ -75,7 +75,8 @@ Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile
 Filename: "{app}\abthumb-agent.exe"; Flags: runasoriginaluser nowait; StatusMsg: "Starting abthumb..."
 
 [UninstallRun]
-; Stop agents and workers (all sessions) before DllUnregisterServer restores the previous handlers.
+; Ask the agent to flush its cache snapshot and exit cleanly first, then force-stop any stragglers.
+Filename: "{app}\abthumb.exe"; Parameters: "stop-agent"; Flags: runhidden; RunOnceId: "GracefulStopAgent"
 Filename: "{sys}\taskkill.exe"; Parameters: "/F /T /IM abthumb-agent.exe"; Flags: runhidden; RunOnceId: "StopAgent"
 Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM abthumb-render.exe"; Flags: runhidden; RunOnceId: "StopRender"
 Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM abthumb-preview.exe"; Flags: runhidden; RunOnceId: "StopPreview"
@@ -88,29 +89,54 @@ Type: dirifempty; Name: "{app}"
 [Code]
 const
   MOVEFILE_DELAY_UNTIL_REBOOT = 4;
+  FILE_ATTRIBUTE_REPARSE_POINT = $0400;
 
 function MoveFileEx(lpExistingFileName, lpNewFileName: string; dwFlags: Cardinal): Boolean;
   external 'MoveFileExW@kernel32.dll stdcall';
 
+function GetFileAttributesW(lpFileName: string): Cardinal;
+  external 'GetFileAttributesW@kernel32.dll stdcall';
+
+function IsReparsePoint(const Path: string): Boolean;
+var
+  Attr: Cardinal;
+begin
+  Attr := GetFileAttributesW(Path);
+  Result := (Attr <> $FFFFFFFF) and ((Attr and FILE_ATTRIBUTE_REPARSE_POINT) <> 0);
+end;
+
 procedure StopOurProcesses();
 var
+  Cli: string;
   Code: Integer;
 begin
+  { Try a graceful stop first so the agent flushes its cache snapshot cleanly. }
+  Cli := ExpandConstant('{app}\abthumb.exe');
+  if FileExists(Cli) then begin
+    Exec(Cli, 'stop-agent', '', SW_HIDE, ewWaitUntilTerminated, Code);
+    Sleep(500);
+  end;
   Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /T /IM abthumb-agent.exe', '', SW_HIDE, ewWaitUntilTerminated, Code);
   Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM abthumb-render.exe', '', SW_HIDE, ewWaitUntilTerminated, Code);
   Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM abthumb-preview.exe', '', SW_HIDE, ewWaitUntilTerminated, Code);
 end;
 
-{ Explorer (and its thumbnail host) keep abthumb.dll loaded. A loaded DLL cannot be overwritten
-  but can be renamed: move it aside and delete it at the next reboot, so the new one can be
-  copied without closing Explorer and without asking for a restart. }
+{ Explorer (and its thumbnail host) keep abthumb.dll loaded, and a still-loaded DLL can respawn
+  abthumb-agent.exe during upgrade. Move locked binaries aside and delete them at next reboot. }
 procedure MoveAsideIfLocked(const Name: string);
 var
-  Path, Old: string;
+  Path, Base, Old: string;
+  N: Integer;
 begin
   Path := ExpandConstant('{app}\') + Name;
   if not FileExists(Path) then Exit;
-  Old := Path + '.old-' + GetDateTimeString('yyyymmddhhnnss', #0, #0);
+  Base := Path + '.old-' + GetDateTimeString('yyyymmddhhnnss', #0, #0);
+  Old := Base;
+  N := 1;
+  while FileExists(Old) and (N < 100) do begin
+    Old := Base + '-' + IntToStr(N);
+    N := N + 1;
+  end;
   if RenameFile(Path, Old) then begin
     if not DeleteFile(Old) then
       MoveFileEx(Old, '', MOVEFILE_DELAY_UNTIL_REBOOT);
@@ -123,17 +149,24 @@ begin
   StopOurProcesses();
   MoveAsideIfLocked('abthumb.dll');
   MoveAsideIfLocked('pdfium.dll');
+  MoveAsideIfLocked('abthumb-agent.exe');
+  MoveAsideIfLocked('abthumb-render.exe');
   { Uninstall entry of the earlier script-based installer, replaced by Inno's own. }
   RegDeleteKeyIncludingSubkeys(HKLM, 'Software\Microsoft\Windows\CurrentVersion\Uninstall\abthumb');
   Result := '';
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+var
+  DataDir, CacheDir: string;
 begin
   if CurUninstallStep = usPostUninstall then begin
-    { Thumbnail cache and logs of the user who runs the uninstaller (other users' caches are
-      plain thumbnail files under their own %LOCALAPPDATA%\abthumb and are harmless). }
-    DelTree(ExpandConstant('{localappdata}\abthumb'), True, True, True);
+    { Thumbnail cache and logs of the user running the uninstaller. Refuse to recurse into
+      reparse points/junctions since uninstall runs elevated. }
+    DataDir := ExpandConstant('{localappdata}\abthumb');
+    CacheDir := DataDir + '\cache';
+    if DirExists(DataDir) and (not IsReparsePoint(DataDir)) and (not IsReparsePoint(CacheDir)) then
+      DelTree(DataDir, True, True, True);
     RegDeleteKeyIncludingSubkeys(HKCU, 'Software\abthumb');
   end;
 end;

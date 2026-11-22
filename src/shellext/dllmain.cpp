@@ -4,7 +4,7 @@
 #include <strsafe.h>
 
 HINSTANCE g_dll = nullptr;
-static LONG g_dll_refs = 0;
+static volatile LONG g_dll_refs = 0;
 
 void dll_addref() { InterlockedIncrement(&g_dll_refs); }
 void dll_release() { InterlockedDecrement(&g_dll_refs); }
@@ -14,7 +14,7 @@ namespace {
 typedef HRESULT (*CreateFn)(REFIID, void**);
 
 class ClassFactory final : public IClassFactory {
-    LONG m_ref = 1;
+    volatile LONG m_ref = 1;
     CreateFn m_create;
 
 public:
@@ -22,6 +22,7 @@ public:
     ~ClassFactory() { dll_release(); }
 
     IFACEMETHODIMP QueryInterface(REFIID riid, void** ppv) override {
+        if (!ppv) return E_POINTER;
         static const QITAB qit[] = {QITABENT(ClassFactory, IClassFactory), {}};
         return QISearch(this, qit, riid, ppv);
     }
@@ -32,6 +33,7 @@ public:
         return (ULONG)r;
     }
     IFACEMETHODIMP CreateInstance(IUnknown* outer, REFIID riid, void** ppv) override {
+        if (!ppv) return E_POINTER;
         *ppv = nullptr;
         if (outer) return CLASS_E_NOAGGREGATION;
         return m_create(riid, ppv);
@@ -52,12 +54,13 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, void*) {
     return TRUE;
 }
 
-STDAPI DllCanUnloadNow() { return g_dll_refs == 0 ? S_OK : S_FALSE; }
+STDAPI DllCanUnloadNow() { return InterlockedCompareExchange(&g_dll_refs, 0, 0) == 0 ? S_OK : S_FALSE; }
 
 // Live COM objects + factories + server locks; used by abthumb-preview.exe for idle exit.
-extern "C" LONG WINAPI AbtObjectCount() { return g_dll_refs; }
+extern "C" LONG WINAPI AbtObjectCount() { return InterlockedCompareExchange(&g_dll_refs, 0, 0); }
 
 STDAPI DllGetClassObject(REFCLSID clsid, REFIID riid, void** ppv) {
+    if (!ppv) return E_POINTER;
     *ppv = nullptr;
     CreateFn fn = nullptr;
     if (IsEqualCLSID(clsid, CLSID_AbtThumbnailProvider)) fn = create_thumbnail_provider;

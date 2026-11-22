@@ -1,7 +1,7 @@
 // Job scheduling and the render-worker pool (D-005, D-017).
 // - Lanes in strict priority; identical in-flight jobs are coalesced.
 // - Each worker slot has one agent thread doing blocking I/O with its worker process; a
-//   watchdog kills workers that pass their deadline (the blocked read then fails cleanly).
+//   watchdog sleeps when idle and kills workers that pass their deadline.
 // - Workers live in a job object: memory cap, kill-on-close, no error UI.
 #include "agent.h"
 #include <objbase.h>
@@ -24,13 +24,14 @@ struct Job {
 
 struct Slot {
     bool background;
+    bool prespawn;  // pre-warm this worker asynchronously on startup
     HANDLE proc, in_w, out_r;
     DWORD pid;
     volatile LONG64 deadline;  // GetTickCount64 value, 0 = idle, -1 = killed by the watchdog
     SRWLOCK proc_lock;         // guards proc against the watchdog (zero-initialised = SRWLOCK_INIT)
     Job* job;
     HANDLE thread;
-    uint64_t jobs_done;
+    volatile LONG64 jobs_done;
 };
 
 static SRWLOCK g_lock = SRWLOCK_INIT;
@@ -40,11 +41,16 @@ static Job* g_tail[LANE_COUNT];
 static Job* g_active;  // queued or running jobs (for coalescing)
 static Slot g_slots[16];
 static int g_nslots = 0;
+static int g_bg_workers = 1;
 static HANDLE g_job_obj = nullptr;
 static HANDLE g_watchdog = nullptr;
+static HANDLE g_wd_wake = nullptr;
+static volatile LONG g_busy_slots = 0;
 static volatile bool g_stop = false;
 static wchar_t g_worker_exe[MAX_PATH];
 static volatile LONG64 g_lane_done[LANE_COUNT], g_crashes, g_kills;
+
+int pool_bg_workers() { return g_bg_workers; }
 
 static DWORD lane_timeout_ms(Lane l) {
     switch (l) {
@@ -58,7 +64,7 @@ static DWORD lane_timeout_ms(Lane l) {
 
 static void job_free(Job* j) {
     if (j->done) CloseHandle(j->done);
-    abt_image_free(&j->res.img);
+    pixbuf_release(j->res.pix);
     mem_free(j->path);
     mem_free(j);
 }
@@ -88,15 +94,20 @@ static bool queue_remove(Job* j) {
 Job* job_submit(const wchar_t* path, const FileKey& k, uint32_t page, int cx, int cy, uint32_t mode, uint32_t flags,
                 Lane lane) {
     int tier = tier_for(cx > cy ? cx : cy);
+    const uint32_t match_mask = ~(uint32_t)(ABT_RF_NO_CACHE | ABT_RF_FROM_PREWARM | ABT_RF_PREFETCH);
     AcquireSRWLockExclusive(&g_lock);
     if (g_stop) { ReleaseSRWLockExclusive(&g_lock); return nullptr; }  // shutting down: nobody would run it
     for (Job* a = g_active; a; a = a->anext) {
-        if (a->key.hi == k.hi && a->key.lo == k.lo && a->key.mtime == k.mtime && a->page == page &&
-            a->tier == tier && a->mode == mode) {
+        if (a->key.hi == k.hi && a->key.lo == k.lo && a->key.size == k.size && a->key.mtime == k.mtime &&
+            a->page == page && a->tier == tier && a->mode == mode &&
+            (a->flags & match_mask) == (flags & match_mask)) {
             InterlockedIncrement(&a->refs);
+            // If a normal cacheable request joins a NO_CACHE job, allow caching the result.
+            if (!(flags & ABT_RF_NO_CACHE)) a->flags &= ~ABT_RF_NO_CACHE;
             if (lane < a->lane && queue_remove(a)) {  // still queued: promote
                 a->lane = lane;
                 queue_push(a);
+                WakeAllConditionVariable(&g_cv);
             }
             ReleaseSRWLockExclusive(&g_lock);
             return a;
@@ -128,20 +139,25 @@ Job* job_submit(const wchar_t* path, const FileKey& k, uint32_t page, int cx, in
     return j;
 }
 
+void job_promote(Job* j, Lane lane) {
+    if (!j) return;
+    AcquireSRWLockExclusive(&g_lock);
+    if (lane < j->lane && queue_remove(j)) {
+        j->lane = lane;
+        queue_push(j);
+        WakeAllConditionVariable(&g_cv);
+    }
+    ReleaseSRWLockExclusive(&g_lock);
+}
+
 bool job_wait(Job* j, DWORD timeout_ms, JobResult* out) {
     if (WaitForSingleObject(j->done, timeout_ms) != WAIT_OBJECT_0) return false;
     *out = j->res;
-    out->img.px = nullptr;
-    if (j->res.img.px) {
-        size_t n = (size_t)j->res.img.w * j->res.img.h * 4;
-        out->img.px = (uint8_t*)malloc(n);
-        if (out->img.px) memcpy(out->img.px, j->res.img.px, n);
-        else out->hr = E_OUTOFMEMORY;
-    }
+    pixbuf_addref(out->pix);
     return true;
 }
 
-// Completion only: no image copy. *hr (optional) receives the job's result code, which the worker
+// Completion only: no image ref. *hr (optional) receives the job's result code, which the worker
 // stores before signalling done.
 bool job_wait_done(Job* j, DWORD timeout_ms, HRESULT* hr) {
     if (WaitForSingleObject(j->done, timeout_ms) != WAIT_OBJECT_0) return false;
@@ -188,14 +204,12 @@ static void finish(Job* j) {
     job_release(j);  // scheduler reference
 }
 
-// ------------------------------------------------------------------ worker processes
-
 // ------------------------------------------------------------------ worker sandbox
 // Workers parse untrusted files, so they run with a low-integrity copy of our token: they can
 // still read what the user can read (they must), but cannot write to the user's files, registry
 // or processes. Opt-out for troubleshooting: HKCU\Software\abthumb\WorkerLowIntegrity = 0.
 static HANDLE g_worker_token = nullptr;
-static volatile bool g_token_failed = false;  // set by any slot; the token itself is closed only in pool_stop
+static volatile LONG g_token_failed = 0;  // latched only on permanent privilege/policy errors
 
 static HANDLE make_worker_token() {
     if (!reg_get_dword(HKEY_CURRENT_USER, ABT_REG_ROOT, L"WorkerLowIntegrity", 1)) return nullptr;
@@ -225,9 +239,9 @@ static void slot_close(Slot* s) {
     AcquireSRWLockExclusive(&s->proc_lock);
     if (s->proc) CloseHandle(s->proc);
     s->proc = nullptr;
+    s->pid = 0;
     ReleaseSRWLockExclusive(&s->proc_lock);
     s->in_w = s->out_r = nullptr;
-    s->pid = 0;
 }
 
 // Asks the worker to exit, kills it if it has not within wait_ms, then releases the slot's handles.
@@ -235,7 +249,7 @@ static void slot_quit(Slot* s, DWORD wait_ms) {
     abt_req q;
     init_req(&q, ABT_MSG_QUIT, 0);
     write_all(s->in_w, &q, sizeof(q));
-    if (WaitForSingleObject(s->proc, wait_ms) != WAIT_OBJECT_0) TerminateProcess(s->proc, 0);
+    if (s->proc && WaitForSingleObject(s->proc, wait_ms) != WAIT_OBJECT_0) TerminateProcess(s->proc, 0);
     slot_close(s);
 }
 
@@ -243,7 +257,7 @@ static bool slot_spawn(Slot* s) {
     SECURITY_ATTRIBUTES sa = {sizeof(sa), nullptr, TRUE};
     HANDLE child_in = nullptr, child_out = nullptr;
     if (!CreatePipe(&child_in, &s->in_w, &sa, 1 << 16)) return false;
-    if (!CreatePipe(&s->out_r, &child_out, &sa, 1 << 20)) {
+    if (!CreatePipe(&s->out_r, &child_out, &sa, 4 << 20)) {
         CloseHandle(child_in); CloseHandle(s->in_w); s->in_w = nullptr;
         return false;
     }
@@ -254,13 +268,14 @@ static bool slot_spawn(Slot* s) {
     // remote or low-integrity locations, terminate on heap corruption.
     SIZE_T attr_size = 0;
     InitializeProcThreadAttributeList(nullptr, 2, 0, &attr_size);
-    LPPROC_THREAD_ATTRIBUTE_LIST attrs = (LPPROC_THREAD_ATTRIBUTE_LIST)mem_alloc(attr_size);
+    LPPROC_THREAD_ATTRIBUTE_LIST attrs = attr_size ? (LPPROC_THREAD_ATTRIBUTE_LIST)mem_alloc(attr_size) : nullptr;
     HANDLE inherit[2] = {child_in, child_out};
     DWORD64 mitigations = PROCESS_CREATION_MITIGATION_POLICY_EXTENSION_POINT_DISABLE_ALWAYS_ON |
                           PROCESS_CREATION_MITIGATION_POLICY_HEAP_TERMINATE_ALWAYS_ON |
                           PROCESS_CREATION_MITIGATION_POLICY_IMAGE_LOAD_NO_REMOTE_ALWAYS_ON |
                           PROCESS_CREATION_MITIGATION_POLICY_IMAGE_LOAD_NO_LOW_LABEL_ALWAYS_ON;
-    bool ok = attrs && InitializeProcThreadAttributeList(attrs, 2, 0, &attr_size) &&
+    bool attr_init = attrs && InitializeProcThreadAttributeList(attrs, 2, 0, &attr_size) != 0;
+    bool ok = attr_init &&
               UpdateProcThreadAttribute(attrs, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherit, sizeof(inherit), nullptr,
                                         nullptr) &&
               UpdateProcThreadAttribute(attrs, 0, PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY, &mitigations,
@@ -276,18 +291,24 @@ static bool slot_spawn(Slot* s) {
     _snwprintf_s(cmd, _countof(cmd), _TRUNCATE, L"\"%s\"%s", g_worker_exe, s->background ? L" --background" : L"");
     PROCESS_INFORMATION pi = {};
     const DWORD cflags = CREATE_SUSPENDED | CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT;
-    if (ok && g_worker_token && !g_token_failed) {
+    if (ok && g_worker_token && !InterlockedCompareExchange(&g_token_failed, 0, 0)) {
         ok = CreateProcessAsUserW(g_worker_token, g_worker_exe, cmd, nullptr, nullptr, TRUE, cflags, nullptr, nullptr,
                                   &si.StartupInfo, &pi) != 0;
-        if (!ok) {  // keep thumbnails working, but say so
-            logf("low-integrity worker spawn failed (%lu); using a normal worker", GetLastError());
-            g_token_failed = true;
+        if (!ok) {
+            DWORD err = GetLastError();
+            logf("low-integrity worker spawn failed (%lu); falling back to normal worker", err);
+            // Only permanently disable low-IL sandbox on persistent privilege/policy errors, not transient OOM.
+            if (err == ERROR_PRIVILEGE_NOT_HELD || err == ERROR_ACCESS_DENIED ||
+                err == ERROR_INVALID_PARAMETER || err == ERROR_NOT_SUPPORTED) {
+                InterlockedExchange(&g_token_failed, 1);
+            }
             ok = true;
         }
     }
     if (ok && !pi.hProcess)
         ok = CreateProcessW(g_worker_exe, cmd, nullptr, nullptr, TRUE, cflags, nullptr, nullptr, &si.StartupInfo, &pi) != 0;
-    if (attrs) { DeleteProcThreadAttributeList(attrs); mem_free(attrs); }
+    if (attr_init) DeleteProcThreadAttributeList(attrs);
+    mem_free(attrs);
     CloseHandle(child_in);
     CloseHandle(child_out);
     if (!ok) { logf("worker spawn failed: %lu", GetLastError()); slot_close(s); return false; }
@@ -302,14 +323,16 @@ static bool slot_spawn(Slot* s) {
     }
     ResumeThread(pi.hThread);
     CloseHandle(pi.hThread);
+    AcquireSRWLockExclusive(&s->proc_lock);
     s->proc = pi.hProcess;
     s->pid = pi.dwProcessId;
+    ReleaseSRWLockExclusive(&s->proc_lock);
     logf("worker %lu started (%s)", s->pid, s->background ? "background" : "foreground");
     return true;
 }
 
 // Deadline kills per file, newest 64 files (ring). Returns the count including this one.
-static struct { uint64_t hi, lo, mtime; int n; } g_killed[64];
+static struct { uint64_t hi, lo, size, mtime; int n; } g_killed[64];
 static int g_killed_pos = 0;
 static SRWLOCK g_killed_lock = SRWLOCK_INIT;
 
@@ -317,11 +340,11 @@ static int kill_count_bump(const FileKey& k) {
     AcquireSRWLockExclusive(&g_killed_lock);
     int n = 0;
     for (auto& e : g_killed)
-        if (e.n && e.hi == k.hi && e.lo == k.lo && e.mtime == k.mtime) { n = ++e.n; break; }
+        if (e.n && e.hi == k.hi && e.lo == k.lo && e.size == k.size && e.mtime == k.mtime) { n = ++e.n; break; }
     if (!n) {
         auto& e = g_killed[g_killed_pos];
         g_killed_pos = (g_killed_pos + 1) % (int)_countof(g_killed);
-        e.hi = k.hi; e.lo = k.lo; e.mtime = k.mtime; e.n = n = 1;
+        e.hi = k.hi; e.lo = k.lo; e.size = k.size; e.mtime = k.mtime; e.n = n = 1;
     }
     ReleaseSRWLockExclusive(&g_killed_lock);
     return n;
@@ -364,19 +387,25 @@ static void run_job(Slot* s, Job* j) {
     DWORD timeout = lane_timeout_ms(j->lane);
     req.deadline_ms = timeout > 1000 ? timeout - 500 : timeout;  // let the worker stop cleanly first
     InterlockedExchange64(&s->deadline, (LONG64)(GetTickCount64() + timeout));
+    if (InterlockedIncrement(&g_busy_slots) == 1 && g_wd_wake) SetEvent(g_wd_wake);
+
     abt_resp resp = {};
     bool ok = write_all(s->in_w, &req, sizeof(req)) && write_all(s->in_w, j->path, plen * sizeof(wchar_t)) &&
               read_all(s->out_r, &resp, sizeof(resp)) && resp.magic == ABT_MAGIC &&
+              resp.width <= ABT_MAX_REPLY_DIM && resp.height <= ABT_MAX_REPLY_DIM &&
               resp.pixel_len <= ABT_MAX_PIXEL_BYTES &&
               (!resp.pixel_len || resp.pixel_len == (uint64_t)resp.width * resp.height * 4u);
     if (ok && resp.pixel_len) {
-        if (abt_image_alloc(&r.img, (int)resp.width, (int)resp.height) != ABT_OK) ok = false;
-        else if (!read_all(s->out_r, r.img.px, resp.pixel_len)) { abt_image_free(&r.img); ok = false; }
-        else abt_image_scan_alpha(&r.img);
+        // Honor ABT_SRC_HAS_ALPHA from worker to avoid redundant full-image alpha scan.
+        int has_alpha = (resp.source & ABT_SRC_HAS_ALPHA) ? 1 : 0;
+        r.pix = pixbuf_alloc((int)resp.width, (int)resp.height, has_alpha);
+        if (!r.pix) ok = false;
+        else if (!read_all(s->out_r, r.pix->px, resp.pixel_len)) { pixbuf_release(r.pix); r.pix = nullptr; ok = false; }
     }
     LONG64 dl = InterlockedExchange64(&s->deadline, 0);
+    InterlockedDecrement(&g_busy_slots);
     // A worker the watchdog killed is never reused, even if its reply had already arrived.
-    if (dl == -1 && ok) { ok = false; abt_image_free(&r.img); }
+    if (dl == -1 && ok) { ok = false; pixbuf_release(r.pix); r.pix = nullptr; }
     if (!ok) {
         bool killed = dl == -1;  // watchdog marks with -1 after terminating
         DWORD code = 0;
@@ -392,10 +421,10 @@ static void run_job(Slot* s, Job* j) {
         lstrcpynA(r.reason, killed ? "render timed out" : "render worker crashed", sizeof(r.reason));
         return;
     }
-    s->jobs_done++;
+    InterlockedIncrement64(&s->jobs_done);
     // The worker parses untrusted files, so its reply is untrusted too.
     r.hr = resp.hr;
-    if (SUCCEEDED(r.hr) && !r.img.px && j->mode != ABT_MODE_PROBE) r.hr = E_FAIL;
+    if (SUCCEEDED(r.hr) && !r.pix && j->mode != ABT_MODE_PROBE) r.hr = E_FAIL;
     if (transient_error(r.hr)) r.transient = true;
     r.info = resp.info;
     r.info.creator[sizeof(r.info.creator) - 1] = 0;
@@ -408,21 +437,29 @@ static void run_job(Slot* s, Job* j) {
 
 static void store_result(Job* j) {
     const JobResult& r = j->res;
-    if (j->flags & ABT_RF_NO_CACHE) return;
-    if (SUCCEEDED(r.hr) && r.img.px) {
+    AcquireSRWLockShared(&g_lock);
+    uint32_t jflags = j->flags;
+    ReleaseSRWLockShared(&g_lock);
+    if (jflags & ABT_RF_NO_CACHE) return;
+    if (SUCCEEDED(r.hr) && r.pix) {
         uint16_t f = 0;
         if (r.source & ABT_SRC_EMBEDDED) f |= CF_EMBEDDED;
         if (r.source & ABT_SRC_RENDERED) f |= CF_RENDERED;
         if (r.source & ABT_SRC_SCALED) f |= CF_SCALED;
-        cache_put(j->key, j->page, j->tier, &r.img, f, r.info);
+        cache_put_async(j->key, j->page, j->tier, r.pix, f, r.info);
     } else if (j->mode == ABT_MODE_AUTO && FAILED(r.hr) && !r.transient) {
-        cache_put(j->key, j->page, j->tier, nullptr, CF_NEGATIVE, r.info);  // never retry until the file changes
+        cache_put_async(j->key, j->page, j->tier, nullptr, CF_NEGATIVE, r.info);
     }
 }
 
 static DWORD WINAPI slot_thread(void* p) {
     Slot* s = (Slot*)p;
-    if (FAILED(CoInitializeEx(nullptr, COINIT_MULTITHREADED))) return 1;
+    HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    if (FAILED(co)) {
+        logf("slot_thread CoInitializeEx failed: 0x%08lx", co);
+        return 1;
+    }
+    if (s->prespawn && !g_stop) slot_spawn(s);  // warm first foreground worker asynchronously
     ULONGLONG idle_since = GetTickCount64();
     for (;;) {
         AcquireSRWLockExclusive(&g_lock);
@@ -459,6 +496,7 @@ static DWORD WINAPI slot_thread(void* p) {
             continue;
         }
         run_job(s, j);
+        // Publish into RAM cache + async disk writer queue (~microseconds), then wake client immediately.
         store_result(j);
         AcquireSRWLockExclusive(&g_lock);
         s->job = nullptr;
@@ -473,11 +511,13 @@ static DWORD WINAPI slot_thread(void* p) {
 
 static DWORD WINAPI watchdog_thread(void*) {
     while (!g_stop) {
-        Sleep(50);
+        DWORD wait = InterlockedCompareExchange(&g_busy_slots, 0, 0) > 0 ? 100 : INFINITE;
+        WaitForSingleObject(g_wd_wake, wait);
+        if (g_stop) break;
         ULONGLONG now = GetTickCount64();
         for (int i = 0; i < g_nslots; ++i) {
             Slot* s = &g_slots[i];
-            LONG64 dl = s->deadline;
+            LONG64 dl = InterlockedCompareExchange64(&s->deadline, 0, 0);
             if (dl > 0 && now > (ULONGLONG)dl && InterlockedCompareExchange64(&s->deadline, -1, dl) == dl) {
                 AcquireSRWLockShared(&s->proc_lock);
                 if (s->proc) TerminateProcess(s->proc, 0xAB7);
@@ -493,11 +533,17 @@ bool pool_start(int fg, int bg) {
     module_dir(nullptr, dir, MAX_PATH);
     _snwprintf_s(g_worker_exe, MAX_PATH, _TRUNCATE, L"%s\\abthumb-render.exe", dir);
     g_job_obj = CreateJobObjectW(nullptr, nullptr);
+    const int kMaxSlots = (int)_countof(g_slots);
     if (fg < 1) fg = 1;
+    if (fg > kMaxSlots) fg = kMaxSlots;
     if (bg < 0) bg = 0;
-    if (fg + bg > (int)_countof(g_slots)) bg = (int)_countof(g_slots) - fg;
+    if (bg > kMaxSlots - fg) bg = kMaxSlots - fg;
+    g_bg_workers = bg > 0 ? bg : 1;
     g_worker_token = make_worker_token();
-    g_token_failed = false;
+    InterlockedExchange(&g_token_failed, 0);
+    g_stop = false;
+    InterlockedExchange(&g_busy_slots, 0);
+    g_wd_wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     logf("render workers: %s integrity", g_worker_token ? "low" : "normal");
     if (g_job_obj) {
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION li = {};
@@ -517,9 +563,10 @@ bool pool_start(int fg, int bg) {
         Slot* s = &g_slots[g_nslots++];
         memset(s, 0, sizeof(*s));
         s->background = i >= fg;
+        s->prespawn = (i == 0);
         s->thread = CreateThread(nullptr, 0, slot_thread, s, 0, nullptr);
     }
-    g_watchdog = CreateThread(nullptr, 0, watchdog_thread, nullptr, 0, nullptr);
+    if (g_wd_wake) g_watchdog = CreateThread(nullptr, 64 << 10, watchdog_thread, nullptr, STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
     return true;
 }
 
@@ -539,6 +586,7 @@ void pool_stop() {
     }
     WakeAllConditionVariable(&g_cv);
     ReleaseSRWLockExclusive(&g_lock);
+    if (g_wd_wake) SetEvent(g_wd_wake);
     while (Job* j = cancelled) {
         cancelled = j->next;
         j->next = nullptr;
@@ -551,14 +599,24 @@ void pool_stop() {
     DWORD n = 0;
     for (int i = 0; i < g_nslots; ++i)
         if (g_slots[i].thread) th[n++] = g_slots[i].thread;
-    if (n && WaitForMultipleObjects(n, th, TRUE, 3000) == WAIT_TIMEOUT && g_job_obj) {
-        TerminateJobObject(g_job_obj, 1);
-        WaitForMultipleObjects(n, th, TRUE, 3000);
+    bool all_exited = true;
+    if (n && WaitForMultipleObjects(n, th, TRUE, 3000) == WAIT_TIMEOUT) {
+        if (g_job_obj) TerminateJobObject(g_job_obj, 1);
+        all_exited = WaitForMultipleObjects(n, th, TRUE, 3000) != WAIT_TIMEOUT;
     }
     for (DWORD i = 0; i < n; ++i) CloseHandle(th[i]);
-    if (g_watchdog) { WaitForSingleObject(g_watchdog, 1000); CloseHandle(g_watchdog); }
-    if (g_job_obj) CloseHandle(g_job_obj);
-    if (g_worker_token) { CloseHandle(g_worker_token); g_worker_token = nullptr; }
+    bool wd_done = true;
+    if (g_watchdog) {
+        if (g_wd_wake) SetEvent(g_wd_wake);
+        wd_done = WaitForSingleObject(g_watchdog, 1000) != WAIT_TIMEOUT;
+        CloseHandle(g_watchdog);
+        g_watchdog = nullptr;
+    }
+    if (wd_done && g_wd_wake) { CloseHandle(g_wd_wake); g_wd_wake = nullptr; }
+    if (all_exited) {
+        if (g_job_obj) { CloseHandle(g_job_obj); g_job_obj = nullptr; }
+        if (g_worker_token) { CloseHandle(g_worker_token); g_worker_token = nullptr; }
+    }
 }
 
 void pool_stats(char* buf, size_t cap) {
@@ -570,9 +628,12 @@ void pool_stats(char* buf, size_t cap) {
     AcquireSRWLockShared(&g_lock);
     for (int i = 0; i < g_nslots && n > 0 && (size_t)n < cap; ++i) {
         Slot* s = &g_slots[i];
-        int m = _snprintf_s(buf + n, cap - n, _TRUNCATE, "  slot %d %s pid=%lu %s jobs=%llu\n", i,
-                            s->background ? "bg" : "fg", s->pid, s->job ? "busy" : "idle",
-                            (unsigned long long)s->jobs_done);
+        AcquireSRWLockShared(&s->proc_lock);
+        DWORD pid = s->pid;
+        ReleaseSRWLockShared(&s->proc_lock);
+        LONG64 done = InterlockedCompareExchange64(&s->jobs_done, 0, 0);
+        int m = _snprintf_s(buf + n, cap - n, _TRUNCATE, "  slot %d %s pid=%lu %s jobs=%lld\n", i,
+                            s->background ? "bg" : "fg", pid, s->job ? "busy" : "idle", done);
         if (m < 0) break;
         n += m;
     }

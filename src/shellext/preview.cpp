@@ -42,6 +42,7 @@ struct Result {
     int req_w, req_h;
     bool quick;      // low-res first paint from the thumbnail tier
     bool info_only;  // prefetch learned something about a page (e.g. it is empty); no pixels
+    bool has_alpha;
     HRESULT hr;
     int w, h;
     uint8_t* px;  // premultiplied BGRA
@@ -57,7 +58,7 @@ void free_result(Result* r) {
 
 void shared_release(Shared* s) {
     if (InterlockedDecrement(&s->refs) == 0) {
-        CloseHandle(s->wake);
+        if (s->wake) CloseHandle(s->wake);
         abt::mem_free(s->path);
         abt::mem_free(s);
     }
@@ -91,12 +92,15 @@ Result* fetch(uint16_t msg, const wchar_t* path, int cx, int cy, int page, int g
     r->req_w = cx;
     r->req_h = cy;
     r->quick = quick;
-    // The first-paint thumbnail is a nicety: never let it hold up the real request for long.
+    // The first-paint thumbnail is a nicety: only use already-cached thumbnails so a cache miss
+    // skips straight to the full preview render instead of double-rendering at 256 px.
     // View -1 (whole artwork) is the agent's canvas page.
     UINT agent_page = page < 0 ? (UINT)ABT_PAGE_CANVAS : (UINT)page;
-    r->hr = request_image(msg, path, (UINT)cx, (UINT)cy, agent_page, &resp, &r->px, 0, quick ? 3000 : 0);
+    uint32_t req_flags = quick ? ABT_RF_CACHE_ONLY : 0;
+    r->hr = request_image(msg, path, (UINT)cx, (UINT)cy, agent_page, &resp, &r->px, req_flags, quick ? 3000 : 0);
     r->w = (int)resp.width;
     r->h = (int)resp.height;
+    r->has_alpha = (resp.source & ABT_SRC_HAS_ALPHA) != 0;
     r->info = resp.info;
     memcpy(r->reason, resp.reason, sizeof(r->reason));
     r->reason[sizeof(r->reason) - 1] = 0;
@@ -165,8 +169,12 @@ DWORD WINAPI request_thread(void* arg) {
             if (quick_done_for != file_gen && page <= 0) {
                 quick_done_for = file_gen;
                 if (Result* q = fetch(ABT_MSG_THUMB, path, 256, 256, page, gen, file_gen, true)) {
-                    if (q->info.page_count > (uint32_t)count) count = (int)min_u32(q->info.page_count, 100000);
-                    post_result(s, q);
+                    if (SUCCEEDED(q->hr)) {
+                        if (q->info.page_count > (uint32_t)count) count = (int)min_u32(q->info.page_count, 100000);
+                        post_result(s, q);
+                    } else {
+                        free_result(q);
+                    }
                 }
                 if (new_request_pending(s)) { abt::mem_free(path); continue; }  // the user moved on
             }
@@ -268,13 +276,20 @@ class PreviewHandler final : public IPreviewHandler,
     int m_zone = Z_NONE;
     bool m_tracking = false;
     int m_wheel = 0;
-    // GDI objects, rebuilt when the DPI changes
+    // GDI objects, rebuilt when the DPI or window size changes
     int m_font_dpi = 0;
     HFONT m_font = nullptr, m_icons = nullptr, m_icons_big = nullptr;
     HBRUSH m_checker = nullptr;
     COLORREF m_checker_bg = 0;
+    HDC m_back_dc = nullptr;
+    HBITMAP m_back_bmp = nullptr;
+    int m_back_w = 0, m_back_h = 0;
+    HDC m_img_dc = nullptr;
 
-    int dpi() const { return m_wnd ? (int)GetDpiForWindow(m_wnd) : 96; }
+    int dpi() const {
+        int d = m_wnd ? (int)GetDpiForWindow(m_wnd) : 96;
+        return d > 0 ? d : 96;
+    }
     int px(int v) const { return MulDiv(v, dpi(), 96); }
     int strip_h() const { return px(30); }
     int page_count() const { return m_have_info && m_info.page_count > 1 ? (int)m_info.page_count : 1; }
@@ -317,12 +332,13 @@ class PreviewHandler final : public IPreviewHandler,
     static HBITMAP bmp_from(const Result* r, bool* alpha) {
         void* bits = nullptr;
         HBITMAP b = abt::create_dib32(r->w, r->h, &bits);
-        *alpha = false;
-        if (!b) return nullptr;
-        size_t n = (size_t)r->w * r->h;
+        *alpha = r->has_alpha;
+        if (!b || !bits) {
+            if (b) DeleteObject(b);
+            return nullptr;
+        }
+        size_t n = (size_t)r->w * (size_t)r->h;
         memcpy(bits, r->px, n * 4);  // premultiplied: ready for AlphaBlend
-        for (size_t i = 0; i < n; ++i)
-            if (r->px[i * 4 + 3] != 255) { *alpha = true; break; }
         return b;
     }
     void drop_quick() {
@@ -394,7 +410,14 @@ class PreviewHandler final : public IPreviewHandler,
             m_checker_bg = m_bg;
         }
     }
+    void free_backbuffer() {
+        if (m_back_bmp) { DeleteObject(m_back_bmp); m_back_bmp = nullptr; }
+        if (m_back_dc) { DeleteDC(m_back_dc); m_back_dc = nullptr; }
+        if (m_img_dc) { DeleteDC(m_img_dc); m_img_dc = nullptr; }
+        m_back_w = m_back_h = 0;
+    }
     void free_gdi() {
+        free_backbuffer();
         if (m_font) DeleteObject(m_font);
         if (m_icons) DeleteObject(m_icons);
         if (m_icons_big) DeleteObject(m_icons_big);
@@ -651,12 +674,12 @@ class PreviewHandler final : public IPreviewHandler,
             SetBrushOrgEx(mdc, dst.left, dst.top, nullptr);
             FillRect(mdc, &dst, m_checker);
         }
-        HDC idc = CreateCompatibleDC(mdc);
-        HGDIOBJ oi = SelectObject(idc, bmp);
+        if (!m_img_dc) m_img_dc = CreateCompatibleDC(mdc);
+        if (!m_img_dc) return;
+        HGDIOBJ oi = SelectObject(m_img_dc, bmp);
         BLENDFUNCTION bf = {AC_SRC_OVER, 0, opacity, AC_SRC_ALPHA};
-        AlphaBlend(mdc, dst.left, dst.top, dw, dh, idc, 0, 0, bw, bh, bf);
-        SelectObject(idc, oi);
-        DeleteDC(idc);
+        AlphaBlend(mdc, dst.left, dst.top, dw, dh, m_img_dc, 0, 0, bw, bh, bf);
+        SelectObject(m_img_dc, oi);
     }
 
     // A rounded label near the top of the image area.
@@ -699,9 +722,17 @@ class PreviewHandler final : public IPreviewHandler,
         int w = rc.right, h = rc.bottom;
         if (w <= 0 || h <= 0) return;
         ensure_gdi();
-        HDC mdc = CreateCompatibleDC(dc);
-        HBITMAP back = CreateCompatibleBitmap(dc, w, h);
-        HGDIOBJ oldb = SelectObject(mdc, back);
+        if (!m_back_dc) m_back_dc = CreateCompatibleDC(dc);
+        if (!m_back_dc) return;
+        if (!m_back_bmp || m_back_w != w || m_back_h != h) {
+            if (m_back_bmp) { DeleteObject(m_back_bmp); m_back_bmp = nullptr; }
+            m_back_bmp = CreateCompatibleBitmap(dc, w, h);
+            if (!m_back_bmp) { m_back_w = m_back_h = 0; return; }
+            m_back_w = w;
+            m_back_h = h;
+        }
+        HDC mdc = m_back_dc;
+        HGDIOBJ oldb = SelectObject(mdc, m_back_bmp);
         fill(mdc, rc, m_bg);
         SetBkMode(mdc, TRANSPARENT);
         HGDIOBJ of = SelectObject(mdc, m_font);
@@ -809,8 +840,6 @@ class PreviewHandler final : public IPreviewHandler,
         SelectObject(mdc, of);
         BitBlt(dc, 0, 0, w, h, mdc, 0, 0, SRCCOPY);
         SelectObject(mdc, oldb);
-        DeleteObject(back);
-        DeleteDC(mdc);
     }
 
     // ---- input
@@ -972,6 +1001,7 @@ class PreviewHandler final : public IPreviewHandler,
     }
 
     void reset_file() {
+        if (m_wnd) KillTimer(m_wnd, kResizeTimer);
         CoTaskMemFree(m_path);
         m_path = nullptr;
         cache_clear();
@@ -1004,6 +1034,7 @@ public:
     }
 
     IFACEMETHODIMP QueryInterface(REFIID riid, void** ppv) override {
+        if (!ppv) return E_POINTER;
         *ppv = nullptr;
         if (riid == IID_IUnknown || riid == IID_IPreviewHandler) *ppv = static_cast<IPreviewHandler*>(this);
         else if (riid == IID_IPreviewHandlerVisuals) *ppv = static_cast<IPreviewHandlerVisuals*>(this);
@@ -1023,15 +1054,18 @@ public:
     }
 
     IFACEMETHODIMP Initialize(IShellItem* item, DWORD) override {
+        if (!item) return E_INVALIDARG;
         reset_file();
         return item->GetDisplayName(SIGDN_FILESYSPATH, &m_path);
     }
     IFACEMETHODIMP Initialize(LPCWSTR path, DWORD) override {
+        if (!path) return E_INVALIDARG;
         reset_file();
         return SHStrDupW(path, &m_path);
     }
 
     IFACEMETHODIMP SetWindow(HWND parent, const RECT* rc) override {
+        if (!parent) return E_INVALIDARG;
         m_parent = parent;
         if (rc) m_rect = *rc;
         if (m_wnd) {
@@ -1085,6 +1119,7 @@ public:
     IFACEMETHODIMP Unload() override {
         stop_thread();
         if (m_wnd) { DestroyWindow(m_wnd); m_wnd = nullptr; }
+        free_backbuffer();
         reset_file();
         return S_OK;
     }
@@ -1093,10 +1128,12 @@ public:
         return S_OK;
     }
     IFACEMETHODIMP QueryFocus(HWND* out) override {
+        if (!out) return E_POINTER;
         *out = GetFocus();
         return *out ? S_OK : HRESULT_FROM_WIN32(GetLastError());
     }
     IFACEMETHODIMP TranslateAccelerator(MSG* msg) override {
+        if (!msg) return E_INVALIDARG;
         IPreviewHandlerFrame* frame = nullptr;
         HRESULT hr = S_FALSE;
         if (m_site && SUCCEEDED(m_site->QueryInterface(IID_PPV_ARGS(&frame)))) {
@@ -1125,11 +1162,13 @@ public:
         return S_OK;
     }
     IFACEMETHODIMP GetSite(REFIID riid, void** ppv) override {
+        if (!ppv) return E_POINTER;
         *ppv = nullptr;
         return m_site ? m_site->QueryInterface(riid, ppv) : E_FAIL;
     }
 
     IFACEMETHODIMP GetWindow(HWND* out) override {
+        if (!out) return E_POINTER;
         *out = m_wnd;
         return m_wnd ? S_OK : E_FAIL;
     }
@@ -1139,6 +1178,7 @@ public:
 }  // namespace
 
 HRESULT create_preview_handler(REFIID riid, void** ppv) {
+    if (!ppv) return E_POINTER;
     abt::log_init(L"shellext");
     PreviewHandler* p = new (std::nothrow) PreviewHandler();
     if (!p) return E_OUTOFMEMORY;

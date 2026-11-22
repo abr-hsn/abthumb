@@ -11,8 +11,26 @@
 
 namespace abt {
 
+static wchar_t* dup_wstr(const wchar_t* s) {
+    if (!s) return nullptr;
+    size_t n = (size_t)lstrlenW(s) + 1;
+    wchar_t* d = (wchar_t*)mem_alloc(n * sizeof(wchar_t));
+    if (d) memcpy(d, s, n * sizeof(wchar_t));
+    return d;
+}
+
+static wchar_t* join_path(const wchar_t* dir, const wchar_t* name) {
+    size_t dl = (size_t)lstrlenW(dir), nl = (size_t)lstrlenW(name);
+    wchar_t* p = (wchar_t*)mem_alloc((dl + 1 + nl + 1) * sizeof(wchar_t));
+    if (!p) return nullptr;
+    memcpy(p, dir, dl * sizeof(wchar_t));
+    p[dl] = L'\\';
+    memcpy(p + dl + 1, name, (nl + 1) * sizeof(wchar_t));
+    return p;
+}
+
 struct Hint {
-    wchar_t folder[MAX_PATH];
+    wchar_t* folder;
     int edge;
     ULONGLONG when;
 };
@@ -23,11 +41,11 @@ static Hint g_hints[32];
 static int g_nhints = 0;
 static Hint g_recent[16];  // recently processed folders (dedupe)
 static int g_recent_pos = 0;
-static HANDLE g_thread = nullptr, g_monitor = nullptr;
+static HANDLE g_thread = nullptr, g_monitor = nullptr, g_stop_ev = nullptr;
 static volatile bool g_stop = false;
 static volatile LONG g_allowed = 1;
 static volatile LONG64 g_hint_count, g_folders, g_queued, g_shell_fills, g_skipped_cached;
-static char g_throttle_reason[64] = "";
+static PVOID volatile g_throttle_reason = nullptr;
 static volatile LONG64 g_generation = 0;  // bumps on every new hint (lets long folders yield)
 
 bool prewarm_allowed() { return g_allowed != 0; }
@@ -36,68 +54,92 @@ static volatile LONG g_typical_edge = 0;  // most recent size Explorer actually 
 
 int prewarm_typical_edge() { return g_typical_edge ? (int)g_typical_edge : 256; }
 
-static void add_hint(const wchar_t* folder, int edge);
+static void add_hint(const wchar_t* folder, int edge, bool push_bottom = false);
 
 void prewarm_hint_file(const wchar_t* path, int edge) {
-    wchar_t folder[MAX_PATH];
-    lstrcpynW(folder, path, MAX_PATH);
-    wchar_t* slash = wcsrchr(folder, L'\\');
-    if (!slash) return;
-    *slash = 0;
+    if (!path) return;
+    const wchar_t* slash = wcsrchr(path, L'\\');
+    if (!slash || slash == path) return;
+    size_t len = (size_t)(slash - path);
+    wchar_t* folder = (wchar_t*)mem_alloc((len + 1) * sizeof(wchar_t));
+    if (!folder) return;
+    memcpy(folder, path, len * sizeof(wchar_t));
+    folder[len] = 0;
     if (edge > 0) InterlockedExchange(&g_typical_edge, edge);
-    add_hint(folder, edge);
+    add_hint(folder, edge, false);
+    mem_free(folder);
 }
 
-void prewarm_hint_folder(const wchar_t* folder, int edge) { add_hint(folder, edge); }
+void prewarm_hint_folder(const wchar_t* folder, int edge) { add_hint(folder, edge, false); }
 
-static void add_hint(const wchar_t* folder, int edge) {
+static void add_hint(const wchar_t* folder, int edge, bool push_bottom) {
+    if (!folder || !folder[0]) return;
     if (reg_get_dword(HKEY_CURRENT_USER, ABT_REG_ROOT, L"Prewarm", 1) == 0) return;
-    // Never sweep a network or optical folder (D-033): it would pull every file over the wire and
-    // slow Explorer's own browsing of that share. Files Explorer asks for are still served.
+    // Never sweep a network or optical folder (D-033).
     if (is_slow_path(folder)) return;
-    Hint h = {};
-    lstrcpynW(h.folder, folder, MAX_PATH);
-    h.edge = edge > 0 ? edge : 256;
-    h.when = GetTickCount64();
+    int e = edge > 0 ? edge : 256;
+    ULONGLONG when = GetTickCount64();
     AcquireSRWLockExclusive(&g_lock);
-    InterlockedIncrement64(&g_hint_count);
+    if (!push_bottom) InterlockedIncrement64(&g_hint_count);
     // Already processed recently at this size?
-    for (int i = 0; i < (int)_countof(g_recent); ++i) {
-        Hint& r = g_recent[i];
-        if (r.folder[0] && r.edge >= h.edge && h.when - r.when < 120000 && !lstrcmpiW(r.folder, h.folder)) {
-            ReleaseSRWLockExclusive(&g_lock);
-            return;
+    if (!push_bottom) {
+        for (int i = 0; i < (int)_countof(g_recent); ++i) {
+            Hint& r = g_recent[i];
+            if (r.folder && r.edge >= e && when - r.when < 120000 && ieq(r.folder, folder)) {
+                ReleaseSRWLockExclusive(&g_lock);
+                return;
+            }
         }
     }
     for (int i = 0; i < g_nhints; ++i) {
-        if (!lstrcmpiW(g_hints[i].folder, h.folder)) {
-            if (h.edge > g_hints[i].edge) g_hints[i].edge = h.edge;
-            g_hints[i].when = h.when;
+        if (g_hints[i].folder && ieq(g_hints[i].folder, folder)) {
+            if (e > g_hints[i].edge) g_hints[i].edge = e;
+            g_hints[i].when = when;
             ReleaseSRWLockExclusive(&g_lock);
             return;
         }
     }
-    if (g_nhints == (int)_countof(g_hints)) {  // drop the oldest
+    wchar_t* copy = dup_wstr(folder);
+    if (!copy) { ReleaseSRWLockExclusive(&g_lock); return; }
+    if (g_nhints == (int)_countof(g_hints)) {
+        if (push_bottom) {
+            mem_free(copy);
+            ReleaseSRWLockExclusive(&g_lock);
+            return;
+        }
+        mem_free(g_hints[0].folder);
         memmove(&g_hints[0], &g_hints[1], sizeof(Hint) * (_countof(g_hints) - 1));
         --g_nhints;
     }
-    g_hints[g_nhints++] = h;
-    InterlockedIncrement64(&g_generation);
+    if (push_bottom) {
+        // Yielded folder goes to index 0 (bottom of LIFO stack) without bumping generation so the
+        // newer folder at the top runs first.
+        memmove(&g_hints[1], &g_hints[0], sizeof(Hint) * (size_t)g_nhints);
+        g_hints[0] = {copy, e, when};
+        ++g_nhints;
+    } else {
+        g_hints[g_nhints++] = {copy, e, when};
+        InterlockedIncrement64(&g_generation);
+    }
     WakeAllConditionVariable(&g_cv);
     ReleaseSRWLockExclusive(&g_lock);
 }
 
 static void forget_recent(const wchar_t* folder) {
     AcquireSRWLockExclusive(&g_lock);
-    for (int i = 0; i < (int)_countof(g_recent); ++i)
-        if (!lstrcmpiW(g_recent[i].folder, folder)) g_recent[i].folder[0] = 0;
+    for (int i = 0; i < (int)_countof(g_recent); ++i) {
+        if (g_recent[i].folder && ieq(g_recent[i].folder, folder)) {
+            mem_free(g_recent[i].folder);
+            g_recent[i].folder = nullptr;
+        }
+    }
     ReleaseSRWLockExclusive(&g_lock);
 }
 
 // ---- progressive upgrades: a slow render finished after we answered with the embedded preview
 struct Upgrade {
     Job* job;
-    wchar_t path[MAX_PATH];
+    wchar_t* path;
     int edge;
 };
 static Upgrade g_upgrades[16];
@@ -105,17 +147,20 @@ static int g_nupgrades = 0;
 static volatile LONG64 g_upgraded = 0;
 
 void prewarm_upgrade_when_done(Job* j, const wchar_t* path, int edge) {
+    wchar_t* pcopy = dup_wstr(path);
     AcquireSRWLockExclusive(&g_lock);
-    if (g_nupgrades < (int)_countof(g_upgrades)) {
+    if (pcopy && g_nupgrades < (int)_countof(g_upgrades)) {
         Upgrade& u = g_upgrades[g_nupgrades++];
         u.job = j;
-        lstrcpynW(u.path, path, MAX_PATH);
+        u.path = pcopy;
         u.edge = edge;
         j = nullptr;
+        pcopy = nullptr;
         WakeAllConditionVariable(&g_cv);
     }
     ReleaseSRWLockExclusive(&g_lock);
     if (j) job_release(j);
+    mem_free(pcopy);
 }
 
 static bool take_upgrade(Upgrade* out) {
@@ -130,22 +175,28 @@ static bool take_upgrade(Upgrade* out) {
     return ok;
 }
 
-// Waits for the render, then replaces Explorer's cached (embedded-preview) entry and tells
-// Explorer to repaint the item.
 static void process_upgrade(Upgrade& u, IThumbnailCache* tc) {
     HRESULT hr = E_FAIL;
     bool ok = job_wait_done(u.job, 60000, &hr) && SUCCEEDED(hr);
     job_release(u.job);
-    if (!ok || !tc) return;
-    IShellItem* item = nullptr;
-    if (SUCCEEDED(SHCreateItemFromParsingName(u.path, nullptr, IID_PPV_ARGS(&item)))) {
-        ISharedBitmap* sb = nullptr;
-        WTS_CACHEFLAGS cf = WTS_DEFAULT;
-        if (SUCCEEDED(tc->GetThumbnail(item, (UINT)u.edge, WTS_FORCEEXTRACTION, &sb, &cf, nullptr)) && sb) sb->Release();
-        item->Release();
+    if (ok && tc && u.path) {
+        IShellItem* item = nullptr;
+        if (SUCCEEDED(SHCreateItemFromParsingName(u.path, nullptr, IID_PPV_ARGS(&item)))) {
+            ISharedBitmap* sb = nullptr;
+            WTS_CACHEFLAGS cf = WTS_DEFAULT;
+            if (SUCCEEDED(tc->GetThumbnail(item, (UINT)u.edge, WTS_FORCEEXTRACTION, &sb, &cf, nullptr)) && sb)
+                sb->Release();
+            item->Release();
+        }
+        SHChangeNotify(SHCNE_UPDATEITEM, SHCNF_PATHW | SHCNF_FLUSHNOWAIT, u.path, nullptr);
+        InterlockedIncrement64(&g_upgraded);
     }
-    SHChangeNotify(SHCNE_UPDATEITEM, SHCNF_PATHW | SHCNF_FLUSHNOWAIT, u.path, nullptr);
-    InterlockedIncrement64(&g_upgraded);
+    mem_free(u.path);
+}
+
+static void drain_upgrades(IThumbnailCache* tc) {
+    Upgrade u;
+    while (!g_stop && take_upgrade(&u)) process_upgrade(u, tc);
 }
 
 // Most recent hint first: the folder on screen now matters most.
@@ -153,123 +204,272 @@ static bool take_hint(Hint* out) {
     AcquireSRWLockExclusive(&g_lock);
     while (!g_stop && g_nhints == 0 && g_nupgrades == 0) SleepConditionVariableSRW(&g_cv, &g_lock, INFINITE, 0);
     bool ok = !g_stop && g_nhints > 0;
-    if (!g_stop && !ok && g_nupgrades > 0) {  // only upgrades pending: let the caller run them
+    if (!g_stop && !ok && g_nupgrades > 0) {
         ReleaseSRWLockExclusive(&g_lock);
-        out->folder[0] = 0;
+        out->folder = nullptr;
         return true;
     }
     if (ok) {
         *out = g_hints[--g_nhints];
-        g_recent[g_recent_pos] = *out;
+        g_hints[g_nhints].folder = nullptr;
+        mem_free(g_recent[g_recent_pos].folder);
+        g_recent[g_recent_pos] = {dup_wstr(out->folder), out->edge, out->when};
         g_recent_pos = (g_recent_pos + 1) % (int)_countof(g_recent);
     }
     ReleaseSRWLockExclusive(&g_lock);
     return ok;
 }
 
-static int __cdecl cmp_names(const void* a, const void* b) {
-    return StrCmpLogicalW(*(const wchar_t* const*)a, *(const wchar_t* const*)b);  // Explorer's sort
+struct DirEntry {
+    wchar_t* name;
+    FileKey key;
+    bool have_key;
+};
+
+static int __cdecl cmp_entries(const void* a, const void* b) {
+    return StrCmpLogicalW(((const DirEntry*)a)->name, ((const DirEntry*)b)->name);  // Explorer's sort
 }
 
 // Pushes one file into Explorer's thumbnail cache. Our handler runs in this process and is served
-// from our cache, so this costs about one shell cache write.
+// from our RAM/disk cache, so this costs about one shell cache write.
 static void shell_fill(IThumbnailCache* tc, const wchar_t* path, int edge) {
     IShellItem* item = nullptr;
     if (FAILED(SHCreateItemFromParsingName(path, nullptr, IID_PPV_ARGS(&item)))) return;
     ISharedBitmap* sb = nullptr;
     WTS_CACHEFLAGS cf = WTS_DEFAULT;
     if (SUCCEEDED(tc->GetThumbnail(item, (UINT)edge, WTS_EXTRACT, &sb, &cf, nullptr)) && sb) {
-        InterlockedIncrement64(&g_shell_fills);  // (WTS_CACHED is reported even right after extraction)
+        InterlockedIncrement64(&g_shell_fills);
         sb->Release();
     }
     item->Release();
 }
 
-static void process_folder(const Hint& h, IThumbnailCache* tc) {
-    wchar_t pat[MAX_PATH];
-    _snwprintf_s(pat, MAX_PATH, _TRUNCATE, L"%s\\*", h.folder);
+// Enumerates supported files in `folder`, extracting NTFS FileKeys in bulk via
+// FileIdBothDirectoryInfo (zero per-file CreateFileW syscalls on NTFS).
+static int enumerate_folder(const wchar_t* folder, DirEntry* entries, int max_entries) {
+    const DWORD kSkipAttrs = FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_OFFLINE |
+                             FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS | FILE_ATTRIBUTE_RECALL_ON_OPEN;
+    HANDLE dh = CreateFileW(folder, FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                            FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (dh != INVALID_HANDLE_VALUE) {
+        // Check if volume uses 64-bit NTFS FileIds (upper 8 bytes zero, low 8 bytes non-zero).
+        FILE_ID_INFO did = {};
+        bool ntfs_ids = false;
+        static const uint8_t zero8[8] = {};
+        if (GetFileInformationByHandleEx(dh, FileIdInfo, &did, sizeof(did)) &&
+            memcmp(did.FileId.Identifier + 8, zero8, 8) == 0 &&
+            memcmp(did.FileId.Identifier, zero8, 8) != 0) {
+            ntfs_ids = true;
+        }
+        const DWORD kBufSz = 64 * 1024;
+        uint8_t* buf = (uint8_t*)mem_alloc(kBufSz);
+        if (buf) {
+            int n = 0;
+            FILE_INFO_BY_HANDLE_CLASS cls = FileIdBothDirectoryRestartInfo;
+            while (n < max_entries && GetFileInformationByHandleEx(dh, cls, buf, kBufSz)) {
+                cls = FileIdBothDirectoryInfo;
+                uint8_t* p = buf;
+                for (;;) {
+                    const FILE_ID_BOTH_DIR_INFO* fi = (const FILE_ID_BOTH_DIR_INFO*)p;
+                    if (!(fi->FileAttributes & kSkipAttrs) && fi->FileNameLength > 0 && n < max_entries) {
+                        size_t chars = fi->FileNameLength / sizeof(wchar_t);
+                        wchar_t* name = (wchar_t*)mem_alloc((chars + 1) * sizeof(wchar_t));
+                        if (name) {
+                            memcpy(name, fi->FileName, chars * sizeof(wchar_t));
+                            name[chars] = 0;
+                            if (is_supported_ext(name)) {
+                                entries[n].name = name;
+                                entries[n].have_key = false;
+                                if (ntfs_ids && fi->FileId.QuadPart != 0) {
+                                    uint8_t fid16[16] = {};
+                                    memcpy(fid16, &fi->FileId.QuadPart, 8);
+                                    file_key_from_id(did.VolumeSerialNumber, fid16,
+                                                     (uint64_t)fi->EndOfFile.QuadPart,
+                                                     (uint64_t)fi->LastWriteTime.QuadPart, &entries[n].key);
+                                    entries[n].have_key = true;
+                                }
+                                ++n;
+                            } else {
+                                mem_free(name);
+                            }
+                        }
+                    }
+                    if (!fi->NextEntryOffset) break;
+                    p += fi->NextEntryOffset;
+                }
+            }
+            mem_free(buf);
+            CloseHandle(dh);
+            return n;
+        }
+        CloseHandle(dh);
+    }
+
+    // Fallback to FindFirstFileExW if directory handle couldn't be opened with FILE_LIST_DIRECTORY.
+    wchar_t* pat = join_path(folder, L"*");
+    if (!pat) return 0;
     WIN32_FIND_DATAW fd;
     HANDLE fh = FindFirstFileExW(pat, FindExInfoBasic, &fd, FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH);
-    if (fh == INVALID_HANDLE_VALUE) return;
-    const int kMax = 20000;
-    wchar_t** names = (wchar_t**)mem_alloc(sizeof(wchar_t*) * kMax);
+    mem_free(pat);
+    if (fh == INVALID_HANDLE_VALUE) return 0;
     int n = 0;
     do {
-        if (fd.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_OFFLINE | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS))
-            continue;  // never trigger cloud-file downloads
-        if (!is_supported_ext(fd.cFileName) || n >= kMax || !names) continue;
-        size_t l = (size_t)lstrlenW(fd.cFileName) + 1;
-        names[n] = (wchar_t*)mem_alloc(l * sizeof(wchar_t));
-        if (names[n]) memcpy(names[n++], fd.cFileName, l * sizeof(wchar_t));
+        if (fd.dwFileAttributes & kSkipAttrs) continue;
+        if (!is_supported_ext(fd.cFileName) || n >= max_entries) continue;
+        wchar_t* name = dup_wstr(fd.cFileName);
+        if (name) {
+            entries[n].name = name;
+            entries[n].have_key = false;
+            ++n;
+        }
     } while (FindNextFileW(fh, &fd));
     FindClose(fh);
-    if (!n) { mem_free(names); return; }
-    qsort(names, (size_t)n, sizeof(wchar_t*), cmp_names);
+    return n;
+}
+
+struct InFlight {
+    Job* job;
+    wchar_t* path;
+};
+
+static void process_folder(const Hint& h, IThumbnailCache* tc) {
+    const int kMax = 20000;
+    DirEntry* entries = (DirEntry*)mem_alloc(sizeof(DirEntry) * kMax);
+    if (!entries) return;
+    int n = enumerate_folder(h.folder, entries, kMax);
+    if (!n) { mem_free(entries); return; }
+    qsort(entries, (size_t)n, sizeof(DirEntry), cmp_entries);
     InterlockedIncrement64(&g_folders);
     LONG64 gen = g_generation;
 
-    // Work in chunks of 32 (in view order): render into our cache, then push into Explorer's cache.
-    const int kChunk = 32;
-    Job* pending[kChunk];
-    wchar_t path[MAX_PATH];
+    // Sliding window keeps bg_workers * 2 jobs in flight without chunk-32 barrier stalls.
+    int max_win = pool_bg_workers() * 2;
+    if (max_win < 4) max_win = 4;
+    if (max_win > 16) max_win = 16;
+    InFlight win[16] = {};
+    int win_n = 0;
     bool yielded = false;
-    for (int base = 0; base < n && !g_stop && !yielded; base += kChunk) {
-        int end = base + kChunk < n ? base + kChunk : n;
-        memset(pending, 0, sizeof(pending));
-        // Phase 1: our cache. Feed jobs only while background capacity is free (short queue).
-        for (int i = base; i < end && !g_stop; ++i) {
-            _snwprintf_s(path, MAX_PATH, _TRUNCATE, L"%s\\%s", h.folder, names[i]);
-            FileKey k;
-            if (!file_key(path, &k)) continue;
-            if (cache_has(k, ABT_PAGE_CANVAS, h.edge, nullptr)) {  // already done
-                InterlockedIncrement64(&g_skipped_cached);
-                continue;
+
+    auto harvest_one = [&](bool block) -> bool {
+        for (int pass = 0; pass < (block ? 2 : 1); ++pass) {
+            for (int w = 0; w < win_n; ++w) {
+                HRESULT hr = E_FAIL;
+                DWORD wait_ms = (pass == 1 && w == 0) ? 15u : 0u;
+                if (job_wait_done(win[w].job, wait_ms, &hr)) {
+                    Job* j = win[w].job;
+                    wchar_t* p = win[w].path;
+                    win[w] = win[--win_n];
+                    job_release(j);
+                    if (SUCCEEDED(hr) && tc && !yielded && !g_stop && prewarm_allowed()) shell_fill(tc, p, h.edge);
+                    mem_free(p);
+                    return true;
+                }
+                if (pass == 1) break;
             }
-            while (!g_stop && (jobs_pending(LANE_VISIBLE) >= 4 || !prewarm_allowed())) Sleep(15);
-            if (g_generation != gen) {  // the user moved on: come back to this folder later
+        }
+        return false;
+    };
+
+    for (int i = 0; i < n && !g_stop && !yielded; ++i) {
+        drain_upgrades(tc);
+        while (harvest_one(false)) {}
+
+        if (g_generation != gen) {
+            forget_recent(h.folder);
+            add_hint(h.folder, h.edge, true);  // re-queue at bottom of stack without bumping gen
+            yielded = true;
+            break;
+        }
+        wchar_t* path = join_path(h.folder, entries[i].name);
+        if (!path) continue;
+        FileKey k = entries[i].key;
+        if (!entries[i].have_key && !file_key(path, &k)) {
+            mem_free(path);
+            continue;
+        }
+        CacheEntryView cv = {};
+        if (cache_has(k, ABT_PAGE_CANVAS, h.edge, &cv)) {
+            InterlockedIncrement64(&g_skipped_cached);
+            // Only push positive cache entries into Explorer's cache; skip negative entries.
+            if (!(cv.flags & CF_NEGATIVE) && tc && prewarm_allowed()) shell_fill(tc, path, h.edge);
+            mem_free(path);
+            continue;
+        }
+        while (!g_stop && (win_n >= max_win || jobs_pending(LANE_VISIBLE) >= max_win || !prewarm_allowed())) {
+            if (g_generation != gen) {
                 forget_recent(h.folder);
-                prewarm_hint_file(path, h.edge);
+                add_hint(h.folder, h.edge, true);
                 yielded = true;
                 break;
             }
-            pending[i - base] = job_submit(path, k, ABT_PAGE_CANVAS, h.edge, h.edge, ABT_MODE_AUTO, 0, i < 64 ? LANE_VISIBLE : LANE_FOLDER);
-            InterlockedIncrement64(&g_queued);
+            drain_upgrades(tc);
+            if (!harvest_one(true)) Sleep(15);
         }
-        // Phase 2: Explorer's cache, as each of our renditions completes.
-        for (int i = base; i < end && !g_stop; ++i) {
-            Job* j = pending[i - base];
-            if (j) {
-                job_wait_done(j, 30000, nullptr);
-                job_release(j);
-                pending[i - base] = nullptr;
-            }
-            if (tc && !yielded && prewarm_allowed()) {
-                _snwprintf_s(path, MAX_PATH, _TRUNCATE, L"%s\\%s", h.folder, names[i]);
-                shell_fill(tc, path, h.edge);
-            }
+        if (g_stop || yielded) { mem_free(path); break; }
+        Job* j = job_submit(path, k, ABT_PAGE_CANVAS, h.edge, h.edge, ABT_MODE_AUTO, 0,
+                            i < 64 ? LANE_VISIBLE : LANE_FOLDER);
+        if (j) {
+            win[win_n++] = {j, path};
+            InterlockedIncrement64(&g_queued);
+        } else {
+            mem_free(path);
         }
     }
-    for (int i = 0; i < n; ++i) mem_free(names[i]);
-    mem_free(names);
+
+    // Drain remaining in-flight jobs; if yielding or stopping, release without blocking 30s each.
+    if (yielded || g_stop) {
+        for (int w = 0; w < win_n; ++w) {
+            job_release(win[w].job);
+            mem_free(win[w].path);
+        }
+    } else {
+        while (win_n > 0 && !g_stop) {
+            drain_upgrades(tc);
+            if (g_generation != gen) {
+                for (int w = 0; w < win_n; ++w) {
+                    job_release(win[w].job);
+                    mem_free(win[w].path);
+                }
+                break;
+            }
+            if (!harvest_one(true)) Sleep(15);
+        }
+    }
+    for (int i = 0; i < n; ++i) mem_free(entries[i].name);
+    mem_free(entries);
+}
+
+static void set_low_io_priority() {
+    // Low CPU priority + LOW (not very-low) I/O priority matching D-033 so HDD shell_fill isn't starved.
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    typedef LONG(NTAPI * SetThreadInfoFn)(HANDLE, ULONG, PVOID, ULONG);
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    SetThreadInfoFn set_info = ntdll ? (SetThreadInfoFn)(void*)GetProcAddress(ntdll, "NtSetInformationThread") : nullptr;
+    if (set_info) {
+        ULONG io_low = 1;  // IoPriorityLow
+        set_info(GetCurrentThread(), 22 /* ThreadIoPriority */, &io_low, sizeof(io_low));
+    }
 }
 
 static DWORD WINAPI prewarm_thread(void*) {
-    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
-    SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
+    HRESULT co = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    set_low_io_priority();
     IThumbnailCache* tc = nullptr;
     CoCreateInstance(CLSID_LocalThumbnailCache, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&tc));
-    Hint h;
+    Hint h = {};
     while (take_hint(&h)) {
-        Upgrade u;
-        while (take_upgrade(&u)) process_upgrade(u, tc);  // user-visible items first
-        if (!h.folder[0]) continue;
+        drain_upgrades(tc);  // user-visible items first
+        if (!h.folder) continue;
         logf("prewarm %ls @%d", h.folder, h.edge);
         process_folder(h, tc);
+        mem_free(h.folder);
+        h.folder = nullptr;
     }
     Upgrade u;
-    while (take_upgrade(&u)) job_release(u.job);
+    while (take_upgrade(&u)) { job_release(u.job); mem_free(u.path); }
     if (tc) tc->Release();
-    CoUninitialize();
+    if (SUCCEEDED(co)) CoUninitialize();
     return 0;
 }
 
@@ -278,8 +478,7 @@ static DWORD WINAPI monitor_thread(void*) {
     FILETIME pi = {}, pk = {}, pu = {};
     GetSystemTimes(&pi, &pk, &pu);
     auto u64 = [](FILETIME f) { return ((uint64_t)f.dwHighDateTime << 32) | f.dwLowDateTime; };
-    while (!g_stop) {
-        Sleep(2000);
+    while (WaitForSingleObject(g_stop_ev, 2000) == WAIT_TIMEOUT && !g_stop) {
         const char* why = "";
         SYSTEM_POWER_STATUS ps = {};
         if (GetSystemPowerStatus(&ps) && ps.SystemStatusFlag == 1) why = "battery saver";
@@ -293,19 +492,18 @@ static DWORD WINAPI monitor_thread(void*) {
             if (!*why && total && idle * 100 / total < 20) why = "system busy";
             pi = ii; pk = kk; pu = uu;
         }
-        lstrcpynA(g_throttle_reason, why, sizeof(g_throttle_reason));
+        InterlockedExchangePointer(&g_throttle_reason, const_cast<char*>(why));
         InterlockedExchange(&g_allowed, *why ? 0 : 1);
     }
     return 0;
 }
 
-// Note: an Explorer navigation watcher (IShellWindows + DWebBrowserEvents2) was tried and removed:
-// Bitdefender quarantines binaries that subscribe to browser navigation events (D-024). Pre-warm
-// starts from the first thumbnail request of a folder instead (see docs/attic).
 void prewarm_start() {
     g_stop = false;
+    g_stop_ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     g_thread = CreateThread(nullptr, 0, prewarm_thread, nullptr, 0, nullptr);
-    g_monitor = CreateThread(nullptr, 64 << 10, monitor_thread, nullptr, STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
+    if (g_stop_ev)
+        g_monitor = CreateThread(nullptr, 64 << 10, monitor_thread, nullptr, STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
 }
 
 void prewarm_stop() {
@@ -313,16 +511,24 @@ void prewarm_stop() {
     g_stop = true;
     WakeAllConditionVariable(&g_cv);
     ReleaseSRWLockExclusive(&g_lock);
+    if (g_stop_ev) SetEvent(g_stop_ev);
     if (g_thread) { WaitForSingleObject(g_thread, 5000); CloseHandle(g_thread); g_thread = nullptr; }
     if (g_monitor) { WaitForSingleObject(g_monitor, 3000); CloseHandle(g_monitor); g_monitor = nullptr; }
+    if (g_stop_ev) { CloseHandle(g_stop_ev); g_stop_ev = nullptr; }
+    AcquireSRWLockExclusive(&g_lock);
+    for (int i = 0; i < g_nhints; ++i) { mem_free(g_hints[i].folder); g_hints[i].folder = nullptr; }
+    g_nhints = 0;
+    for (int i = 0; i < (int)_countof(g_recent); ++i) { mem_free(g_recent[i].folder); g_recent[i].folder = nullptr; }
+    ReleaseSRWLockExclusive(&g_lock);
 }
 
 void prewarm_stats(char* buf, size_t cap) {
+    const char* why = (const char*)InterlockedCompareExchangePointer(&g_throttle_reason, nullptr, nullptr);
     _snprintf_s(buf, cap, _TRUNCATE,
                 "prewarm: %lld hints, %lld folders, %lld files queued, %lld already cached, %lld Explorer cache "
                 "fills, %lld progressive upgrades, typical size %d, throttle: %s\n",
                 g_hint_count, g_folders, g_queued, g_skipped_cached, g_shell_fills, g_upgraded, prewarm_typical_edge(),
-                g_allowed ? "open" : g_throttle_reason);
+                g_allowed ? "open" : (why ? why : ""));
 }
 
 }  // namespace abt

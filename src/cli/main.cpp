@@ -104,6 +104,8 @@ static int cmd_shelltest(int argc, wchar_t** argv) {
         else if (npaths < 256) paths[npaths++] = argv[i];
     }
     if (!npaths) { usage(); return 2; }
+    if (o.size < 1) o.size = 1;
+    if (o.repeat < 1) o.repeat = 1;
     int failures = 0;
     for (int p = 0; p < npaths; ++p) {
         wchar_t full[MAX_PATH];
@@ -222,6 +224,8 @@ static int cmd_render(int argc, wchar_t** argv) {
         else if (np < 512) paths[np++] = argv[i];
     }
     if (!np) { usage(); return 2; }
+    if (o.cx < 1) o.cx = 1;
+    if (o.repeat < 1) o.repeat = 1;
     if (o.out && !CreateDirectoryW(o.out, nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) {
         fprintf(stderr, "cannot create %ls: error %lu\n", o.out, GetLastError());
         return 1;
@@ -464,6 +468,10 @@ static int cmd_previewtest(int argc, wchar_t** argv) {
         else file = argv[i];
     }
     if (!file) { usage(); return 2; }
+    if (w < 1) w = 1;
+    if (w > (int)ABT_MAX_REPLY_DIM) w = (int)ABT_MAX_REPLY_DIM;
+    if (h < 1) h = 1;
+    if (h > (int)ABT_MAX_REPLY_DIM) h = (int)ABT_MAX_REPLY_DIM;
     wchar_t full[MAX_PATH];
     GetFullPathNameW(file, MAX_PATH, full, nullptr);
 
@@ -481,9 +489,10 @@ static int cmd_previewtest(int argc, wchar_t** argv) {
 
     uint64_t t0 = abt::qpc();
     IPreviewHandler* ph = nullptr;
+    HMODULE mod = nullptr;
     HRESULT hr = E_FAIL;
     if (dll) {
-        HMODULE mod = LoadLibraryW(dll);
+        mod = LoadLibraryW(dll);
         typedef HRESULT(STDAPICALLTYPE * GetClassObjectFn)(REFCLSID, REFIID, void**);
         GetClassObjectFn gco = mod ? (GetClassObjectFn)GetProcAddress(mod, "DllGetClassObject") : nullptr;
         IClassFactory* cf = nullptr;
@@ -494,7 +503,11 @@ static int cmd_previewtest(int argc, wchar_t** argv) {
                               IID_PPV_ARGS(&ph));
     }
     printf("CoCreateInstance(%s): 0x%08lx  %.1f ms\n", inproc ? "inproc" : "local server", hr, abt::qpc_ms(t0, abt::qpc()));
-    if (FAILED(hr)) { DestroyWindow(host); return 1; }
+    if (FAILED(hr)) {
+        if (mod) FreeLibrary(mod);
+        DestroyWindow(host);
+        return 1;
+    }
     IInitializeWithItem* iwi = nullptr;
     IInitializeWithFile* iwf = nullptr;
     if (SUCCEEDED(ph->QueryInterface(IID_PPV_ARGS(&iwi)))) {
@@ -550,7 +563,7 @@ static int cmd_previewtest(int argc, wchar_t** argv) {
         SelectObject(mdc, old);
         DeleteDC(mdc);
         ReleaseDC(host, wdc);
-        for (int i = 0; i < w * h; ++i) ((uint8_t*)bits)[i * 4 + 3] = 255;
+        for (size_t i = 0, npix = (size_t)w * (size_t)h; i < npix; ++i) ((uint8_t*)bits)[i * 4 + 3] = 255;
         HRESULT shr = abt::save_png_bgra(path, (const uint8_t*)bits, w, h, w * 4, false);
         printf("capture -> %ls: 0x%08lx\n", path, shr);
         if (FAILED(shr) && SUCCEEDED(hr)) hr = shr;
@@ -558,6 +571,7 @@ static int cmd_previewtest(int argc, wchar_t** argv) {
     }
     ph->Unload();
     ph->Release();
+    if (mod) FreeLibrary(mod);
     DestroyWindow(host);
     return SUCCEEDED(hr) ? 0 : 1;
 }

@@ -31,8 +31,9 @@ $saved = $ErrorActionPreference
 $ErrorActionPreference = "Continue"
 foreach ($f in $files) {
   $n++
-  $out = & $Exe render $f.FullName --canvas --size 256 --out $tmp 2>&1 | ForEach-Object { "$_" } | Out-String
   $png = Join-Path $tmp "$($f.Name)_256.png"
+  Remove-Item -LiteralPath $png -ErrorAction SilentlyContinue
+  $out = & $Exe render $f.FullName --canvas --size 256 --out $tmp 2>&1 | ForEach-Object { "$_" } | Out-String
   $size = if (Test-Path -LiteralPath $png) { (Get-Item -LiteralPath $png).Length } else { 0 }
   $declared = $out -match "no visible art|saved without PDF content"
   if ($size -lt 900 -and -not $declared) { $bad += "$($f.FullName) ($size bytes)" }

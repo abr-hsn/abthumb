@@ -1,4 +1,5 @@
 // Named-pipe server: answers the shell extension (thumbnails, preview pane) and the CLI.
+// Supports persistent keep-alive connections and reuses pipe instances across clients.
 #include "agent.h"
 #include <sddl.h>
 #include <objbase.h>
@@ -10,6 +11,7 @@ Stats g_stats;
 static HANDLE g_threads[32];
 static int g_nthreads = 0;
 static volatile bool g_stop = false;
+static HANDLE g_stop_event = nullptr;
 static PSECURITY_DESCRIPTOR g_sd = nullptr;
 static HANDLE g_first = INVALID_HANDLE_VALUE;
 static wchar_t g_name[128];
@@ -38,24 +40,31 @@ static HANDLE create_instance(bool first) {
                             PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | (first ? FILE_FLAG_FIRST_PIPE_INSTANCE : 0),
                             // NOLINTNEXTLINE(misc-redundant-expression): three of these are 0, named for clarity
                             PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
-                            PIPE_UNLIMITED_INSTANCES, 1 << 16, 1 << 16, 0, g_sd ? &sa : nullptr);
+                            PIPE_UNLIMITED_INSTANCES, 512 * 1024, 64 * 1024, 0, g_sd ? &sa : nullptr);
 }
 
-static void fit_to_box(abt_image* img, int bw, int bh) {
-    if (!img->px || bw <= 0 || bh <= 0) return;
-    double s = (double)bw / img->w, s2 = (double)bh / img->h;
+// Fits src (RefPixBuf) into (bw, bh) without enlarging. If no resize is needed, returns src directly
+// (zero-copy); otherwise allocates a resized RefPixBuf and releases src.
+static RefPixBuf* fit_to_box(RefPixBuf* src, int bw, int bh) {
+    if (!src || !src->px || bw <= 0 || bh <= 0) return src;
+    double s = (double)bw / src->w, s2 = (double)bh / src->h;
     if (s2 < s) s = s2;
-    if (s >= 1.0) return;  // never enlarge here
-    int dw = (int)(img->w * s + 0.5), dh = (int)(img->h * s + 0.5);
+    if (s >= 1.0) return src;  // never enlarge here
+    int dw = (int)(src->w * s + 0.5), dh = (int)(src->h * s + 0.5);
     if (dw < 1) dw = 1;
     if (dh < 1) dh = 1;
-    abt_image r;
-    if (abt_resize(img->px, img->w, img->h, (size_t)img->w * 4, dw, dh, &r) == ABT_OK) {
-        int alpha = img->has_alpha;
-        abt_image_free(img);
-        *img = r;
-        img->has_alpha = alpha;
+    abt_image r = {};
+    if (abt_resize(src->px, src->w, src->h, (size_t)src->w * 4, dw, dh, &r) == ABT_OK && r.px) {
+        RefPixBuf* dst = pixbuf_alloc(r.w, r.h, src->has_alpha);
+        if (dst) {
+            memcpy(dst->px, r.px, (size_t)r.w * (size_t)r.h * 4u);
+            abt_image_free(&r);
+            pixbuf_release(src);
+            return dst;
+        }
+        abt_image_free(&r);
     }
+    return src;
 }
 
 static uint32_t flags_to_source(uint16_t f) {
@@ -67,9 +76,6 @@ static uint32_t flags_to_source(uint16_t f) {
 }
 
 // ---- network shares that stopped answering (D-033)
-// Opening a file on a share whose server is gone can block for the SMB timeout (tens of seconds).
-// One slow or failed open marks the share as down for 30 s, and requests for it fail at once, so
-// Explorer threads and our pipe threads are not parked behind an unreachable server.
 struct DownShare {
     wchar_t key[80];
     ULONGLONG until;
@@ -77,12 +83,16 @@ struct DownShare {
 static DownShare g_down[8];
 static SRWLOCK g_down_lock = SRWLOCK_INIT;
 
+static bool prefix_ieq(const wchar_t* s, const wchar_t* prefix, int len) {
+    return CompareStringOrdinal(s, len, prefix, len, TRUE) == CSTR_EQUAL;
+}
+
 // "server\share" or "X:" (mapped drive); empty for local paths.
 static void share_key(const wchar_t* path, wchar_t* out, size_t cap) {
     out[0] = 0;
     if (cap < 3 || !is_slow_path(path)) return;
     const wchar_t* p = path;
-    if (!wcsncmp(p, L"\\\\?\\UNC\\", 8)) p += 8;
+    if (!wcsncmp(p, L"\\\\?\\", 4) && prefix_ieq(p + 4, L"UNC\\", 4)) p += 8;
     else if (!wcsncmp(p, L"\\\\?\\", 4)) { lstrcpynW(out, p + 4, 3); return; }
     else if (!wcsncmp(p, L"\\\\", 2)) p += 2;
     else { lstrcpynW(out, path, 3); return; }
@@ -101,7 +111,7 @@ static bool share_down(const wchar_t* key) {
     bool down = false;
     AcquireSRWLockShared(&g_down_lock);
     for (const DownShare& d : g_down)
-        if (d.until > now && !lstrcmpiW(d.key, key)) down = true;
+        if (d.until > now && ieq(d.key, key)) { down = true; break; }
     ReleaseSRWLockShared(&g_down_lock);
     return down;
 }
@@ -111,7 +121,7 @@ static void mark_share_down(const wchar_t* key) {
     AcquireSRWLockExclusive(&g_down_lock);
     int slot = 0;
     for (int i = 0; i < (int)_countof(g_down); ++i) {
-        if (!lstrcmpiW(g_down[i].key, key)) { slot = i; break; }
+        if (ieq(g_down[i].key, key)) { slot = i; break; }
         if (g_down[i].until < g_down[slot].until) slot = i;
     }
     lstrcpynW(g_down[slot].key, key, (int)_countof(g_down[slot].key));
@@ -132,7 +142,8 @@ static bool network_error(DWORD e) {
     }
 }
 
-static void serve_image(const abt_req& req, const wchar_t* path, abt_resp* resp, abt_image* img) {
+static void serve_image(const abt_req& req, const wchar_t* path, abt_resp* resp, RefPixBuf** out_pix) {
+    *out_pix = nullptr;
     uint64_t t0 = qpc();
     InterlockedIncrement64(&g_stats.requests);
     wchar_t share[80];
@@ -163,15 +174,13 @@ static void serve_image(const abt_req& req, const wchar_t* path, abt_resp* resp,
     const uint32_t page = req.msg == ABT_MSG_PREVIEW ? req.page : ABT_PAGE_CANVAS;
     CacheEntryView view = {};
     if (req.msg == ABT_MSG_PREVIEW && (req.flags & ABT_RF_PREFETCH)) {
-        // Neighbouring artboards for the preview pane: start the render and answer at once. The
-        // pane's real request later finds it in the cache or joins the job still in flight.
         if (cache_has(k, page, edge, &view)) {
             resp->hr = (view.flags & CF_NEGATIVE) ? S_FALSE : S_OK;
-            resp->info = view.info;  // lets the pane learn that a page is empty before showing it
+            resp->info = view.info;
             lstrcpynA(resp->reason, "prefetch: cached", sizeof(resp->reason));
-        } else if (Job* pj = job_submit(path, k, page, edge, edge, ABT_MODE_AUTO, req.flags & ~ABT_RF_PREFETCH,
-                                        LANE_PREVIEW)) {
-            job_release(pj);  // the scheduler keeps its own reference; the result goes to the cache
+        } else if (Job* pj = job_submit(path, k, page, edge, edge, ABT_MODE_AUTO,
+                                        req.flags & ~(ABT_RF_PREFETCH | ABT_RF_CACHE_ONLY), LANE_PREVIEW)) {
+            job_release(pj);
             resp->hr = S_FALSE;
             lstrcpynA(resp->reason, "prefetch: queued", sizeof(resp->reason));
         } else {
@@ -181,7 +190,8 @@ static void serve_image(const abt_req& req, const wchar_t* path, abt_resp* resp,
         resp->elapsed_us = (uint32_t)(qpc_ms(t0, qpc()) * 1000.0);
         return;
     }
-    if (!(req.flags & ABT_RF_NO_CACHE) && !info_only && cache_get(k, page, edge, img, &view)) {
+    RefPixBuf* pix = nullptr;
+    if (!(req.flags & ABT_RF_NO_CACHE) && !info_only && cache_get(k, page, edge, &pix, &view)) {
         resp->info = view.info;
         resp->source = flags_to_source(view.flags);
         if (view.flags & CF_NEGATIVE) {
@@ -193,11 +203,12 @@ static void serve_image(const abt_req& req, const wchar_t* path, abt_resp* resp,
             lstrcpynA(resp->reason, "cache", sizeof(resp->reason));
             InterlockedIncrement64(&g_stats.cache_hits);
         }
+    } else if (req.flags & ABT_RF_CACHE_ONLY) {
+        // Preview pane quick first-paint: never block on a redundant 256 px render on cache miss.
+        resp->hr = HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+        lstrcpynA(resp->reason, "cache miss (cache-only)", sizeof(resp->reason));
     } else {
         InterlockedIncrement64(&g_stats.misses);
-        // Files on a network share (D-033): the full render reads the whole file over the wire and must
-        // not hold a foreground worker that local files are waiting for. It goes to the background
-        // lane, and Explorer gets the embedded preview (a few KB) at once, upgraded when the render lands.
         const bool slow = req.msg == ABT_MSG_THUMB && share[0] && !(req.flags & ABT_RF_FROM_PREWARM);
         Lane lane = req.msg == ABT_MSG_PREVIEW ? LANE_PREVIEW
                     : (req.flags & ABT_RF_FROM_PREWARM) ? LANE_VISIBLE
@@ -222,23 +233,22 @@ static void serve_image(const abt_req& req, const wchar_t* path, abt_resp* resp,
                 if (!done) {
                     Job* fast = job_submit(path, k, page, edge, edge, ABT_MODE_FAST, req.flags | ABT_RF_NO_CACHE,
                                            LANE_FOREGROUND);
-                    JobResult fr = {};  // untouched when job_wait times out
-                    if (fast && job_wait(fast, slow ? 2500 : 1500, &fr) && SUCCEEDED(fr.hr) && fr.img.px) {
+                    JobResult fr = {};
+                    if (fast && job_wait(fast, slow ? 2500 : 1500, &fr) && SUCCEEDED(fr.hr) && fr.pix) {
                         resp->hr = S_OK;
                         resp->info = fr.info;
                         resp->source = fr.source | ABT_SRC_UPGRADE_PENDING;
                         lstrcpynA(resp->reason, "embedded preview; sharper render on its way", sizeof(resp->reason));
-                        *img = fr.img;
+                        pix = fr.pix;
                         prewarm_upgrade_when_done(j, path, edge);  // takes over our reference
                         j = nullptr;
                     } else if (fast) {
-                        abt_image_free(&fr.img);
+                        pixbuf_release(fr.pix);
                     }
                     if (fast) job_release(fast);
                     if (!j) goto finish;
-                    // No usable embedded preview: Explorer is waiting for the render itself, so a
-                    // network file's job moves up to the foreground lane (if it is still queued).
-                    if (slow) job_release(job_submit(path, k, page, edge, edge, mode, req.flags, LANE_FOREGROUND));
+                    // No usable embedded preview: promote our existing queued job (never spawn a duplicate).
+                    if (slow) job_promote(j, LANE_FOREGROUND);
                     DWORD spent = (DWORD)qpc_ms(tw, qpc());
                     wait = wait > spent + 100 ? wait - spent : 100;
                 }
@@ -248,7 +258,7 @@ static void serve_image(const abt_req& req, const wchar_t* path, abt_resp* resp,
                 resp->info = r.info;
                 resp->source = r.source;
                 memcpy(resp->reason, r.reason, sizeof(resp->reason));
-                *img = r.img;
+                pix = r.pix;
                 if (FAILED(r.hr)) InterlockedIncrement64(&g_stats.failures);
             } else {
                 resp->hr = HRESULT_FROM_WIN32(ERROR_TIMEOUT);
@@ -259,18 +269,23 @@ static void serve_image(const abt_req& req, const wchar_t* path, abt_resp* resp,
         }
     }
 finish:
-    if (SUCCEEDED(resp->hr) && img->px) {
-        fit_to_box(img, bw, bh);
-        resp->width = (uint32_t)img->w;
-        resp->height = (uint32_t)img->h;
-        resp->pixel_len = resp->width * resp->height * 4;  // <= 16384^2*4 after fit_to_box: no wrap
+    if (SUCCEEDED(resp->hr) && pix && pix->px) {
+        pix = fit_to_box(pix, bw, bh);
+        resp->width = (uint32_t)pix->w;
+        resp->height = (uint32_t)pix->h;
+        resp->pixel_len = resp->width * resp->height * 4;
+        if (pix->has_alpha) resp->source |= ABT_SRC_HAS_ALPHA;
+        else resp->source &= ~ABT_SRC_HAS_ALPHA;
+        *out_pix = pix;
     } else {
-        abt_image_free(img);
+        pixbuf_release(pix);
     }
     resp->total_len = sizeof(*resp) + resp->pixel_len;
     resp->elapsed_us = (uint32_t)(qpc_ms(t0, qpc()) * 1000.0);
     InterlockedAdd64(&g_stats.total_us, resp->elapsed_us);
-    if (req.msg == ABT_MSG_THUMB && !(req.flags & ABT_RF_FROM_PREWARM)) prewarm_hint_file(path, edge);
+    if (SUCCEEDED(resp->hr) && req.msg == ABT_MSG_THUMB &&
+        !(req.flags & (ABT_RF_FROM_PREWARM | ABT_RF_NO_CACHE | ABT_RF_CACHE_ONLY)))
+        prewarm_hint_file(path, edge);
 }
 
 // Who is on the other end. Low-integrity callers (prevhost, sandboxed apps) may only ask for
@@ -296,34 +311,45 @@ static Caller identify_caller(HANDLE p) {
     return c;
 }
 
+static bool is_ascii_alpha(wchar_t c) { return (c >= L'A' && c <= L'Z') || (c >= L'a' && c <= L'z'); }
+
+static bool acceptable_unc_tail(const wchar_t* p) {
+    // Expect non-empty "server\share" with no '.', '?', '/', '\' leading server, and reject pipe / IPC$.
+    if (!p[0] || p[0] == L'.' || p[0] == L'?' || p[0] == L'/' || p[0] == L'\\') return false;
+    const wchar_t* s = p;
+    while (*s && *s != L'\\' && *s != L'/') ++s;
+    if (*s != L'\\' || s == p) return false;
+    const wchar_t* sh = s + 1;
+    const wchar_t* she = sh;
+    while (*she && *she != L'\\' && *she != L'/') ++she;
+    int sh_len = (int)(she - sh);
+    if (sh_len <= 0) return false;
+    if ((sh_len == 4 && prefix_ieq(sh, L"pipe", 4)) || (sh_len == 4 && prefix_ieq(sh, L"IPC$", 4))) return false;
+    return true;
+}
+
 // Paths must be plain drive-letter or UNC paths: no device namespace (\\.\, \\?\GLOBALROOT, \??\),
-// no embedded NULs.
+// no named-pipe/IPC$ shares, no embedded NULs, ASCII drive letters only.
 static bool acceptable_path(const wchar_t* path, uint32_t chars) {
     if (chars < 3 || wcslen(path) != chars) return false;
     if (!wcsncmp(path, L"\\\\?\\", 4)) {
-        path += 4;  // long-path prefix: allow \\?\X:\ and \\?\UNC\ only
-        if (!_wcsnicmp(path, L"UNC\\", 4)) return true;
-    } else if (!wcsncmp(path, L"\\\\", 2)) {
-        return path[2] != L'.' && path[2] != L'?';
+        path += 4;
+        if (prefix_ieq(path, L"UNC\\", 4)) return acceptable_unc_tail(path + 4);
+        return is_ascii_alpha(path[0]) && path[1] == L':' && path[2] == L'\\';
     }
-    return iswalpha(path[0]) && path[1] == L':' && path[2] == L'\\';
+    if (!wcsncmp(path, L"\\\\", 2)) {
+        return acceptable_unc_tail(path + 2);
+    }
+    return is_ascii_alpha(path[0]) && path[1] == L':' && path[2] == L'\\';
 }
 
 static const DWORD kIoTimeoutMs = 5000;
 
-static void handle_client(HANDLE p, wchar_t* path, HANDLE ev) {
-    abt_req req;
-    if (!read_all_timeout(p, &req, sizeof(req), kIoTimeoutMs, ev) || req.magic != ABT_MAGIC ||
-        req.version != ABT_PROTO_VERSION || req.path_chars > ABT_MAX_PATH_CHARS ||
-        req.total_len != sizeof(req) + req.path_chars * sizeof(wchar_t))
-        return;
-    if (req.path_chars && !read_all_timeout(p, path, req.path_chars * sizeof(wchar_t), kIoTimeoutMs, ev)) return;
-    path[req.path_chars] = 0;
-    const Caller caller = identify_caller(p);
+static bool handle_request(HANDLE p, abt_req req, const wchar_t* path, const Caller& caller, HANDLE ev) {
     abt_resp resp;
     init_resp(&resp, (abt_msg)req.msg);
     if (caller.low) {
-        req.flags &= ABT_RF_PREFETCH;  // only scheduling hints; the rest steers the agent (D-028)
+        req.flags &= (ABT_RF_PREFETCH | ABT_RF_CACHE_ONLY);  // only scheduling/cache hints (D-028, D-030)
         if (req.msg != ABT_MSG_THUMB && req.msg != ABT_MSG_PREVIEW && req.msg != ABT_MSG_INFO && req.msg != ABT_MSG_PING)
             req.msg = 0;  // -> E_INVALIDARG below
     }
@@ -333,10 +359,9 @@ static void handle_client(HANDLE p, wchar_t* path, HANDLE ev) {
         (!acceptable_path(path, req.path_chars) || req.cx > ABT_MAX_REPLY_DIM || req.cy > ABT_MAX_REPLY_DIM ||
          req.page > 0xFFFF)) {
         resp.hr = E_INVALIDARG;
-        write_all_timeout(p, &resp, sizeof(resp), kIoTimeoutMs, ev);
-        return;
+        return write_all_timeout(p, &resp, sizeof(resp), kIoTimeoutMs, ev);
     }
-    abt_image img = {};
+    RefPixBuf* pix = nullptr;
     char* text = nullptr;
     size_t text_len = 0;
     switch (req.msg) {
@@ -349,8 +374,10 @@ static void handle_client(HANDLE p, wchar_t* path, HANDLE ev) {
         break;
     case ABT_MSG_HINT: {
         DWORD a = GetFileAttributesW(path);
-        if (a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY)) prewarm_hint_folder(path, req.cx ? (int)req.cx : 256);
-        else prewarm_hint_file(path, req.cx ? (int)req.cx : 256);
+        int edge = req.cx ? (int)req.cx : 256;
+        if (edge > 2560) edge = 2560;
+        if (a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY)) prewarm_hint_folder(path, edge);
+        else prewarm_hint_file(path, edge);
         resp.hr = S_OK;
         break;
     }
@@ -380,7 +407,7 @@ static void handle_client(HANDLE p, wchar_t* path, HANDLE ev) {
     case ABT_MSG_THUMB:
     case ABT_MSG_PREVIEW:
     case ABT_MSG_INFO:
-        serve_image(req, path, &resp, &img);
+        serve_image(req, path, &resp, &pix);
         break;
     default:
         resp.hr = E_INVALIDARG;
@@ -388,17 +415,37 @@ static void handle_client(HANDLE p, wchar_t* path, HANDLE ev) {
     }
     // Bounded writes: a client that stops reading cannot park this thread.
     const DWORD out_timeout = kIoTimeoutMs + resp.pixel_len / 4096;  // ~4 MB/s floor for big previews
-    if (write_all_timeout(p, &resp, sizeof(resp), kIoTimeoutMs, ev) && resp.pixel_len)
-        write_all_timeout(p, text ? (void*)text : (void*)img.px, resp.pixel_len, out_timeout, ev);
+    const void* payload = text ? (const void*)text : (pix ? (const void*)pix->px : nullptr);
+    bool ok = write_all_timeout(p, &resp, sizeof(resp), kIoTimeoutMs, ev);
+    if (ok && resp.pixel_len && payload)
+        ok = write_all_timeout(p, payload, resp.pixel_len, out_timeout, ev);
     mem_free(text);
-    abt_image_free(&img);
+    pixbuf_release(pix);
+    return ok;
 }
 
-// The client closes its end once it has read the whole reply; wait for that (bounded) so that
-// DisconnectNamedPipe does not discard unread bytes. Replaces an unbounded FlushFileBuffers.
-static void wait_client_close(HANDLE p, HANDLE ev) {
-    uint8_t b;
-    read_all_timeout(p, &b, 1, kIoTimeoutMs, ev);
+// Persistent keep-alive loop: serves 1 or more requests on a connected pipe instance until the
+// client closes, idles out (5 s), sends a bad frame, or quits. Identifies the caller once.
+static void handle_connection(HANDLE p, wchar_t* path, HANDLE ev) {
+    bool identified = false;
+    Caller caller = {true, false};
+    while (!g_stop) {
+        abt_req req;
+        if (!read_all_timeout(p, &req, sizeof(req), kIoTimeoutMs, ev)) break;
+        if (req.magic != ABT_MAGIC || req.version != ABT_PROTO_VERSION ||
+            req.path_chars > ABT_MAX_PATH_CHARS ||
+            req.total_len != sizeof(req) + req.path_chars * sizeof(wchar_t))
+            break;
+        if (req.path_chars && !read_all_timeout(p, path, req.path_chars * sizeof(wchar_t), kIoTimeoutMs, ev))
+            break;
+        path[req.path_chars] = 0;
+        if (!identified) {
+            caller = identify_caller(p);
+            identified = true;
+        }
+        if (!handle_request(p, req, path, caller, ev)) break;
+        if (req.msg == ABT_MSG_QUIT) break;
+    }
 }
 
 static bool connect_client(HANDLE p, HANDLE ev) {
@@ -409,8 +456,15 @@ static bool connect_client(HANDLE p, HANDLE ev) {
     DWORD e = GetLastError();
     if (e == ERROR_PIPE_CONNECTED) return true;
     if (e != ERROR_IO_PENDING) return false;
+    HANDLE waits[2] = {ev, g_stop_event};
+    DWORD r = WaitForMultipleObjects(2, waits, FALSE, INFINITE);
     DWORD n = 0;
-    return GetOverlappedResult(p, &ov, &n, TRUE) != 0;  // server_stop connects once per thread
+    if (r != WAIT_OBJECT_0) {
+        CancelIoEx(p, &ov);
+        GetOverlappedResult(p, &ov, &n, TRUE);
+        return false;
+    }
+    return GetOverlappedResult(p, &ov, &n, FALSE) != 0;
 }
 
 static DWORD WINAPI server_thread(void* arg) {
@@ -423,14 +477,22 @@ static DWORD WINAPI server_thread(void* arg) {
         if (p == INVALID_HANDLE_VALUE || !p) p = create_instance(false);
         if (p == INVALID_HANDLE_VALUE || !p) { p = INVALID_HANDLE_VALUE; Sleep(100); continue; }
         if (connect_client(p, ev) && !g_stop) {
-            handle_client(p, path, ev);
-            wait_client_close(p, ev);
+            handle_connection(p, path, ev);
+            // Reuse the pipe instance across clients (avoids CreateNamedPipe/CloseHandle churn and
+            // prevents a zero-instance gap when ServerThreads=1).
+            if (!DisconnectNamedPipe(p)) {
+                CloseHandle(p);
+                p = INVALID_HANDLE_VALUE;
+            }
+        } else if (!g_stop) {
+            CloseHandle(p);
+            p = INVALID_HANDLE_VALUE;
         }
+    }
+    if (p != INVALID_HANDLE_VALUE && p) {
         DisconnectNamedPipe(p);
         CloseHandle(p);
-        p = INVALID_HANDLE_VALUE;
     }
-    if (p != INVALID_HANDLE_VALUE && p) CloseHandle(p);
     if (ev) CloseHandle(ev);
     mem_free(path);
     if (SUCCEEDED(co)) CoUninitialize();
@@ -439,41 +501,61 @@ static DWORD WINAPI server_thread(void* arg) {
 
 bool server_start(int threads) {
     pipe_name(g_name, _countof(g_name));
+    g_stop = false;
+    g_stop_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!g_stop_event) return false;
     if (!make_sd()) {  // never fall back to the default DACL
         logf("pipe security descriptor failed: %lu", GetLastError());
+        CloseHandle(g_stop_event); g_stop_event = nullptr;
         return false;
     }
     g_first = create_instance(true);
     if (g_first == INVALID_HANDLE_VALUE) {
         logf("pipe %ls unavailable (%lu): another agent is running?", g_name, GetLastError());
+        LocalFree(g_sd); g_sd = nullptr;
+        CloseHandle(g_stop_event); g_stop_event = nullptr;
         return false;
     }
     if (threads < 1) threads = 1;
     if (threads > (int)_countof(g_threads)) threads = (int)_countof(g_threads);
+    g_nthreads = 0;
+    bool first_handed = false;
     for (int i = 0; i < threads; ++i) {
-        g_threads[g_nthreads] = CreateThread(nullptr, 512 << 10, server_thread, i == 0 ? g_first : INVALID_HANDLE_VALUE,
-                                             STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
-        if (g_threads[g_nthreads]) ++g_nthreads;
+        HANDLE pass = (!first_handed) ? g_first : INVALID_HANDLE_VALUE;
+        HANDLE th = CreateThread(nullptr, 512 << 10, server_thread, pass, STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
+        if (th) {
+            if (!first_handed) first_handed = true;
+            g_threads[g_nthreads++] = th;
+        }
+    }
+    if (!first_handed) {
+        CloseHandle(g_first);
+        g_first = INVALID_HANDLE_VALUE;
+    }
+    if (g_nthreads == 0) {
+        LocalFree(g_sd); g_sd = nullptr;
+        CloseHandle(g_stop_event); g_stop_event = nullptr;
+        return false;
     }
     logf("pipe server: %ls, %d threads", g_name, g_nthreads);
-    return g_nthreads > 0;
+    return true;
 }
 
-void server_stop() {
+bool server_stop() {
     g_stop = true;
-    // Unblock ConnectNamedPipe in every thread by connecting once per thread.
-    for (int i = 0; i < g_nthreads; ++i) {
-        HANDLE h = CreateFileW(g_name, GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
-        if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
-    }
-    // Every pipe read/write has a timeout and the pool has already cancelled queued jobs, so
-    // threads finish within a few seconds. If one still runs, keep what it may touch alive.
+    if (g_stop_event) SetEvent(g_stop_event);
+    // Every pipe read/write has a timeout, ConnectNamedPipe watches g_stop_event, and the pool has
+    // already cancelled queued jobs, so threads exit cleanly.
     bool all_done = !g_nthreads ||
                     WaitForMultipleObjects((DWORD)g_nthreads, g_threads, TRUE, 8000) != WAIT_TIMEOUT;
     if (!all_done) logf("pipe server: threads still busy at shutdown");
     for (int i = 0; i < g_nthreads; ++i) CloseHandle(g_threads[i]);
     g_nthreads = 0;
-    if (all_done && g_sd) { LocalFree(g_sd); g_sd = nullptr; }
+    if (all_done) {
+        if (g_sd) { LocalFree(g_sd); g_sd = nullptr; }
+        if (g_stop_event) { CloseHandle(g_stop_event); g_stop_event = nullptr; }
+    }
+    return all_done;
 }
 
 }  // namespace abt
