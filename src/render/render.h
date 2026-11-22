@@ -38,6 +38,8 @@ struct RenderResult {
 };
 
 void render_shutdown();
+void render_release_cached_doc();
+bool render_has_cached_doc();
 void render_file(const RenderRequest& rq, RenderResult* rr);
 void render_result_free(RenderResult* rr);
 
@@ -50,6 +52,7 @@ struct MappedFile {
     DWORD err;           // Win32 error when map_file fails (0-byte files: ERROR_EMPTY)
     bool is_mapped;      // true = MapViewOfFile; false = ReadFile into buffer
     bool from_scratch;   // true = data eligible for reusable worker scratch buffer
+    bool writable;       // true = copy-on-write view or private buffer (safe for in-place patching)
 };
 bool map_file(const wchar_t* path, MappedFile* mf);
 void unmap_file(MappedFile* mf);
@@ -59,8 +62,10 @@ void gs_shutdown();
 
 // Reusable PDFium document handle (single FPDF_LoadMemDocument64 per render_file).
 struct PdfDoc;
+void pdf_patch_ai_cmyk_icc(uint8_t* data, size_t size);
 PdfDoc* pdf_open(const uint8_t* data, size_t size, abt_file_info* info, HRESULT* err_hr);
 bool pdf_doc_layout(PdfDoc* doc, int* pages, float* w0, float* h0);
+bool pdf_doc_page_size(PdfDoc* doc, int page_index, float* w, float* h);
 HRESULT pdf_doc_render(PdfDoc* doc, const RenderRequest& rq, abt_family fam, uint64_t deadline_qpc, abt_image* out,
                        abt_file_info* info, bool* no_pdf_content, double* out_ink);
 void pdf_close(PdfDoc* doc);

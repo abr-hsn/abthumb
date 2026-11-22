@@ -3,6 +3,7 @@
 #include "abt_proto.h"
 #include "abt_decode.h"
 #include "abt_wic.h"
+#include "abt_reader.h"
 #include <fpdfview.h>
 #include <fpdf_progressive.h>
 #include <fpdf_text.h>
@@ -35,12 +36,135 @@ static uint64_t qpc_deadline_from_ms(uint32_t ms) {
 }
 
 void render_shutdown() {
+    render_release_cached_doc();
     if (g_pdfium_ready) FPDF_DestroyLibrary();
     g_pdfium_ready = false;
     cmyk_xform_shutdown();
     wic_shutdown();
     gs_shutdown();
     render_scratch_shutdown();
+}
+
+// Replaces an Illustrator 4-channel CMYK [/ICCBased <num> 0 R] colorspace array in copy-on-write
+// memory with /DeviceCMYK padded with spaces to the exact same byte length (preserving all PDF
+// xref offsets). Avoids LittleCMS 4D tetrahedral evaluation on tens of millions of high-DPI source
+// pixels before downscaling (3x-6x speedup on heavy CMYK Illustrator files).
+static bool try_patch_icc_obj_at(uint8_t* data, size_t size, size_t off) {
+    if (off >= size) return false;
+    size_t win = size - off < 512 ? size - off : 512;
+    const uint8_t* base = data + off;
+    const uint8_t* hit = (const uint8_t*)abt_memmem(base, win, "[/ICCBased", 10);
+    if (!hit || (size_t)(hit - base) > 64) return false;
+    const uint8_t* p = hit + 10;
+    const uint8_t* end = base + win;
+    while (p < end && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) ++p;
+    if (p >= end || *p < '0' || *p > '9') return false;
+    while (p < end && *p >= '0' && *p <= '9') ++p;
+    while (p < end && (*p == ' ' || *p == '\t')) ++p;
+    if (p + 3 >= end || p[0] != '0' || (p[1] != ' ' && p[1] != '\t') || p[2] != 'R') return false;
+    p += 3;
+    while (p < end && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) ++p;
+    if (p >= end || *p != ']') return false;
+    ++p;
+    size_t arr_len = (size_t)(p - hit);
+    if (arr_len < 11 || arr_len > 48) return false;
+    // Verify the following ICC profile stream dictionary specifies /N 4 (4-channel CMYK).
+    size_t rem = (size_t)(end - p);
+    const uint8_t* n4 = (const uint8_t*)abt_memmem(p, rem, "/N 4", 4);
+    if (!n4) return false;
+    if (n4 + 4 < end && n4[4] >= '0' && n4[4] <= '9') return false;
+    uint8_t* dst = data + (hit - data);
+    memcpy(dst, "/DeviceCMYK", 11);
+    if (arr_len > 11) memset(dst + 11, ' ', arr_len - 11);
+    return true;
+}
+
+static size_t lookup_xref_offset(const uint8_t* data, size_t size, size_t xref_off, uint32_t target_obj) {
+    if (xref_off >= size || size - xref_off < 24 || memcmp(data + xref_off, "xref", 4) != 0) return 0;
+    const uint8_t* p = data + xref_off + 4;
+    const uint8_t* end = data + size;
+    for (int sub = 0; sub < 64 && p < end; ++sub) {
+        while (p < end && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) ++p;
+        if (p >= end || *p < '0' || *p > '9') break;
+        uint32_t first = 0, count = 0;
+        while (p < end && *p >= '0' && *p <= '9' && first < 10000000u) first = first * 10u + (uint32_t)(*p++ - '0');
+        while (p < end && (*p == ' ' || *p == '\t')) ++p;
+        if (p >= end || *p < '0' || *p > '9') break;
+        while (p < end && *p >= '0' && *p <= '9' && count < 10000000u) count = count * 10u + (uint32_t)(*p++ - '0');
+        while (p < end && (*p == ' ' || *p == '\t')) ++p;
+        if (p < end && *p == '\r') ++p;
+        if (p < end && *p == '\n') ++p;
+        if ((uint64_t)count * 20u > (uint64_t)(end - p)) break;
+        if (target_obj >= first && target_obj < first + count) {
+            const uint8_t* ent = p + (size_t)(target_obj - first) * 20u;
+            if (ent[17] != 'n') return 0;
+            size_t off = 0;
+            for (int k = 0; k < 10; ++k) {
+                if (ent[k] < '0' || ent[k] > '9') return 0;
+                off = off * 10u + (size_t)(ent[k] - '0');
+            }
+            return off < size ? off : 0;
+        }
+        p += (size_t)count * 20u;
+    }
+    return 0;
+}
+
+void pdf_patch_ai_cmyk_icc(uint8_t* data, size_t size) {
+    if (!data || size < 64) return;
+    // 1. Find startxref in the last 4 KB for O(1) xref table lookup without faulting the file body.
+    size_t tail_off = size > 4096 ? size - 4096 : 0;
+    const uint8_t* sx = (const uint8_t*)abt_memrmem(data + tail_off, size - tail_off, "startxref", 9);
+    size_t xref_off = 0;
+    if (sx) {
+        const uint8_t* p = sx + 9;
+        const uint8_t* end = data + size;
+        while (p < end && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) ++p;
+        while (p < end && *p >= '0' && *p <= '9') {
+            xref_off = xref_off * 10u + (size_t)(*p++ - '0');
+            if (xref_off >= size) { xref_off = 0; break; }
+        }
+    }
+    if (xref_off > 0 && xref_off < size) {
+        // Scan /ColorSpace dictionaries in the first 512 KB (where Page 1 lives after the XMP packet).
+        size_t head = size < (512u << 10) ? size : (512u << 10);
+        const uint8_t* p = data;
+        const uint8_t* end = data + head;
+        while (p < end) {
+            const uint8_t* cs = (const uint8_t*)abt_memmem(p, (size_t)(end - p), "/ColorSpace", 11);
+            if (!cs) break;
+            p = cs + 11;
+            const uint8_t* lim = p + 256 < end ? p + 256 : end;
+            const uint8_t* gt = (const uint8_t*)abt_memmem(p, (size_t)(lim - p), ">>", 2);
+            if (gt) lim = gt;
+            const uint8_t* q = p;
+            while (q < lim) {
+                if (*q >= '1' && *q <= '9') {
+                    uint32_t obj = 0;
+                    while (q < lim && *q >= '0' && *q <= '9' && obj < 10000000u)
+                        obj = obj * 10u + (uint32_t)(*q++ - '0');
+                    if (q + 3 <= lim && q[0] == ' ' && q[1] == '0' && q[2] == ' ' && q[3] == 'R') {
+                        size_t obj_off = lookup_xref_offset(data, size, xref_off, obj);
+                        if (obj_off > 0) try_patch_icc_obj_at(data, size, obj_off);
+                        q += 4;
+                        continue;
+                    }
+                }
+                ++q;
+            }
+        }
+    }
+    // 2. For files <= 4 MB (already buffered in RAM), also scan directly for any [/ICCBased ...].
+    if (size <= (4u << 20)) {
+        size_t pos = 0;
+        while (pos < size) {
+            const uint8_t* hit = (const uint8_t*)abt_memmem(data + pos, size - pos, "[/ICCBased", 10);
+            if (!hit) break;
+            size_t off = (size_t)(hit - data);
+            try_patch_icc_obj_at(data, size, off);
+            pos = off + 10;
+        }
+    }
 }
 
 struct PauseCtx {
@@ -160,21 +284,31 @@ void pdf_close(PdfDoc* doc) {
     if (doc) FPDF_CloseDocument((FPDF_DOCUMENT)doc);
 }
 
+bool pdf_doc_page_size(PdfDoc* doc, int page_index, float* w, float* h) {
+    *w = *h = 0;
+    if (!doc || page_index < 0) return false;
+    FPDF_DOCUMENT d = (FPDF_DOCUMENT)doc;
+    FS_SIZEF sz = {};
+    bool ok = FPDF_GetPageSizeByIndexF(d, page_index, &sz) && isfinite(sz.width) && isfinite(sz.height) &&
+              sz.width > 0 && sz.height > 0;
+    if (ok) {
+        *w = sz.width;
+        *h = sz.height;
+    }
+    return ok;
+}
+
 bool pdf_doc_layout(PdfDoc* doc, int* pages, float* w0, float* h0) {
     *pages = 0;
     *w0 = *h0 = 0;
     if (!doc) return false;
     FPDF_DOCUMENT d = (FPDF_DOCUMENT)doc;
     int n = FPDF_GetPageCount(d);
-    FS_SIZEF sz = {};
-    bool ok = n > 0 && FPDF_GetPageSizeByIndexF(d, 0, &sz) && isfinite(sz.width) && isfinite(sz.height) &&
-              sz.width > 0 && sz.height > 0;
-    if (ok) {
+    if (n > 0 && pdf_doc_page_size(doc, 0, w0, h0)) {
         *pages = n;
-        *w0 = sz.width;
-        *h0 = sz.height;
+        return true;
     }
-    return ok;
+    return false;
 }
 
 HRESULT pdf_doc_render(PdfDoc* doc, const RenderRequest& rq, abt_family fam, uint64_t deadline_qpc, abt_image* out,

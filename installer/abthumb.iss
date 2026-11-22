@@ -60,6 +60,8 @@ Source: "{#Dist}\abthumb-agent.exe"; DestDir: "{app}"; Flags: ignoreversion unin
 Source: "{#Dist}\abthumb-render.exe"; DestDir: "{app}"; Flags: ignoreversion uninsrestartdelete
 Source: "{#Dist}\abthumb-preview.exe"; DestDir: "{app}"; Flags: ignoreversion uninsrestartdelete
 Source: "{#Dist}\abthumb.exe"; DestDir: "{app}"; Flags: ignoreversion uninsrestartdelete
+Source: "{#Dist}\gswin64c.exe"; DestDir: "{app}"; Flags: ignoreversion uninsrestartdelete skipifsourcedoesntexist
+Source: "{#Dist}\gsdll64.dll"; DestDir: "{app}"; Flags: ignoreversion uninsrestartdelete skipifsourcedoesntexist
 Source: "{#Dist}\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#Dist}\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#Dist}\THIRD_PARTY_NOTICES.md"; DestDir: "{app}"; Flags: ignoreversion
@@ -80,6 +82,7 @@ Filename: "{app}\abthumb.exe"; Parameters: "stop-agent"; Flags: runhidden; RunOn
 Filename: "{sys}\taskkill.exe"; Parameters: "/F /T /IM abthumb-agent.exe"; Flags: runhidden; RunOnceId: "StopAgent"
 Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM abthumb-render.exe"; Flags: runhidden; RunOnceId: "StopRender"
 Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM abthumb-preview.exe"; Flags: runhidden; RunOnceId: "StopPreview"
+Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM gswin64c.exe"; Flags: runhidden; RunOnceId: "StopGS"
 
 [UninstallDelete]
 Type: files; Name: "{app}\*.old-*"
@@ -118,6 +121,7 @@ begin
   Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /T /IM abthumb-agent.exe', '', SW_HIDE, ewWaitUntilTerminated, Code);
   Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM abthumb-render.exe', '', SW_HIDE, ewWaitUntilTerminated, Code);
   Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM abthumb-preview.exe', '', SW_HIDE, ewWaitUntilTerminated, Code);
+  Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM gswin64c.exe', '', SW_HIDE, ewWaitUntilTerminated, Code);
 end;
 
 { Explorer (and its thumbnail host) keep abthumb.dll loaded, and a still-loaded DLL can respawn
@@ -150,6 +154,8 @@ begin
   MoveAsideIfLocked('pdfium.dll');
   MoveAsideIfLocked('abthumb-agent.exe');
   MoveAsideIfLocked('abthumb-render.exe');
+  MoveAsideIfLocked('gswin64c.exe');
+  MoveAsideIfLocked('gsdll64.dll');
   { Uninstall entry of the earlier script-based installer, replaced by Inno's own. }
   RegDeleteKeyIncludingSubkeys(HKLM, 'Software\Microsoft\Windows\CurrentVersion\Uninstall\abthumb');
   Result := '';

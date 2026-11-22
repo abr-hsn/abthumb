@@ -8,7 +8,7 @@
 
 namespace abt {
 
-static const uint32_t kRendererVersion = 3;  // 2-3: blank-preview fixes (D-032). Bump when output changes: invalidates the cache
+static const uint32_t kRendererVersion = 4;  // 4: high-res whole-canvas AI composite & 1600 px RAM hot cache
 static const uint32_t kRecMagic = 0x52544241u;  // "ABTR"
 static const uint32_t kIdxMagic = 0x49544241u;  // "ABTI"
 static const uint64_t kSegMax = 64ull << 20;
@@ -17,8 +17,8 @@ static const int kTiers[] = {256, 512, 768, 1200, 1600, 2560};  // previews stop
 static const uint32_t kNegTier = 0xFFFFu;
 static const uint16_t kCodecQoi = 0, kCodecJpeg = 1;  // RecHdr.reserved: payload encoding
 static const int kMaxSegs = 4096;
-static const size_t kHotMaxBytes = 48ull << 20;  // 48 MB in-memory LRU hot cache
-static const int kHotMaxEdge = 512;              // cache decoded BGRA up to 512 px in RAM
+static const size_t kHotMaxBytes = 128ull << 20;  // 128 MB in-memory LRU hot cache (holds thumbnails + preview artboards)
+static const int kHotMaxEdge = 1600;              // cache decoded BGRA up to 1600 px (Preview Pane tier) in RAM
 static const int kHotBuckets = 512;
 static const int kMaxWriteQueue = 64;
 static const size_t kMaxWriteQueueBytes = 128ull << 20;

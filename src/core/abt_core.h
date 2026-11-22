@@ -66,6 +66,8 @@ typedef struct abt_file_info {
     uint32_t preview_h;
     char creator[48];     /* UTF-8, e.g. "Adobe Illustrator 30.0" */
     char version[16];     /* UTF-8, e.g. "PDF 1.6", "PSD v1", "AI 8" */
+    float canvas_pt_w;    /* AI 9+: whole-canvas width in points (%%HiResBoundingBox), 0 if unknown */
+    float canvas_pt_h;    /* AI 9+: whole-canvas height in points */
 } abt_file_info;
 
 const char* abt_status_str(abt_status s);

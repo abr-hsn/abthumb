@@ -13,10 +13,18 @@ New-Item -ItemType Directory -Force "$out\licenses" | Out-Null
 foreach ($f in "abthumb.dll", "abthumb.exe", "abthumb-agent.exe", "abthumb-render.exe", "abthumb-preview.exe", "pdfium.dll") {
   Copy-Item "$bin\$f" $out
 }
+if (Test-Path "$bin\gswin64c.exe") {
+  Copy-Item "$bin\gswin64c.exe", "$bin\gsdll64.dll" $out
+} elseif (Test-Path "$root\third_party\ghostscript\bin\gswin64c.exe") {
+  Copy-Item "$root\third_party\ghostscript\bin\gswin64c.exe", "$root\third_party\ghostscript\bin\gsdll64.dll" $out
+}
 Copy-Item "$root\LICENSE", "$root\README.md", "$root\THIRD_PARTY_NOTICES.md" $out
 Copy-Item "$root\third_party\pdfium\LICENSE" "$out\licenses\pdfium-LICENSE.txt"
 Copy-Item "$root\third_party\pdfium\licenses\*" "$out\licenses\"
 Copy-Item "$root\third_party\miniz\LICENSE" "$out\licenses\miniz-LICENSE.txt"
+if (Test-Path "$root\third_party\ghostscript\COPYING") {
+  Copy-Item "$root\third_party\ghostscript\COPYING" "$out\licenses\ghostscript-LICENSE.txt"
+}
 
 # Installer
 $iscc = @("$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe", "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",

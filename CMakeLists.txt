@@ -118,6 +118,13 @@ set_target_properties(abthumb_render PROPERTIES OUTPUT_NAME abthumb-render)
 target_link_libraries(abthumb_render PRIVATE abt_render)
 add_custom_command(TARGET abthumb_render POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_if_different "${ABT_PDFIUM_DIR}/bin/pdfium.dll" "$<TARGET_FILE_DIR:abthumb_render>")
+if(EXISTS "${CMAKE_SOURCE_DIR}/third_party/ghostscript/bin/gswin64c.exe")
+  add_custom_command(TARGET abthumb_render POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+      "${CMAKE_SOURCE_DIR}/third_party/ghostscript/bin/gswin64c.exe"
+      "${CMAKE_SOURCE_DIR}/third_party/ghostscript/bin/gsdll64.dll"
+      "$<TARGET_FILE_DIR:abthumb_render>")
+endif()
 
 # ---------------------------------------------------------------- shell extension DLL
 add_library(abthumb SHARED

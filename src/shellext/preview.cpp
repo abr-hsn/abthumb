@@ -20,7 +20,7 @@ namespace {
 const wchar_t kWndClass[] = L"abthumbPreviewWnd";
 const UINT WM_APP_RESULT = WM_APP + 1;
 const UINT_PTR kResizeTimer = 1;
-const int kPageCache = 5;  // bitmaps of pages already rendered for the current file
+const int kPageCache = 24;  // bitmaps of pages already rendered for the current file
 
 // Shared between the handler (UI thread) and its request thread; refcounted so the thread can
 // finish a slow request after the handler is gone.
@@ -120,22 +120,29 @@ Result* fetch(uint16_t msg, const wchar_t* path, int cx, int cy, int page, int g
 void prefetch_neighbours(Shared* s, const wchar_t* path, int cx, int cy, int page, int count, int dir, int gen,
                          int file_gen) {
     int dirs[2] = {dir < 0 ? -1 : 1, dir < 0 ? 1 : -1};
+    int max_non_empty[2] = {8, 2};  // burst-prefetch up to 8 pages ahead and 2 behind across worker pool
     for (int i = 0; i < 2; ++i) {
-        for (int p = page + dirs[i], hops = 0; p >= 0 && p < count && hops < 8; p += dirs[i], ++hops) {
+        int non_empty = 0;
+        for (int p = page + dirs[i], hops = 0; p >= 0 && p < count && hops < 16 && non_empty < max_non_empty[i];
+             p += dirs[i], ++hops) {
             if (new_request_pending(s)) return;
             abt_resp resp;
             uint8_t* px = nullptr;
             HRESULT hr = request_image(ABT_MSG_PREVIEW, path, (UINT)cx, (UINT)cy, (UINT)p, &resp, &px, ABT_RF_PREFETCH);
             abt::mem_free(px);
-            if (hr != S_OK || !(resp.info.flags & ABT_INFO_PAGE_EMPTY)) break;  // queued, or a real page
-            Result* r = (Result*)abt::mem_zalloc(sizeof(Result));
-            if (!r) return;
-            r->gen = gen;
-            r->file_gen = file_gen;
-            r->page = p;
-            r->info_only = true;
-            r->info = resp.info;
-            post_result(s, r);
+            if (hr == S_OK && (resp.info.flags & ABT_INFO_PAGE_EMPTY)) {
+                Result* r = (Result*)abt::mem_zalloc(sizeof(Result));
+                if (!r) return;
+                r->gen = gen;
+                r->file_gen = file_gen;
+                r->page = p;
+                r->info_only = true;
+                r->info = resp.info;
+                post_result(s, r);
+                continue;
+            }
+            if (FAILED(hr)) break;
+            ++non_empty;
         }
     }
 }
@@ -165,7 +172,8 @@ DWORD WINAPI request_thread(void* arg) {
         if (stop) { abt::mem_free(path); break; }
         if (!path) continue;
         if (pixels) {
-            // First paint of a new file: the thumbnail tier is usually cached already (sub-ms).
+            // First paint of a new file: the thumbnail tier is usually cached already (sub-ms), or
+            // extracted from the embedded preview via ABT_MODE_FAST (< 1 ms).
             if (quick_done_for != file_gen && page <= 0) {
                 quick_done_for = file_gen;
                 if (Result* q = fetch(ABT_MSG_THUMB, path, 256, 256, page, gen, file_gen, true)) {
@@ -178,6 +186,9 @@ DWORD WINAPI request_thread(void* arg) {
                 }
                 if (new_request_pending(s)) { abt::mem_free(path); continue; }  // the user moved on
             }
+            // Start prefetching artboards across the worker pool immediately once page count is known.
+            if (count > 1) prefetch_neighbours(s, path, cx, cy, page, count, dir, gen, file_gen);
+            if (new_request_pending(s)) { abt::mem_free(path); continue; }
             if (Result* r = fetch(ABT_MSG_PREVIEW, path, cx, cy, page, gen, file_gen, false)) {
                 if (r->info.page_count > (uint32_t)count) count = (int)min_u32(r->info.page_count, 100000);
                 post_result(s, r);

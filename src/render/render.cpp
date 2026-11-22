@@ -98,9 +98,13 @@ bool map_file(const wchar_t* path, MappedFile* mf) {
         return false;
     }
     const size_t fsize = (size_t)sz.QuadPart;
+    const bool slow = is_slow_path(path);
 
-    // Small/medium files (<= 4 MB): single ReadFile into reusable buffer (no mmap/TLB/SEH overhead).
-    if (fsize <= kBufferedFileMax) {
+    // Small/medium local files (<= 4 MB) or tiny network files (<= 64 KB): single ReadFile into reusable
+    // buffer (no mmap/TLB/SEH overhead). On SMB shares (> 64 KB), use MapViewOfFile so extracting a
+    // 30 KB embedded XMP thumbnail from a 1.5 MB network file only transfers the touched 64 KB head.
+    const size_t buf_limit = slow ? (64u << 10) : kBufferedFileMax;
+    if (fsize <= buf_limit) {
         size_t cap = 0;
         uint8_t* buf = take_buf(&g_file_buf_lock, &g_file_buf, &g_file_cap, fsize, &cap);
         if (buf) {
@@ -124,6 +128,7 @@ bool map_file(const wchar_t* path, MappedFile* mf) {
                 mf->buf_cap = cap;
                 mf->is_mapped = false;
                 mf->from_scratch = (cap <= kBufferedFileMax);
+                mf->writable = true;
                 return true;
             }
             return_buf(&g_file_buf_lock, &g_file_buf, &g_file_cap, buf, cap, kBufferedFileMax);
@@ -132,9 +137,16 @@ bool map_file(const wchar_t* path, MappedFile* mf) {
         }
     }
 
-    mf->map = CreateFileMappingW(mf->file, nullptr, PAGE_READONLY, 0, 0, nullptr);
+    // Map with PAGE_WRITECOPY (FILE_MAP_COPY) on local drives so in-memory copy-on-write patches
+    // (such as CMYK ICC fast-path) never touch the file on disk. Fall back to PAGE_READONLY if needed.
+    bool copy_on_write = !slow;
+    mf->map = CreateFileMappingW(mf->file, nullptr, copy_on_write ? PAGE_WRITECOPY : PAGE_READONLY, 0, 0, nullptr);
+    if (!mf->map && copy_on_write) {
+        copy_on_write = false;
+        mf->map = CreateFileMappingW(mf->file, nullptr, PAGE_READONLY, 0, 0, nullptr);
+    }
     if (!mf->map) { mf->err = GetLastError(); CloseHandle(mf->file); mf->file = nullptr; return false; }
-    mf->data = (const uint8_t*)MapViewOfFile(mf->map, FILE_MAP_READ, 0, 0, 0);
+    mf->data = (const uint8_t*)MapViewOfFile(mf->map, copy_on_write ? FILE_MAP_COPY : FILE_MAP_READ, 0, 0, 0);
     if (!mf->data) {
         DWORD e = GetLastError();
         CloseHandle(mf->map);
@@ -145,6 +157,7 @@ bool map_file(const wchar_t* path, MappedFile* mf) {
     }
     mf->size = fsize;
     mf->is_mapped = true;
+    mf->writable = copy_on_write;
     return true;
 }
 
@@ -292,8 +305,7 @@ static bool ai_layout_from_xmp(const abt_probe& pr, int* pages, float* w0, float
 // The whole-canvas thumbnail of a multi-artboard Illustrator file: Illustrator's own document
 // thumbnail, enlarged when the request is bigger than it (soft, but it is the only image that holds
 // art outside the artboards).
-static bool ai_canvas_thumbnail(const MappedFile& mf, const abt_probe& pr, int bw, int bh, RenderResult* rr) {
-    int edge = bw > bh ? bw : bh;
+static int ai_best_xmp_preview(const abt_probe& pr, int edge) {
     int best_ge = -1, best_any = -1;
     uint32_t ge_len = 0xFFFFFFFFu, any_len = 0;
     for (int i = 0; i < pr.n_previews; ++i) {
@@ -303,7 +315,12 @@ static bool ai_canvas_thumbnail(const MappedFile& mf, const abt_probe& pr, int b
         if (l >= (uint32_t)edge && l < ge_len) { ge_len = l; best_ge = i; }
         if (best_any < 0 || l > any_len) { any_len = l; best_any = i; }
     }
-    int best = best_ge >= 0 ? best_ge : best_any;
+    return best_ge >= 0 ? best_ge : best_any;
+}
+
+static bool ai_canvas_thumbnail(const MappedFile& mf, const abt_probe& pr, int bw, int bh, RenderResult* rr) {
+    int edge = bw > bh ? bw : bh;
+    int best = ai_best_xmp_preview(pr, edge);
     if (best < 0) return false;
     abt_image img = {};
     if (FAILED(decode_preview(mf, pr.previews[best], bw, bh, &img))) return false;
@@ -316,10 +333,139 @@ static bool ai_canvas_thumbnail(const MappedFile& mf, const abt_probe& pr, int b
     return true;
 }
 
-struct PdfDocGuard {
-    PdfDoc* doc = nullptr;
-    ~PdfDocGuard() { pdf_close(doc); }
+// High-resolution whole-artwork render for multi-artboard Illustrator files (edge > 256):
+// composites crisp PDFium vector/image renders of each artboard onto the upscaled XMP document
+// thumbnail (so off-artboard dimension labels and artwork are preserved while every artboard is
+// crystal clear).
+static bool ai_render_whole_canvas(const RenderRequest& rq, const MappedFile& mf, const abt_probe& pr,
+                                   int bw, int bh, uint64_t deadline_qpc, PdfDoc* doc, RenderResult* rr) {
+    if (!doc) return false;
+    int best = ai_best_xmp_preview(pr, bw > bh ? bw : bh);
+    if (best < 0) return false;
+    float canvas_pt_w = pr.info.canvas_pt_w;
+    float canvas_pt_h = pr.info.canvas_pt_h;
+    if (!(canvas_pt_w > 0.0f && canvas_pt_h > 0.0f)) return false;
+
+    abt_image thumb = {};
+    if (FAILED(decode_preview(mf, pr.previews[best], 4096, 4096, &thumb))) return false;
+    abt_image canvas_img = {};
+    int cw = 0, ch = 0;
+    fit_box(thumb.w, thumb.h, bw, bh, true, &cw, &ch);
+    if (abt_resize(thumb.px, thumb.w, thumb.h, (size_t)thumb.w * 4u, cw, ch, &canvas_img) != ABT_OK) {
+        abt_image_free(&thumb);
+        return false;
+    }
+    canvas_img.has_alpha = 0;
+
+    enum { kMaxCanvasPages = 32 };
+    int npages = (int)rr->info.page_count;
+    if (npages < 1) {
+        int lp = 0; float w0 = 0, h0 = 0;
+        if (pdf_doc_layout(doc, &lp, &w0, &h0)) npages = lp;
+    }
+    if (npages > kMaxCanvasPages) npages = kMaxCanvasPages;
+
+    float pw[kMaxCanvasPages] = {};
+    float ph[kMaxCanvasPages] = {};
+    int order[kMaxCanvasPages] = {};
+    int valid_pages = 0;
+    for (int p = 0; p < npages; ++p) {
+        if (pdf_doc_page_size(doc, p, &pw[p], &ph[p])) {
+            order[valid_pages++] = p;
+        }
+    }
+    // Place larger artboards first so smaller strips cannot match sub-regions of larger artboards.
+    for (int i = 1; i < valid_pages; ++i) {
+        int cur = order[i];
+        float cur_a = pw[cur] * ph[cur];
+        int j = i - 1;
+        while (j >= 0 && pw[order[j]] * ph[order[j]] < cur_a) {
+            order[j + 1] = order[j];
+            --j;
+        }
+        order[j + 1] = cur;
+    }
+
+    abt_canvas_rect placed[kMaxCanvasPages] = {};
+    int n_placed = 0;
+    bool no_pdf = false;
+    for (int i = 0; i < valid_pages; ++i) {
+        if (deadline_qpc && qpc() > deadline_qpc) break;
+        int p = order[i];
+        int ab_w = (int)((double)cw * (double)pw[p] / (double)canvas_pt_w + 0.5);
+        int ab_h = (int)((double)ch * (double)ph[p] / (double)canvas_pt_h + 0.5);
+        int ab_edge = ab_w > ab_h ? ab_w : ab_h;
+        if (ab_edge < 8) continue;
+
+        RenderRequest prq = rq;
+        prq.page = p;
+        prq.cx = ab_w;
+        prq.cy = ab_h;
+        abt_image page_img = {};
+        abt_file_info pinfo = rr->info;
+        pinfo.flags &= ~(uint32_t)ABT_INFO_PAGE_EMPTY;
+        bool page_no_pdf = false;
+        HRESULT hr = pdf_doc_render(doc, prq, ABT_FAM_AI_PDF, deadline_qpc, &page_img, &pinfo, &page_no_pdf, nullptr);
+        if (page_no_pdf) { no_pdf = true; abt_image_free(&page_img); break; }
+        if (SUCCEEDED(hr) && !(pinfo.flags & ABT_INFO_PAGE_EMPTY) && page_img.px) {
+            abt_canvas_place_artboard(&canvas_img, &thumb, canvas_pt_w, canvas_pt_h, &page_img, pw[p], ph[p],
+                                      placed, &n_placed, kMaxCanvasPages);
+        }
+        abt_image_free(&page_img);
+    }
+    abt_image_free(&thumb);
+
+    if (no_pdf || n_placed == 0) {
+        abt_image_free(&canvas_img);
+        return false;
+    }
+    rr->img = canvas_img;
+    rr->hr = S_OK;
+    rr->source = ABT_SRC_RENDERED;
+    rr->info.flags |= ABT_INFO_HAS_PDF_CONTENT;
+    set_reason(rr, "Illustrator whole canvas (high-res artboards)");
+    return true;
+}
+
+// ------------------------------------------------------------------ persistent 1-document worker cache
+struct CachedDoc {
+    wchar_t path[ABT_MAX_PATH_CHARS + 1];
+    uint64_t file_size;
+    uint64_t mtime;
+    MappedFile mf;
+    abt_probe pr;
+    abt_status probe_st;
+    PdfDoc* pdf;
+    HRESULT pdf_open_hr;
+    bool cmyk_patched;
+    bool max_quality;
 };
+
+static SRWLOCK g_doc_lock = SRWLOCK_INIT;
+static CachedDoc* g_cached_doc = nullptr;
+
+static void cached_doc_close(CachedDoc* cd) {
+    if (!cd) return;
+    pdf_close(cd->pdf);
+    unmap_file(&cd->mf);
+    free(cd);
+}
+
+void render_release_cached_doc() {
+    CachedDoc* cd = nullptr;
+    AcquireSRWLockExclusive(&g_doc_lock);
+    cd = g_cached_doc;
+    g_cached_doc = nullptr;
+    ReleaseSRWLockExclusive(&g_doc_lock);
+    cached_doc_close(cd);
+}
+
+bool render_has_cached_doc() {
+    AcquireSRWLockShared(&g_doc_lock);
+    bool has = g_cached_doc != nullptr;
+    ReleaseSRWLockShared(&g_doc_lock);
+    return has;
+}
 
 static uint64_t make_deadline_qpc(uint32_t deadline_ms) {
     if (!deadline_ms) return 0;
@@ -335,9 +481,10 @@ static uint64_t make_deadline_qpc(uint32_t deadline_ms) {
 }
 
 // Body of the pipeline; may fault on I/O errors of the mapped view (guarded by the caller).
-static void render_inner(const RenderRequest& rq, const MappedFile& mf, RenderResult* rr) {
-    abt_probe pr;
-    abt_status st = abt_probe_file(mf.data, mf.size, &pr);
+static void render_inner(const RenderRequest& rq, CachedDoc* cd, RenderResult* rr) {
+    const MappedFile& mf = cd->mf;
+    const abt_probe& pr = cd->pr;
+    abt_status st = cd->probe_st;
     rr->info = pr.info;
     if (st != ABT_OK) {
         rr->hr = HRESULT_FROM_WIN32(ERROR_BAD_FORMAT);
@@ -349,12 +496,16 @@ static void render_inner(const RenderRequest& rq, const MappedFile& mf, RenderRe
     const int page = canvas ? 0 : rq.page;
     const uint64_t deadline_qpc = make_deadline_qpc(rq.deadline_ms);
 
-    // Single PDFium document handle kept open across layout, page 0, and multi-page fallback (Opt 1).
-    PdfDocGuard pdf;
-    HRESULT pdf_open_hr = S_OK;
+    // Persistent PDFium document handle kept open across layout, page renders, and consecutive requests.
     auto ensure_pdf = [&]() -> PdfDoc* {
-        if (!pdf.doc) pdf.doc = pdf_open(mf.data, mf.size, &rr->info, &pdf_open_hr);
-        return pdf.doc;
+        if (!cd->pdf && cd->pdf_open_hr == S_OK) {
+            if (fam == ABT_FAM_AI_PDF && cd->mf.writable && !cd->cmyk_patched && !(rq.flags & ABT_RF_MAX_QUALITY)) {
+                pdf_patch_ai_cmyk_icc(const_cast<uint8_t*>(cd->mf.data), cd->mf.size);
+                cd->cmyk_patched = true;
+            }
+            cd->pdf = pdf_open(mf.data, mf.size, &rr->info, &cd->pdf_open_hr);
+        }
+        return cd->pdf;
     };
 
     // Illustrator: artboard count and whether the whole canvas is more than artboard 1 (D-029).
@@ -368,11 +519,23 @@ static void render_inner(const RenderRequest& rq, const MappedFile& mf, RenderRe
         if (rq.mode != ABT_MODE_PROBE)
             have_layout = ai_layout_from_xmp(pr, &pages, &w0, &h0);
         if (!have_layout && ensure_pdf())
-            have_layout = pdf_doc_layout(pdf.doc, &pages, &w0, &h0);
+            have_layout = pdf_doc_layout(cd->pdf, &pages, &w0, &h0);
         if (have_layout) {
             rr->info.page_count = (uint32_t)pages;
             if (w0 > 0 && h0 > 0) {
                 rr->info.pt_width = w0;  // stDim in the XMP is the active artboard, not artboard 1
+                rr->info.pt_height = h0;
+            }
+            ai_multi = !ai_canvas_is_page1(pr, pages, w0, h0);
+            if (ai_multi) rr->info.flags |= ABT_INFO_CANVAS_BEYOND_PAGE1;
+        }
+    } else if (fam == ABT_FAM_AI_PDF && rq.mode == ABT_MODE_FAST) {
+        int pages = 0;
+        float w0 = 0, h0 = 0;
+        if (ai_layout_from_xmp(pr, &pages, &w0, &h0)) {
+            rr->info.page_count = (uint32_t)pages;
+            if (w0 > 0 && h0 > 0) {
+                rr->info.pt_width = w0;
                 rr->info.pt_height = h0;
             }
             ai_multi = !ai_canvas_is_page1(pr, pages, w0, h0);
@@ -394,8 +557,15 @@ static void render_inner(const RenderRequest& rq, const MappedFile& mf, RenderRe
     int best = abt_probe_best_preview(&pr, edge);
 
     if (ai_multi) {
-        // Whole canvas: only Illustrator's document thumbnail has it (D-029).
-        if (canvas && allow_embedded && ai_canvas_thumbnail(mf, pr, bw, bh, rr)) return;
+        if (canvas) {
+            // For high-res previews (edge > 256, e.g. Preview Pane Whole artwork view), render each
+            // artboard via PDFium and composite onto the whole canvas so text and artwork are crisp.
+            if (edge > 256 && rq.mode != ABT_MODE_FAST &&
+                ai_render_whole_canvas(rq, mf, pr, bw, bh, deadline_qpc, ensure_pdf(), rr)) {
+                return;
+            }
+            if (allow_embedded && ai_canvas_thumbnail(mf, pr, bw, bh, rr)) return;
+        }
         // One artboard: that thumbnail shows more than the artboard, so it never stands in for it.
         allow_embedded = false;
         if (canvas) set_reason(rr, "no document thumbnail: artboard 1 only");
@@ -433,10 +603,10 @@ static void render_inner(const RenderRequest& rq, const MappedFile& mf, RenderRe
     case ABT_FAM_PDF: {
         bool no_pdf = false;
         if (!ensure_pdf()) {
-            hr = pdf_open_hr;
+            hr = cd->pdf_open_hr;
         } else {
             const bool need_ink = canvas;
-            hr = pdf_doc_render(pdf.doc, rq, fam, deadline_qpc, &rr->img, &rr->info, &no_pdf,
+            hr = pdf_doc_render(cd->pdf, rq, fam, deadline_qpc, &rr->img, &rr->info, &no_pdf,
                                 need_ink ? &page_ink : nullptr);
         }
         if (no_pdf) {
@@ -510,7 +680,7 @@ static void render_inner(const RenderRequest& rq, const MappedFile& mf, RenderRe
     // An Illustrator artboard with only crop marks or a stray line counts as nearly empty (under 1 %
     // ink). PDFs keep a sparse page 1 (a cover is page 1 even when it is mostly white).
     bool fallback_timeout = false;
-    if (SUCCEEDED(hr) && canvas && pdf.doc && (fam == ABT_FAM_AI_PDF || fam == ABT_FAM_PDF) &&
+    if (SUCCEEDED(hr) && canvas && cd->pdf && (fam == ABT_FAM_AI_PDF || fam == ABT_FAM_PDF) &&
         rr->info.page_count > 1 &&
         ((rr->info.flags & ABT_INFO_PAGE_EMPTY) || (fam == ABT_FAM_AI_PDF && page_ink < 0.01))) {
         double best_ink = (rr->info.flags & ABT_INFO_PAGE_EMPTY) ? 0.0 : page_ink;
@@ -525,7 +695,7 @@ static void render_inner(const RenderRequest& rq, const MappedFile& mf, RenderRe
             inf.flags &= ~(uint32_t)ABT_INFO_PAGE_EMPTY;
             bool np = false;
             double ink = 0.0;
-            HRESULT hr2 = pdf_doc_render(pdf.doc, r2, fam, deadline_qpc, &img, &inf, &np, &ink);
+            HRESULT hr2 = pdf_doc_render(cd->pdf, r2, fam, deadline_qpc, &img, &inf, &np, &ink);
             if (FAILED(hr2)) {
                 if (hr2 == HRESULT_FROM_WIN32(ERROR_TIMEOUT)) fallback_timeout = true;
                 break;
@@ -588,9 +758,18 @@ static int seh_filter(DWORD code) {
     return code == EXCEPTION_IN_PAGE_ERROR ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH;
 }
 
-static bool render_guarded(const RenderRequest& rq, const MappedFile& mf, RenderResult* rr) {
+static bool render_guarded(const RenderRequest& rq, CachedDoc* cd, RenderResult* rr) {
     __try {
-        render_inner(rq, mf, rr);
+        render_inner(rq, cd, rr);
+        return true;
+    } __except (seh_filter(GetExceptionCode())) {
+        return false;
+    }
+}
+
+static bool probe_guarded(CachedDoc* cd) {
+    __try {
+        cd->probe_st = abt_probe_file(cd->mf.data, cd->mf.size, &cd->pr);
         return true;
     } __except (seh_filter(GetExceptionCode())) {
         return false;
@@ -601,22 +780,99 @@ void render_file(const RenderRequest& rq, RenderResult* rr) {
     memset(rr, 0, sizeof(*rr));
     rr->hr = E_FAIL;
     uint64_t t0 = qpc();
-    MappedFile mf;
-    if (!map_file(rq.path, &mf)) {
-        rr->hr = HRESULT_FROM_WIN32(mf.err ? mf.err : ERROR_OPEN_FAILED);
-        set_reason(rr, "cannot open/map file");
-    } else {
-        if (!render_guarded(rq, mf, rr)) {
-            abt_image_free(&rr->img);
-            // A read error of the mapped view (network drop, file shortened while being saved) says
-            // nothing about the file: ERROR_READ_FAULT is retried later instead of remembered.
-            // Signal the worker to exit after replying so leaked/unwound PDFium/WIC state is discarded.
+    if (!rq.path || !rq.path[0]) {
+        rr->hr = E_INVALIDARG;
+        set_reason(rr, "empty path");
+        return;
+    }
+
+    const bool slow = is_slow_path(rq.path);
+    const bool max_q = (rq.flags & ABT_RF_MAX_QUALITY) != 0;
+    uint64_t fsize = 0, fmtime = 0;
+    bool have_stat = false;
+    if (!slow) {
+        WIN32_FILE_ATTRIBUTE_DATA fad = {};
+        if (GetFileAttributesExW(rq.path, GetFileExInfoStandard, &fad)) {
+            if (fad.dwFileAttributes & (FILE_ATTRIBUTE_OFFLINE | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS | FILE_ATTRIBUTE_RECALL_ON_OPEN)) {
+                rr->hr = HRESULT_FROM_WIN32(ERROR_CLOUD_FILE_NOT_IN_SYNC);
+                set_reason(rr, "cloud placeholder not in sync");
+                rr->elapsed_us = (uint32_t)(qpc_ms(t0, qpc()) * 1000.0);
+                return;
+            }
+            fsize = ((uint64_t)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
+            fmtime = ((uint64_t)fad.ftLastWriteTime.dwHighDateTime << 32) | fad.ftLastWriteTime.dwLowDateTime;
+            have_stat = fsize > 0;
+        }
+    }
+
+    CachedDoc* cd = nullptr;
+    AcquireSRWLockExclusive(&g_doc_lock);
+    cd = g_cached_doc;
+    g_cached_doc = nullptr;
+    ReleaseSRWLockExclusive(&g_doc_lock);
+
+    bool hit = cd && have_stat && cd->mf.data && cd->file_size == fsize && cd->mtime == fmtime &&
+               cd->max_quality == max_q && ieq(cd->path, rq.path);
+    if (!hit) {
+        cached_doc_close(cd);
+        cd = (CachedDoc*)calloc(1, sizeof(CachedDoc));
+        if (!cd) {
+            rr->hr = E_OUTOFMEMORY;
+            set_reason(rr, "out of memory");
+            return;
+        }
+        if (!map_file(rq.path, &cd->mf)) {
+            rr->hr = HRESULT_FROM_WIN32(cd->mf.err ? cd->mf.err : ERROR_OPEN_FAILED);
+            set_reason(rr, "cannot open/map file");
+            free(cd);
+            rr->elapsed_us = (uint32_t)(qpc_ms(t0, qpc()) * 1000.0);
+            return;
+        }
+        if (!probe_guarded(cd)) {
             rr->faulted = true;
             rr->hr = HRESULT_FROM_WIN32(ERROR_READ_FAULT);
             set_reason(rr, "I/O error while reading the file");
+            cached_doc_close(cd);
+            rr->elapsed_us = (uint32_t)(qpc_ms(t0, qpc()) * 1000.0);
+            return;
         }
-        unmap_file(&mf);
+        lstrcpynW(cd->path, rq.path, (int)_countof(cd->path));
+        cd->file_size = fsize;
+        cd->mtime = fmtime;
+        cd->pdf_open_hr = S_OK;
+        cd->max_quality = max_q;
     }
+
+    if (!render_guarded(rq, cd, rr)) {
+        abt_image_free(&rr->img);
+        // A read error of the mapped view (network drop, file shortened while being saved) says
+        // nothing about the file: ERROR_READ_FAULT is retried later instead of remembered.
+        // Signal the worker to exit after replying so leaked/unwound PDFium/WIC state is discarded.
+        rr->faulted = true;
+        rr->hr = HRESULT_FROM_WIN32(ERROR_READ_FAULT);
+        set_reason(rr, "I/O error while reading the file");
+    }
+
+    // Keep local PDF/AI documents cached in the worker across consecutive artboard renders.
+    bool keep = !rr->faulted && !slow && have_stat && SUCCEEDED(rr->hr) &&
+                (cd->pr.info.family == ABT_FAM_AI_PDF || cd->pr.info.family == ABT_FAM_PDF);
+    if (keep) {
+        CachedDoc* old = nullptr;
+        AcquireSRWLockExclusive(&g_doc_lock);
+        if (!g_cached_doc) {
+            g_cached_doc = cd;
+            cd = nullptr;
+        } else {
+            old = g_cached_doc;
+            g_cached_doc = cd;
+            cd = nullptr;
+        }
+        ReleaseSRWLockExclusive(&g_doc_lock);
+        cached_doc_close(old);
+    } else {
+        cached_doc_close(cd);
+    }
+
     if (FAILED(rr->hr)) abt_image_free(&rr->img);
     rr->elapsed_us = (uint32_t)(qpc_ms(t0, qpc()) * 1000.0);
 }

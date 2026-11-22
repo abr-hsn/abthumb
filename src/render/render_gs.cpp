@@ -55,6 +55,16 @@ static bool ghostscript_available() {
         if (abt::ieq(v, L"off")) return false;
         if (GetFileAttributesW(v) != INVALID_FILE_ATTRIBUTES) { lstrcpynW(g_gs, v, MAX_PATH); g_gs_state = 1; return true; }
     }
+    // Check bundled gswin64c.exe next to abthumb-render.exe / abthumb.exe first.
+    wchar_t dir[MAX_PATH];
+    if (module_dir(nullptr, dir, MAX_PATH)) {
+        if (_snwprintf_s(v, _countof(v), _TRUNCATE, L"%s\\gswin64c.exe", dir) > 0 &&
+            GetFileAttributesW(v) != INVALID_FILE_ATTRIBUTES) {
+            lstrcpynW(g_gs, v, MAX_PATH);
+            g_gs_state = 1;
+            return true;
+        }
+    }
     if (find_in_registry(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Artifex\\GPL Ghostscript", g_gs) ||
         find_in_registry(HKEY_LOCAL_MACHINE, L"SOFTWARE\\GPL Ghostscript", g_gs)) {
         g_gs_state = 1;

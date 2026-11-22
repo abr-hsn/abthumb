@@ -179,9 +179,19 @@ int jobs_pending(Lane min_lane) {
 
 // Picks the next job for a slot (lock held). Foreground slots serve lanes up to VISIBLE;
 // background slots serve VISIBLE and below, and only while the throttle allows it.
+// When multiple foreground slots exist, slot 0 is reserved for LANE_FOREGROUND whenever all other
+// foreground slots are busy on LANE_PREVIEW / LANE_VISIBLE, so active preview/thumbnail requests
+// never queue behind background artboard prefetches.
 static Job* pick(Slot* s) {
     int lo = s->background ? LANE_VISIBLE : LANE_FOREGROUND;
     int hi = s->background ? LANE_COUNT - 1 : LANE_VISIBLE;
+    if (!s->background && s == &g_slots[0] && g_nslots > 2 && !g_head[LANE_FOREGROUND]) {
+        bool any_idle_fg = false;
+        for (int i = 1; i < g_nslots; ++i) {
+            if (!g_slots[i].background && !g_slots[i].job) { any_idle_fg = true; break; }
+        }
+        if (!any_idle_fg) hi = LANE_FOREGROUND;
+    }
     for (int l = lo; l <= hi; ++l) {
         if (!g_head[l]) continue;
         if (s->background && l > LANE_VISIBLE && !prewarm_allowed()) return nullptr;

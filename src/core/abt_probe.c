@@ -466,9 +466,17 @@ static uint32_t pdf_pages_count_slice(const uint8_t* d, size_t n) {
     return best;
 }
 
-static uint32_t pdf_pages_count(const uint8_t* d, size_t n) {
+static uint32_t pdf_pages_count(const uint8_t* d, size_t n, const uint8_t* xend) {
+    /* Illustrator writes /Type /Pages right after </x:xmpmeta> (often at 64-160 KB when the XMP
+       thumbnail + padding is large), so scan both the fast 64 KB head and 64 KB after xend. */
     size_t h = n < ABT_PDF_FAST_HEAD ? n : ABT_PDF_FAST_HEAD;
     uint32_t c = pdf_pages_count_slice(d, h);
+    if (xend && xend > d && (size_t)(xend - d) < n) {
+        size_t xoff = (size_t)(xend - d);
+        size_t xwin = n - xoff < ABT_PDF_FAST_HEAD ? n - xoff : ABT_PDF_FAST_HEAD;
+        uint32_t cx = pdf_pages_count_slice(d + xoff, xwin);
+        if (cx > c) c = cx;
+    }
     if (n > h) {
         size_t t = n > ABT_PDF_ENC_TAIL_SCAN ? n - ABT_PDF_ENC_TAIL_SCAN : 0;
         if (t < h) t = h;
@@ -482,9 +490,12 @@ static float xmp_unit_to_pts(const uint8_t* xmp, size_t xlen) {
     if (xmp_val_ieq(xmp, xlen, "stDim:unit", "Points")) return 1.0f;
     if (xmp_val_ieq(xmp, xlen, "stDim:unit", "Pixels")) return 1.0f;
     if (xmp_val_ieq(xmp, xlen, "stDim:unit", "Inches")) return 72.0f;
+    if (xmp_val_ieq(xmp, xlen, "stDim:unit", "Feet")) return 72.0f * 12.0f;
+    if (xmp_val_ieq(xmp, xlen, "stDim:unit", "Yards")) return 72.0f * 36.0f;
     if (xmp_val_ieq(xmp, xlen, "stDim:unit", "Picas")) return 12.0f;
     if (xmp_val_ieq(xmp, xlen, "stDim:unit", "Millimeters")) return (float)(72.0 / 25.4);
     if (xmp_val_ieq(xmp, xlen, "stDim:unit", "Centimeters")) return (float)(72.0 / 2.54);
+    if (xmp_val_ieq(xmp, xlen, "stDim:unit", "Meters")) return (float)(72000.0 / 25.4);
     return 0.0f;
 }
 
@@ -557,6 +568,10 @@ abt_status abt_probe_pdf(const uint8_t* d, size_t n, abt_probe* out) {
             out->ai_version = major;
         }
         ai_art_bounds(d, head, out);
+        if (out->bbox[2] > out->bbox[0] && out->bbox[3] > out->bbox[1]) {
+            out->info.canvas_pt_w = out->bbox[2] - out->bbox[0];
+            out->info.canvas_pt_h = out->bbox[3] - out->bbox[1];
+        }
     }
     /* Extract XMP page layout metadata (stDim:w/h, stDim:unit, xmpTPg:NPages) and PDF /Pages /Count.
        Note: Illustrator often writes xmpTPg:NPages=1 even on multi-artboard files, whereas the PDF
@@ -582,7 +597,7 @@ abt_status abt_probe_pdf(const uint8_t* d, size_t n, abt_probe* out) {
             }
         }
         uint32_t np = xmp_uint(xmp, xlen, "xmpTPg:NPages");
-        uint32_t pc = is_ai ? pdf_pages_count(d, n) : 0;
+        uint32_t pc = is_ai ? pdf_pages_count(d, n, xend) : 0;
         if (pc > 0) out->xmp_pages = pc;
         else if (np > 1 || (np == 1 && !any_mismatch)) out->xmp_pages = np;
     }

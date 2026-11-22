@@ -114,6 +114,16 @@ int wmain(int argc, wchar_t** argv) {
         abt::render_result_free(&rr);
         // Never reuse a worker after an SEH unwind (leaked PDFium/WIC/ICM state).
         if (!ok || faulted) break;
+        // Release any cached open document after 2 s of pipe inactivity so local files are never
+        // held open once a burst of artboard renders completes.
+        if (abt::render_has_cached_doc()) {
+            DWORD avail = 0;
+            for (int w = 0; w < 40; ++w) {
+                if (!PeekNamedPipe(in, nullptr, 0, nullptr, &avail, nullptr) || avail > 0) break;
+                Sleep(50);
+            }
+            if (avail == 0) abt::render_release_cached_doc();
+        }
     }
     abt::mem_free(path);
     abt::render_shutdown();

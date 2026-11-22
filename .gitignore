@@ -8,6 +8,7 @@
 
 # fetched third-party binaries
 /third_party/pdfium/
+/third_party/ghostscript/
 
 # generated test corpus (regenerate with tests/corpus/scripts/run_corpus.ps1)
 /tests/corpus/generated/
