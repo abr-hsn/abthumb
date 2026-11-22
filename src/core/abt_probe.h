@@ -58,6 +58,8 @@ typedef struct abt_probe {
     uint32_t psd_channels;
     /* AI-specific */
     uint32_t ai_version;  /* major Illustrator version if known (e.g. 30 for 2026), 0 unknown */
+    uint32_t xmp_pages;   /* <xmpTPg:NPages> if found in XMP, else 0 */
+    uint8_t xmp_unit_pts; /* 1 if XMP <stDim:unit> is Points */
 } abt_probe;
 
 /* Identify the family from the first bytes (needs at least 1 KB if available). */

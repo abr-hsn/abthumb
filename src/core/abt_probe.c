@@ -1,21 +1,54 @@
 /* Family detection, generic probe helpers, XMP thumbnails, base64, PDF/AI probe. */
 #include "abt_probe.h"
 #include "abt_reader.h"
-#include <string.h>
 #include <stdlib.h>
+#include <string.h>
+
+#if defined(_M_X64) || defined(__x86_64__) || defined(__SSE2__)
+#define ABT_SSE2 1
+#include <emmintrin.h>
+#else
+#define ABT_SSE2 0
+#endif
 
 /* ------------------------------------------------------------------ byte search */
+
+#if ABT_SSE2
+static inline unsigned abt_ctz32(uint32_t x) {
+    static const uint8_t tbl[32] = {0,  1,  28, 2,  29, 14, 24, 3,  30, 22, 20, 15, 25, 17, 4,  8,
+                                    31, 27, 13, 23, 21, 19, 16, 7,  26, 12, 18, 6,  11, 5,  10, 9};
+    return tbl[((uint32_t)(x & (0u - x)) * 0x077CB531u) >> 27];
+}
+#endif
 
 const uint8_t* abt_memmem(const uint8_t* hay, size_t hn, const void* needle, size_t nn) {
     if (!nn) return hay;
     if (nn > hn) return NULL;
     const uint8_t* n = (const uint8_t*)needle;
-    const uint8_t* end = hay + (hn - nn) + 1;
-    const uint8_t* p = hay;
+    if (nn == 1) return (const uint8_t*)memchr(hay, n[0], hn);
+    size_t limit = hn - nn + 1;
+    size_t i = 0;
+#if ABT_SSE2
+    const __m128i vfirst = _mm_set1_epi8((char)n[0]);
+    const __m128i vlast = _mm_set1_epi8((char)n[nn - 1]);
+    for (; i + 16 <= limit; i += 16) {
+        __m128i b0 = _mm_loadu_si128((const __m128i*)(hay + i));
+        __m128i b1 = _mm_loadu_si128((const __m128i*)(hay + i + nn - 1));
+        uint32_t mask = (uint32_t)_mm_movemask_epi8(_mm_and_si128(_mm_cmpeq_epi8(b0, vfirst),
+                                                                  _mm_cmpeq_epi8(b1, vlast)));
+        while (mask) {
+            unsigned bit = abt_ctz32(mask);
+            if (nn == 2 || memcmp(hay + i + bit + 1, n + 1, nn - 2) == 0) return hay + i + bit;
+            mask &= mask - 1u;
+        }
+    }
+#endif
+    const uint8_t* p = hay + i;
+    const uint8_t* end = hay + limit;
     while (p < end) {
         p = (const uint8_t*)memchr(p, n[0], (size_t)(end - p));
         if (!p) return NULL;
-        if (memcmp(p, n, nn) == 0) return p;
+        if (p[nn - 1] == n[nn - 1] && (nn == 2 || memcmp(p + 1, n + 1, nn - 2) == 0)) return p;
         ++p;
     }
     return NULL;
@@ -24,7 +57,28 @@ const uint8_t* abt_memmem(const uint8_t* hay, size_t hn, const void* needle, siz
 const uint8_t* abt_memrmem(const uint8_t* hay, size_t hn, const void* needle, size_t nn) {
     if (!nn || nn > hn) return NULL;
     const uint8_t* n = (const uint8_t*)needle;
-    for (size_t i = hn - nn + 1; i-- > 0;)
+    size_t i = hn - nn + 1;
+#if ABT_SSE2
+    if (nn >= 2) {
+        const __m128i vfirst = _mm_set1_epi8((char)n[0]);
+        const __m128i vlast = _mm_set1_epi8((char)n[nn - 1]);
+        while (i >= 16) {
+            i -= 16;
+            __m128i b0 = _mm_loadu_si128((const __m128i*)(hay + i));
+            __m128i b1 = _mm_loadu_si128((const __m128i*)(hay + i + nn - 1));
+            uint32_t mask = (uint32_t)_mm_movemask_epi8(_mm_and_si128(_mm_cmpeq_epi8(b0, vfirst),
+                                                                      _mm_cmpeq_epi8(b1, vlast)));
+            if (mask) {
+                for (int bit = 15; bit >= 0; --bit) {
+                    if ((mask & (1u << (unsigned)bit)) &&
+                        (nn == 2 || memcmp(hay + i + (size_t)bit + 1, n + 1, nn - 2) == 0))
+                        return hay + i + (size_t)bit;
+                }
+            }
+        }
+    }
+#endif
+    while (i-- > 0)
         if (hay[i] == n[0] && memcmp(hay + i, n, nn) == 0) return hay + i;
     return NULL;
 }
@@ -64,10 +118,11 @@ void abt_probe_add_preview(abt_probe* p, const abt_preview* pv) {
 int abt_probe_best_preview(const abt_probe* p, int edge) {
     int best_ge = -1, best_any = -1;
     uint32_t ge_len = 0xFFFFFFFFu, any_len = 0;
+    uint32_t target = edge > 0 ? (uint32_t)edge : 0u;
     for (int i = 0; i < p->n_previews; ++i) {
         const abt_preview* v = &p->previews[i];
         uint32_t l = v->width > v->height ? v->width : v->height;
-        if (l >= (uint32_t)edge && l < ge_len) { ge_len = l; best_ge = i; }
+        if (l >= target && l < ge_len) { ge_len = l; best_ge = i; }
         if (best_any < 0 || l > any_len) { any_len = l; best_any = i; }
     }
     return best_ge >= 0 ? best_ge : best_any;
@@ -90,29 +145,59 @@ abt_status abt_probe_file(const uint8_t* d, size_t n, abt_probe* out) {
 
 /* ------------------------------------------------------------------ base64 */
 
-static int b64v(uint8_t c) {
-    if (c >= 'A' && c <= 'Z') return c - 'A';
-    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
-    if (c >= '0' && c <= '9') return c - '0' + 52;
-    if (c == '+') return 62;
-    if (c == '/') return 63;
-    return -1;
-}
+/* 0xFF = skip (whitespace/junk), 0xFE = '&' (XML entity), 0xFD = '=' (padding), 0..63 = value */
+static const uint8_t g_b64[256] = {
+    255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,
+    255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,
+    255,255,255,255,255,255,254,255,255,255,255, 62,255,255,255, 63,
+     52, 53, 54, 55, 56, 57, 58, 59, 60, 61,255,255,255,253,255,255,
+    255,  0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14,
+     15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,255,255,255,255,255,
+    255, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40,
+     41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51,255,255,255,255,255,
+    255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,
+    255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,
+    255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,
+    255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,
+    255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,
+    255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,
+    255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,
+    255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255
+};
 
 size_t abt_base64_decode(const uint8_t* in, size_t len, uint8_t* out) {
     uint32_t acc = 0;
     int bits = 0;
     size_t o = 0;
-    for (size_t i = 0; i < len; ++i) {
-        uint8_t c = in[i];
-        if (c == '&') { /* character reference such as &#xA; or &#10; : skip to ';' */
-            while (i < len && in[i] != ';') ++i;
+    size_t i = 0;
+    while (i < len) {
+        /* Fast path: when byte-aligned (bits == 0), decode 4 clean base64 chars -> 3 bytes directly */
+        if (bits == 0) {
+            while (i + 4 <= len) {
+                uint32_t v0 = g_b64[in[i]];
+                uint32_t v1 = g_b64[in[i + 1]];
+                uint32_t v2 = g_b64[in[i + 2]];
+                uint32_t v3 = g_b64[in[i + 3]];
+                if ((v0 | v1 | v2 | v3) & 0x80u) break;
+                uint32_t w = (v0 << 18) | (v1 << 12) | (v2 << 6) | v3;
+                out[o++] = (uint8_t)(w >> 16);
+                out[o++] = (uint8_t)(w >> 8);
+                out[o++] = (uint8_t)w;
+                i += 4;
+            }
+            if (i >= len) break;
+        }
+        uint32_t v = g_b64[in[i++]];
+        if (v & 0x80u) {
+            if (v == 254u) { /* '&': character reference such as &#xA; or &#10; */
+                while (i < len && in[i] != ';') ++i;
+                if (i < len) ++i;
+            } else if (v == 253u) { /* '=' padding */
+                break;
+            }
             continue;
         }
-        if (c == '=') break;
-        int v = b64v(c);
-        if (v < 0) continue; /* whitespace or junk */
-        acc = (acc << 6) | (uint32_t)v;
+        acc = (acc << 6) | v;
         bits += 6;
         if (bits >= 8) {
             bits -= 8;
@@ -194,22 +279,29 @@ int abt_xmp_find_thumbnails(const uint8_t* file, size_t fsize, size_t off, size_
     return added;
 }
 
-float abt_xmp_float(const uint8_t* d, size_t n, const char* name) {
+/* Finds value start of an XMP property in element (<name>val) or attribute (name="val") form. */
+static const uint8_t* xmp_prop_val(const uint8_t* d, size_t n, const char* name) {
     char pat[64];
     size_t nl = strlen(name);
-    if (nl + 2 > sizeof(pat)) return 0;
+    if (nl + 2 > sizeof(pat)) return NULL;
+    const uint8_t* end = d + n;
     pat[0] = '<';
     memcpy(pat + 1, name, nl);
     pat[nl + 1] = '>';
     const uint8_t* p = abt_memmem(d, n, pat, nl + 2);
-    if (p) p += nl + 2;
-    else {
-        memcpy(pat, name, nl);
-        pat[nl] = '=';
-        p = abt_memmem(d, n, pat, nl + 1);
-        if (!p) return 0;
-        p += nl + 2; /* skip =" */
-    }
+    if (p) return p + nl + 2;
+    memcpy(pat, name, nl);
+    pat[nl] = '=';
+    p = abt_memmem(d, n, pat, nl + 1);
+    if (!p) return NULL;
+    p += nl + 1;
+    if (p < end && (*p == '"' || *p == '\'')) ++p;
+    return p;
+}
+
+float abt_xmp_float(const uint8_t* d, size_t n, const char* name) {
+    const uint8_t* p = xmp_prop_val(d, n, name);
+    if (!p) return 0.f;
     const uint8_t* end = d + n;
     double v = 0, frac = 0.1;
     int any = 0, dot = 0;
@@ -221,6 +313,38 @@ float abt_xmp_float(const uint8_t* d, size_t n, const char* name) {
         else break;
     }
     return any && v < 1e7 ? (float)v : 0.f;
+}
+
+static uint32_t xmp_uint(const uint8_t* d, size_t n, const char* name) {
+    const uint8_t* p = xmp_prop_val(d, n, name);
+    if (!p) return 0;
+    const uint8_t* end = d + n;
+    uint32_t v = 0;
+    int any = 0;
+    while (p < end && (*p == ' ' || *p == '\t')) ++p;
+    while (p < end && *p >= '0' && *p <= '9') {
+        if (v < 1000000u) v = v * 10u + (uint32_t)(*p - '0');
+        any = 1;
+        ++p;
+    }
+    return any ? v : 0;
+}
+
+static int xmp_val_ieq(const uint8_t* d, size_t n, const char* name, const char* expect) {
+    const uint8_t* p = xmp_prop_val(d, n, name);
+    if (!p) return 0;
+    const uint8_t* end = d + n;
+    while (p < end && (*p == ' ' || *p == '\t')) ++p;
+    size_t el = strlen(expect);
+    if ((size_t)(end - p) < el) return 0;
+    for (size_t i = 0; i < el; ++i) {
+        uint8_t a = p[i], b = (uint8_t)expect[i];
+        if (a >= 'A' && a <= 'Z') a = (uint8_t)(a + ('a' - 'A'));
+        if (b >= 'A' && b <= 'Z') b = (uint8_t)(b + ('a' - 'A'));
+        if (a != b) return 0;
+    }
+    p += el;
+    return p == end || *p == '<' || *p == '"' || *p == '\'' || *p == ' ' || *p == '\t' || *p == '\r' || *p == '\n';
 }
 
 int abt_xmp_creator_tool(const uint8_t* d, size_t n, char* out, size_t cap) {
@@ -293,9 +417,76 @@ static void ai_art_bounds(const uint8_t* d, size_t n, abt_probe* out) {
 
 /* Illustrator writes the XMP packet right after the header (offset ~200) and keeps the
    thumbnail inside the first few KB (verified on the corpus for CS-2026). We scan a bounded
-   head window; other producers may put metadata anywhere, so also look at the tail. */
-#define ABT_PDF_HEAD_SCAN (4u << 20)
-#define ABT_PDF_TAIL_SCAN (1u << 20)
+   head window; other producers may put metadata anywhere, so also look at the tail.
+   /Encrypt lives in the PDF trailer (last 64 KB) or linearized header (first 8 KB). */
+#define ABT_PDF_HEAD_SCAN     (4u << 20)
+#define ABT_PDF_TAIL_SCAN     (1u << 20)
+#define ABT_PDF_FAST_HEAD     (64u << 10)
+#define ABT_PDF_ENC_HEAD_SCAN (8u << 10)
+#define ABT_PDF_ENC_TAIL_SCAN (64u << 10)
+
+/* Scans a bounded slice for /Type /Pages dictionaries and returns the largest /Count value found
+   (the root Pages node always has the total document page count), or 0 if not found in plain text. */
+static uint32_t pdf_pages_count_slice(const uint8_t* d, size_t n) {
+    uint32_t best = 0;
+    const uint8_t* p = d;
+    const uint8_t* end = d + n;
+    while (p < end) {
+        const uint8_t* hit = abt_memmem(p, (size_t)(end - p), "/Pages", 6);
+        if (!hit) break;
+        p = hit + 6;
+        /* Must be followed by delimiter/whitespace, not /PagesKids etc. */
+        if (p < end && ((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z') || (*p >= '0' && *p <= '9')))
+            continue;
+        /* Verify /Type precedes /Pages (skipping optional whitespace) */
+        const uint8_t* b = hit;
+        while (b > d && (b[-1] == ' ' || b[-1] == '\t' || b[-1] == '\r' || b[-1] == '\n')) --b;
+        if (b < d + 5 || memcmp(b - 5, "/Type", 5) != 0) continue;
+        /* Find enclosing << ... >> within 512 bytes */
+        const uint8_t* dlo = hit - d > 512 ? hit - 512 : d;
+        const uint8_t* dict_start = abt_memrmem(dlo, (size_t)(hit - dlo), "<<", 2);
+        if (!dict_start) dict_start = dlo;
+        size_t rlim = (size_t)(end - hit);
+        if (rlim > 512) rlim = 512;
+        const uint8_t* dict_end = abt_memmem(hit, rlim, ">>", 2);
+        if (!dict_end) dict_end = hit + rlim;
+        const uint8_t* cnt = abt_memmem(dict_start, (size_t)(dict_end - dict_start), "/Count", 6);
+        if (!cnt) continue;
+        const uint8_t* q = cnt + 6;
+        while (q < dict_end && (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n')) ++q;
+        uint32_t v = 0;
+        int any = 0;
+        while (q < dict_end && *q >= '0' && *q <= '9') {
+            if (v < 100000u) v = v * 10u + (uint32_t)(*q - '0');
+            any = 1;
+            ++q;
+        }
+        if (any && v > best) best = v;
+    }
+    return best;
+}
+
+static uint32_t pdf_pages_count(const uint8_t* d, size_t n) {
+    size_t h = n < ABT_PDF_FAST_HEAD ? n : ABT_PDF_FAST_HEAD;
+    uint32_t c = pdf_pages_count_slice(d, h);
+    if (n > h) {
+        size_t t = n > ABT_PDF_ENC_TAIL_SCAN ? n - ABT_PDF_ENC_TAIL_SCAN : 0;
+        if (t < h) t = h;
+        uint32_t c2 = pdf_pages_count_slice(d + t, n - t);
+        if (c2 > c) c = c2;
+    }
+    return c;
+}
+
+static float xmp_unit_to_pts(const uint8_t* xmp, size_t xlen) {
+    if (xmp_val_ieq(xmp, xlen, "stDim:unit", "Points")) return 1.0f;
+    if (xmp_val_ieq(xmp, xlen, "stDim:unit", "Pixels")) return 1.0f;
+    if (xmp_val_ieq(xmp, xlen, "stDim:unit", "Inches")) return 72.0f;
+    if (xmp_val_ieq(xmp, xlen, "stDim:unit", "Picas")) return 12.0f;
+    if (xmp_val_ieq(xmp, xlen, "stDim:unit", "Millimeters")) return (float)(72.0 / 25.4);
+    if (xmp_val_ieq(xmp, xlen, "stDim:unit", "Centimeters")) return (float)(72.0 / 2.54);
+    return 0.0f;
+}
 
 abt_status abt_probe_pdf(const uint8_t* d, size_t n, abt_probe* out) {
     out->info.family = ABT_FAM_PDF;
@@ -308,14 +499,20 @@ abt_status abt_probe_pdf(const uint8_t* d, size_t n, abt_probe* out) {
         out->info.version[7] = 0;
     }
     size_t head = n < ABT_PDF_HEAD_SCAN ? n : ABT_PDF_HEAD_SCAN;
-    /* XMP packet in the head: find its extent so we only scan the packet itself */
-    const uint8_t* xmp = abt_memmem(d, head, "<x:xmpmeta", 10);
+    size_t fhead = head < ABT_PDF_FAST_HEAD ? head : ABT_PDF_FAST_HEAD;
+    /* XMP packet in the head: check fast 64 KB window first to avoid faulting 4 MB on cold files */
+    const uint8_t* xmp = abt_memmem(d, fhead, "<x:xmpmeta", 10);
+    if (!xmp && head > fhead) {
+        size_t start = fhead > 9 ? fhead - 9 : 0;
+        xmp = abt_memmem(d + start, head - start, "<x:xmpmeta", 10);
+    }
     const uint8_t* xend = NULL;
+    size_t xlen = 0;
     if (xmp) {
         size_t xlim = (size_t)(d + n - xmp);
         if (xlim > ((size_t)8 << 20)) xlim = (size_t)8 << 20; /* never fault in a whole huge file */
         xend = abt_memmem(xmp, xlim, "</x:xmpmeta>", 12);
-        size_t xlen = xend ? (size_t)(xend - xmp) + 12 : (size_t)(d + head - xmp);
+        xlen = xend ? (size_t)(xend - xmp) + 12 : (size_t)(d + head - xmp);
         abt_xmp_find_thumbnails(d, n, (size_t)(xmp - d), xlen, out);
         abt_xmp_creator_tool(xmp, xlen, out->info.creator, sizeof(out->info.creator));
     }
@@ -324,17 +521,29 @@ abt_status abt_probe_pdf(const uint8_t* d, size_t n, abt_probe* out) {
         if (toff < head) toff = head;
         const uint8_t* tx = abt_memmem(d + toff, n - toff, "<x:xmpmeta", 10);
         if (tx) {
-            abt_xmp_find_thumbnails(d, n, (size_t)(tx - d), n - (size_t)(tx - d), out);
+            size_t tlen = n - (size_t)(tx - d);
+            const uint8_t* txend = abt_memmem(tx, tlen, "</x:xmpmeta>", 12);
+            if (txend) tlen = (size_t)(txend - tx) + 12;
+            abt_xmp_find_thumbnails(d, n, (size_t)(tx - d), tlen, out);
             if (!out->info.creator[0])
-                abt_xmp_creator_tool(tx, n - (size_t)(tx - d), out->info.creator, sizeof(out->info.creator));
+                abt_xmp_creator_tool(tx, tlen, out->info.creator, sizeof(out->info.creator));
+            if (!xmp) { xmp = tx; xlen = tlen; }
         }
     }
     /* Illustrator? CreatorTool says so, and AI files carry AIPrivateData streams / an /Illustrator key. */
-    int is_ai = strstr(out->info.creator, "Illustrator") != NULL ||
-                abt_memmem(d, head, "/Illustrator", 12) != NULL ||
-                abt_memmem(d, head, "AIPrivateData", 13) != NULL;
+    int is_ai = strstr(out->info.creator, "Illustrator") != NULL;
+    if (!is_ai) {
+        is_ai = abt_memmem(d, fhead, "/Illustrator", 12) != NULL ||
+                abt_memmem(d, fhead, "AIPrivateData", 13) != NULL;
+    }
+    if (!is_ai && head > fhead) {
+        size_t start = fhead > 12 ? fhead - 12 : 0;
+        is_ai = abt_memmem(d + start, head - start, "/Illustrator", 12) != NULL ||
+                abt_memmem(d + start, head - start, "AIPrivateData", 13) != NULL;
+    }
     if (!is_ai && n > head) {
         size_t toff = n > ABT_PDF_TAIL_SCAN ? n - ABT_PDF_TAIL_SCAN : 0;
+        if (toff < head) toff = head;
         is_ai = abt_memmem(d + toff, n - toff, "AIPrivateData", 13) != NULL;
     }
     if (is_ai) {
@@ -344,33 +553,46 @@ abt_status abt_probe_pdf(const uint8_t* d, size_t n, abt_probe* out) {
         if (v) {
             v += 12;
             uint32_t major = 0;
-            while (*v >= '0' && *v <= '9') major = major * 10 + (uint32_t)(*v++ - '0');
+            while (*v >= '0' && *v <= '9' && major < 1000u) major = major * 10u + (uint32_t)(*v++ - '0');
             out->ai_version = major;
         }
         ai_art_bounds(d, head, out);
     }
-    /* Illustrator's XMP thumbnail shows the whole canvas (every artboard and any art outside them,
-       cropped to the art bounds), while stDim (MaxPageSize) is the active artboard. Thumbnails show
-       that whole canvas (D-029); the flag below only records that the two differ. */
-    if (xmp) {
-        size_t xlen = xend ? (size_t)(xend - xmp) : (size_t)(d + head - xmp);
+    /* Extract XMP page layout metadata (stDim:w/h, stDim:unit, xmpTPg:NPages) and PDF /Pages /Count.
+       Note: Illustrator often writes xmpTPg:NPages=1 even on multi-artboard files, whereas the PDF
+       /Type /Pages dictionary has the exact page count. */
+    if (xmp && xlen) {
+        float scale = xmp_unit_to_pts(xmp, xlen);
+        out->xmp_unit_pts = scale > 0.0f ? 1 : 0;
         float w = abt_xmp_float(xmp, xlen, "stDim:w"), h = abt_xmp_float(xmp, xlen, "stDim:h");
+        int any_mismatch = 0;
         if (w > 0 && h > 0) {
-            out->info.pt_width = w;
-            out->info.pt_height = h;
+            float mult = scale > 0.0f ? scale : 1.0f;
+            out->info.pt_width = w * mult;
+            out->info.pt_height = h * mult;
             for (int i = 0; i < out->n_previews; ++i) {
                 abt_preview* v = &out->previews[i];
                 if (v->source != ABT_PVS_XMP || !v->width || !v->height) continue;
                 float expect_h = (float)v->width * h / w;
                 float diff = expect_h > (float)v->height ? expect_h - (float)v->height : (float)v->height - expect_h;
-                if (diff > 1.5f + 0.02f * (float)v->height) v->flags |= ABT_PVF_ASPECT_MISMATCH;
+                if (diff > 1.5f + 0.02f * (float)v->height) {
+                    v->flags |= ABT_PVF_ASPECT_MISMATCH;
+                    any_mismatch = 1;
+                }
             }
         }
+        uint32_t np = xmp_uint(xmp, xlen, "xmpTPg:NPages");
+        uint32_t pc = is_ai ? pdf_pages_count(d, n) : 0;
+        if (pc > 0) out->xmp_pages = pc;
+        else if (np > 1 || (np == 1 && !any_mismatch)) out->xmp_pages = np;
     }
-    if (abt_memmem(d, head, "/Encrypt", 8)) out->info.flags |= ABT_INFO_ENCRYPTED;
-    else if (n > head) { /* non-linearised PDF: the trailer (and /Encrypt) is at the end */
-        size_t t = n > ((size_t)1 << 20) ? n - ((size_t)1 << 20) : 0;
-        if (t < head) t = head;
+    /* /Encrypt lives in the PDF trailer (last 64 KB) or linearized header (first 8 KB). */
+    size_t ehead = n < ABT_PDF_ENC_HEAD_SCAN ? n : ABT_PDF_ENC_HEAD_SCAN;
+    if (abt_memmem(d, ehead, "/Encrypt", 8)) {
+        out->info.flags |= ABT_INFO_ENCRYPTED;
+    } else if (n > ehead) {
+        size_t t = n > ABT_PDF_ENC_TAIL_SCAN ? n - ABT_PDF_ENC_TAIL_SCAN : 0;
+        if (t < ehead) t = ehead;
         if (abt_memmem(d + t, n - t, "/Encrypt", 8)) out->info.flags |= ABT_INFO_ENCRYPTED;
     }
     int best = abt_probe_best_preview(out, 1 << 30);

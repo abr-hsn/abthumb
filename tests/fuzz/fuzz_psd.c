@@ -14,7 +14,7 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     abt_probe* pr = (abt_probe*)calloc(1, sizeof *pr);
     if (!pr) return 0;
     if (abt_probe_psd(data, size, pr) == ABT_OK && pr->info.px_width > 0 && pr->info.px_height > 0 &&
-        pr->info.px_width <= ABT_MAX_DIM && pr->info.px_height <= ABT_MAX_DIM) {
+        pr->info.px_width <= 300000u && pr->info.px_height <= 300000u) {
         abt_psd_opts o = {0};
         abt_fit((int)pr->info.px_width, (int)pr->info.px_height, 64, 0, &o.dst_w, &o.dst_h);
         for (int pass = 0; pass < 2; pass++) {

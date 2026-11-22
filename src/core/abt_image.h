@@ -14,7 +14,8 @@ typedef struct abt_image {
     int has_alpha; /* 1 if any pixel has alpha < 255 */
 } abt_image;
 
-abt_status abt_image_alloc(abt_image* img, int w, int h); /* zero-filled (transparent) */
+abt_status abt_image_alloc(abt_image* img, int w, int h);        /* zero-filled (transparent) */
+abt_status abt_image_alloc_uninit(abt_image* img, int w, int h); /* uninitialized pixel buffer */
 void abt_image_free(abt_image* img);
 void abt_image_fill(abt_image* img, uint8_t b, uint8_t g, uint8_t r, uint8_t a);
 int abt_image_scan_alpha(abt_image* img); /* sets and returns has_alpha */
@@ -33,11 +34,16 @@ void abt_fit(int sw, int sh, int edge, int allow_up, int* dw, int* dh);
    ask abt_rs_row_needed). ch = interleaved 8-bit channels per pixel (1..8). */
 typedef struct abt_rs abt_rs;
 abt_rs* abt_rs_create(int src_w, int src_h, int dst_w, int dst_h, int ch, int rows_per_out);
+/* Same as abt_rs_create, but writes output rows directly into dst (stride dst_stride) when dst != NULL. */
+abt_rs* abt_rs_create_into(int src_w, int src_h, int dst_w, int dst_h, int ch, int rows_per_out,
+                           uint8_t* dst, size_t dst_stride);
 int abt_rs_row_needed(const abt_rs* rs, int y);
 /* Next source row index >= y that is needed, or src_h if none. */
 int abt_rs_next_needed(const abt_rs* rs, int y);
 void abt_rs_push(abt_rs* rs, int y, const uint8_t* row);
-/* Writes dst_h rows of dst_w*ch bytes. Rows never pushed count as zero. */
+/* Push a row given as ch separate contiguous channel planes (each src_w bytes). */
+void abt_rs_push_planar(abt_rs* rs, int y, const uint8_t* const* planes, int ch);
+/* Writes dst_h rows of dst_w*ch bytes (no-op copy if created with abt_rs_create_into and dst == NULL). */
 void abt_rs_finish(abt_rs* rs, uint8_t* dst, size_t dst_stride);
 void abt_rs_destroy(abt_rs* rs);
 

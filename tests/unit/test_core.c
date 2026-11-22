@@ -23,9 +23,10 @@ static void test_qoi_roundtrip(void) {
     ABT_CHECK(img.px && memcmp(img.px, px, (size_t)w * h * 4) == 0);
     ABT_CHECK(img.has_alpha == 1);
     abt_image_free(&img);
-    /* truncated input must not crash */
-    abt_image t;
-    if (abt_qoi_decode(enc, n / 2, &t) == ABT_OK) abt_image_free(&t);
+    /* truncated input must fail cleanly with ABT_E_TRUNCATED */
+    abt_image t = {0};
+    ABT_CHECK(abt_qoi_decode(enc, n / 2, &t) == ABT_E_TRUNCATED);
+    ABT_CHECK(t.px == NULL);
     free(enc);
     {   /* fuzz regression: 22-byte file claiming 24062x16898 px must be rejected, not allocate GBs */
         static const uint8_t huge[22] = {'q','o','i','f', 0,0,0x5d,0xfe, 0,0,0x42,0x02, 4,0, 0,0,0,0,0,0,0,1};
@@ -80,6 +81,30 @@ static void test_resampler(void) {
     free(out);
     free(row);
     free(src);
+
+    /* extreme downscale ratio hs >= 363 (regression for fixed-point weight underflow at sw=498, dw=1) */
+    {
+        int ew = 498, eh = 2;
+        uint8_t* esrc = (uint8_t*)calloc((size_t)ew * eh, 4);
+        /* pixel 0 is bright white, remaining 497 pixels are black -> average must be ~1, NOT 255 */
+        esrc[0] = esrc[1] = esrc[2] = esrc[3] = 255;
+        esrc[(size_t)ew * 4 + 0] = esrc[(size_t)ew * 4 + 1] = esrc[(size_t)ew * 4 + 2] = esrc[(size_t)ew * 4 + 3] = 255;
+        abt_image edst = {0};
+        ABT_CHECK(abt_resize(esrc, ew, eh, (size_t)ew * 4, 1, 1, &edst) == ABT_OK);
+        ABT_CHECK_MSG(edst.px[0] <= 2 && edst.px[1] <= 2 && edst.px[2] <= 2 && edst.px[3] <= 2,
+                      "hs=498 impulse -> %u,%u,%u,%u", edst.px[0], edst.px[1], edst.px[2], edst.px[3]);
+        ABT_CHECK(edst.has_alpha == 1);
+        abt_image_free(&edst);
+        /* uniform image at hs=498 stays exact */
+        for (int i = 0; i < ew * eh; ++i) { esrc[i * 4 + 0] = 33; esrc[i * 4 + 1] = 144; esrc[i * 4 + 2] = 211; esrc[i * 4 + 3] = 255; }
+        ABT_CHECK(abt_resize(esrc, ew, eh, (size_t)ew * 4, 1, 1, &edst) == ABT_OK);
+        ABT_CHECK(edst.px[0] == 33 && edst.px[1] == 144 && edst.px[2] == 211 && edst.px[3] == 255 && edst.has_alpha == 0);
+        abt_image_free(&edst);
+        /* invalid resize inputs */
+        ABT_CHECK(abt_resize(NULL, 4, 4, 16, 2, 2, &edst) != ABT_OK);
+        ABT_CHECK(abt_resize(esrc, 0, 4, 16, 2, 2, &edst) != ABT_OK);
+        free(esrc);
+    }
 
     /* fit */
     int w, h;
@@ -254,8 +279,50 @@ static void test_uniform(void) {
     abt_image_free(&img);
 }
 
+static void test_alloc_uninit_and_xmp_layout(void) {
+    abt_image img = {0};
+    ABT_CHECK(abt_image_alloc_uninit(&img, 16, 8) == ABT_OK);
+    ABT_CHECK(img.px != NULL && img.w == 16 && img.h == 8 && img.has_alpha == 0);
+    abt_image_free(&img);
+    ABT_CHECK(abt_image_alloc_uninit(&img, 0, 8) == ABT_E_LIMIT && img.px == NULL);
+    ABT_CHECK(abt_image_alloc_uninit(&img, ABT_MAX_DIM + 1, 1) == ABT_E_LIMIT && img.px == NULL);
+    ABT_CHECK(abt_image_alloc_uninit(NULL, 4, 4) == ABT_E_FORMAT);
+
+    /* XMP element form: xmpTPg:NPages + stDim:unit=Points */
+    const char* doc1 =
+        "%PDF-1.6\n<x:xmpmeta><rdf:RDF><rdf:Description>"
+        "<xmp:CreatorTool>Adobe Illustrator 30.0</xmp:CreatorTool>"
+        "<xmpTPg:NPages>3</xmpTPg:NPages>"
+        "<stDim:w>612.0</stDim:w><stDim:h>792.0</stDim:h><stDim:unit>Points</stDim:unit>"
+        "</rdf:Description></rdf:RDF></x:xmpmeta>\n";
+    abt_probe p;
+    ABT_CHECK(abt_probe_file((const uint8_t*)doc1, strlen(doc1), &p) == ABT_OK);
+    ABT_CHECK(p.info.family == ABT_FAM_AI_PDF && p.ai_version == 30);
+    ABT_CHECK(p.xmp_pages == 3 && p.xmp_unit_pts == 1);
+    ABT_CHECK(p.info.pt_width == 612.0f && p.info.pt_height == 792.0f);
+
+    /* XMP attribute form with Millimeters unit (converted to points) */
+    const char* doc2 =
+        "%PDF-1.7\n<x:xmpmeta><rdf:Description xmpTPg:NPages=\"5\" stDim:w=\"210\" stDim:h=\"297\" stDim:unit=\"Millimeters\"/></x:xmpmeta>\n";
+    ABT_CHECK(abt_probe_file((const uint8_t*)doc2, strlen(doc2), &p) == ABT_OK);
+    ABT_CHECK(p.xmp_pages == 5 && p.xmp_unit_pts == 1);
+    ABT_CHECK(p.info.pt_width > 594.0f && p.info.pt_width < 596.0f);
+
+    /* Unrecognized unit keeps xmp_unit_pts == 0; PDF /Pages /Count overrides stale xmpTPg:NPages=1 */
+    const char* doc3 =
+        "%PDF-1.6\n<x:xmpmeta><rdf:Description xmp:CreatorTool=\"Adobe Illustrator 30.0\" xmpTPg:NPages=\"1\" stDim:unit=\"Unknown\"/></x:xmpmeta>\n"
+        "2 0 obj << /Type /Pages /Count 4 >> endobj\n";
+    ABT_CHECK(abt_probe_file((const uint8_t*)doc3, strlen(doc3), &p) == ABT_OK);
+    ABT_CHECK(p.xmp_pages == 4 && p.xmp_unit_pts == 0);
+
+    /* abt_xmp_float with attribute '=' at exact buffer end (regression for OOB pointer advance) */
+    const char* edge = "stDim:w=";
+    ABT_CHECK(abt_xmp_float((const uint8_t*)edge, strlen(edge), "stDim:w") == 0.f);
+}
+
 void suite_core(void) {
     test_uniform();
+    test_alloc_uninit_and_xmp_layout();
     test_qoi_roundtrip();
     test_resampler();
     test_base64();

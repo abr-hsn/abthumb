@@ -16,29 +16,26 @@
 
 /* ------------------------------------------------------------------ small helpers */
 
-static int hexv(uint8_t c) {
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-    return -1;
-}
+static const uint8_t g_hex[256] = {
+    255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,
+    255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,
+    255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,
+      0,  1,  2,  3,  4,  5,  6,  7,  8,  9,255,255,255,255,255,255,
+    255, 10, 11, 12, 13, 14, 15,255,255,255,255,255,255,255,255,255,
+    255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,
+    255, 10, 11, 12, 13, 14, 15,255,255,255,255,255,255,255,255,255,
+    255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,
+    255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,
+    255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,
+    255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,
+    255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,
+    255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,
+    255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,
+    255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,
+    255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255
+};
 
-/* Decodes hex digit pairs, ignoring everything else ('%', blanks, newlines). */
-static size_t hex_decode(const uint8_t* p, size_t len, uint8_t* out, size_t cap) {
-    int hi = -1;
-    size_t o = 0;
-    for (size_t i = 0; i < len; ++i) {
-        int v = hexv(p[i]);
-        if (v < 0) continue;
-        if (hi < 0) hi = v;
-        else {
-            if (o == cap) break;
-            out[o++] = (uint8_t)(hi << 4 | v);
-            hi = -1;
-        }
-    }
-    return o;
-}
+static inline int hexv(uint8_t c) { return g_hex[c] == 255 ? -1 : (int)g_hex[c]; }
 
 static const uint8_t* line_end(const uint8_t* p, const uint8_t* end) {
     while (p < end && *p != '\r' && *p != '\n') ++p;
@@ -85,14 +82,29 @@ static void tiff_dims(const uint8_t* t, size_t n, uint32_t* w, uint32_t* h) {
     }
 }
 
-/* Placeable WMF header (key 0x9AC6CDD7): int16 left, top, right, bottom at byte 6. */
+/* Placeable WMF header (key 0x9AC6CDD7): int16 left, top, right, bottom at byte 6, inch at byte 14.
+   Convert logical units to 96 DPI pixels when inch > 0 so preview selection compares fairly with raster previews. */
 static void wmf_dims(const uint8_t* t, size_t n, uint32_t* w, uint32_t* h) {
     *w = *h = 0;
     if (n < 22 || abt_load_u32le(t) != 0x9AC6CDD7u) return;
     int l = (int16_t)rd16(t + 6, 1), tp = (int16_t)rd16(t + 8, 1);
     int r = (int16_t)rd16(t + 10, 1), b = (int16_t)rd16(t + 12, 1);
-    *w = (uint32_t)(r > l ? r - l : l - r);
-    *h = (uint32_t)(b > tp ? b - tp : tp - b);
+    uint32_t rw = (uint32_t)(r > l ? r - l : l - r);
+    uint32_t rh = (uint32_t)(b > tp ? b - tp : tp - b);
+    uint32_t inch = rd16(t + 14, 1);
+    if (inch > 0 && rw && rh) {
+        uint64_t pw = ((uint64_t)rw * 96u + inch / 2u) / inch;
+        uint64_t ph = ((uint64_t)rh * 96u + inch / 2u) / inch;
+        if (pw < 1) pw = 1;
+        if (ph < 1) ph = 1;
+        if (pw > ABT_MAX_DIM) pw = ABT_MAX_DIM;
+        if (ph > ABT_MAX_DIM) ph = ABT_MAX_DIM;
+        *w = (uint32_t)pw;
+        *h = (uint32_t)ph;
+    } else {
+        *w = rw;
+        *h = rh;
+    }
 }
 
 static void add_dos_preview(abt_probe* out, const uint8_t* d, size_t n, uint32_t off, uint32_t len, int tiff) {
@@ -108,67 +120,97 @@ static void add_dos_preview(abt_probe* out, const uint8_t* d, size_t n, uint32_t
     abt_probe_add_preview(out, &pv);
 }
 
-/* ------------------------------------------------------------------ Photoshop image resources */
+/* ------------------------------------------------------------------ Photoshop image resources (streaming hex) */
 
-/* Walks 8BIM resources in buf; returns the data of resource `id`. Layout (Photoshop file format
-   spec): "8BIM", u16 id, Pascal name padded to even total, u32 size, data padded to even. */
-static int psres_find(const uint8_t* buf, size_t len, uint32_t id, const uint8_t** data, size_t* dlen) {
-    abt_rd r = abt_rd_make(buf, len);
-    while (abt_rd_has(&r, 12)) {
-        const uint8_t* sig = abt_rd_take(&r, 4);
-        if (memcmp(sig, "8BIM", 4) != 0) return 0;
-        uint32_t rid = abt_rd_u16be(&r);
-        uint32_t nl = abt_rd_u8(&r);
-        abt_rd_skip(&r, (nl + 1) & 1 ? nl + 1 : nl); /* name incl. length byte, padded to even */
-        uint32_t sz = abt_rd_u32be(&r);
-        if (r.err || sz > abt_rd_left(&r)) return 0;
-        if (rid == id) { *data = abt_rd_ptr(&r); *dlen = sz; return 1; }
-        abt_rd_skip(&r, (uint64_t)sz + (sz & 1));
+typedef struct hex_rd {
+    const uint8_t* p;
+    const uint8_t* end;
+} hex_rd;
+
+static size_t hex_read(hex_rd* r, uint8_t* out, size_t want) {
+    size_t o = 0;
+    int hi = -1;
+    const uint8_t* p = r->p;
+    const uint8_t* end = r->end;
+    while (o < want && p < end) {
+        uint8_t v = g_hex[*p++];
+        if (v == 255) continue;
+        if (hi < 0) hi = (int)v;
+        else { out[o++] = (uint8_t)((hi << 4) | v); hi = -1; }
     }
-    return 0;
+    r->p = p;
+    return o;
 }
 
-/* Resource 1036 body: 28-byte header (format, width, height, widthbytes, total size,
-   compressed size, bpp, planes) then JFIF. */
-static int thumb1036(const uint8_t* d, size_t n, uint32_t* w, uint32_t* h, const uint8_t** jpg, size_t* jlen) {
-    if (n <= 28 || abt_load_u32be(d) != 1) return 0; /* 1 = kJpegRGB */
-    *w = abt_load_u32be(d + 4);
-    *h = abt_load_u32be(d + 8);
-    uint32_t comp = abt_load_u32be(d + 20);
-    *jpg = d + 28;
-    *jlen = n - 28;
-    if (comp && comp < *jlen) *jlen = comp;
-    return 1;
+static int hex_skip(hex_rd* r, uint64_t skip) {
+    uint64_t left = skip;
+    int hi = 0;
+    const uint8_t* p = r->p;
+    const uint8_t* end = r->end;
+    while (left > 0 && p < end) {
+        if (g_hex[*p++] == 255) continue;
+        if (!hi) hi = 1;
+        else { hi = 0; --left; }
+    }
+    r->p = p;
+    return left == 0;
 }
 
-/* Decodes the hex block of pv into a malloc'd buffer. */
-static uint8_t* psres_block(const uint8_t* file, size_t n, const abt_preview* pv, size_t* blen) {
-    if (pv->offset > n || pv->length > n - pv->offset || pv->length > PSRES_HEX_MAX) return NULL;
-    uint8_t* buf = (uint8_t*)malloc((size_t)pv->length / 2 + 1);
-    if (!buf) return NULL;
-    *blen = hex_decode(file + pv->offset, (size_t)pv->length, buf, (size_t)pv->length / 2 + 1);
-    return buf;
+/* Streams 8BIM resources from a %BeginPhotoshop hex block without allocating the whole decoded block.
+   When want_jpeg != 0, allocates and returns the JFIF bytes in *jpeg_out (size *jlen_out). */
+static int psres_stream_1036(const uint8_t* hex_start, size_t hex_len, uint32_t* w_out, uint32_t* h_out,
+                             int want_jpeg, uint8_t** jpeg_out, size_t* jlen_out) {
+    if (hex_len > PSRES_HEX_MAX) return 0;
+    hex_rd r;
+    r.p = hex_start;
+    r.end = hex_start + hex_len;
+    for (;;) {
+        uint8_t hdr[7];
+        if (hex_read(&r, hdr, 7) < 7) return 0;
+        if (memcmp(hdr, "8BIM", 4) != 0) return 0;
+        uint32_t rid = abt_load_u16be(hdr + 4);
+        uint32_t nl = hdr[6];
+        uint64_t name_skip = ((nl + 1u) & 1u) ? (uint64_t)nl + 1u : (uint64_t)nl;
+        if (!hex_skip(&r, name_skip)) return 0;
+        uint8_t szb[4];
+        if (hex_read(&r, szb, 4) < 4) return 0;
+        uint32_t sz = abt_load_u32be(szb);
+        if (rid == 1036) {
+            if (sz <= 28) return 0;
+            uint8_t th[28];
+            if (hex_read(&r, th, 28) < 28) return 0;
+            if (abt_load_u32be(th) != 1) return 0; /* 1 = kJpegRGB */
+            *w_out = abt_load_u32be(th + 4);
+            *h_out = abt_load_u32be(th + 8);
+            uint32_t comp = abt_load_u32be(th + 20);
+            size_t jlen = (size_t)(sz - 28u);
+            if (comp && comp < jlen) jlen = comp;
+            if (want_jpeg && jpeg_out && jlen_out) {
+                uint8_t* buf = (uint8_t*)malloc(jlen);
+                if (!buf) return 0;
+                size_t got = hex_read(&r, buf, jlen);
+                if (!got) { free(buf); return 0; }
+                *jpeg_out = buf;
+                *jlen_out = got;
+            }
+            return 1;
+        }
+        uint64_t data_skip = (uint64_t)sz + (sz & 1u);
+        if (!hex_skip(&r, data_skip)) return 0;
+    }
 }
 
 size_t abt_eps_psres_jpeg(const uint8_t* file, size_t n, const abt_preview* pv, uint8_t** jpeg) {
     *jpeg = NULL;
-    size_t blen = 0;
-    uint8_t* buf = psres_block(file, n, pv, &blen);
-    if (!buf) return 0;
-    const uint8_t *res, *jpg;
-    size_t rlen, jlen = 0;
-    uint32_t w, h;
-    if (psres_find(buf, blen, 1036, &res, &rlen) && thumb1036(res, rlen, &w, &h, &jpg, &jlen)) {
-        *jpeg = (uint8_t*)malloc(jlen);
-        if (*jpeg) memcpy(*jpeg, jpg, jlen);
-        else jlen = 0;
-    }
-    free(buf);
+    if (!file || !pv || pv->offset > n || pv->length > n - pv->offset || pv->length > PSRES_HEX_MAX) return 0;
+    uint32_t w = 0, h = 0;
+    size_t jlen = 0;
+    if (!psres_stream_1036(file + pv->offset, (size_t)pv->length, &w, &h, 1, jpeg, &jlen)) return 0;
     return jlen;
 }
 
 /* "%BeginPhotoshop: <len>" + hex lines + "%EndPhotoshop" */
-static void scan_photoshop(abt_probe* out, const uint8_t* d, size_t n, const uint8_t* ps, size_t scan) {
+static void scan_photoshop(abt_probe* out, const uint8_t* d, const uint8_t* ps, size_t scan) {
     const uint8_t* end = ps + scan;
     const uint8_t* b = abt_memmem(ps, scan, "%BeginPhotoshop:", 16);
     if (!b) return;
@@ -182,15 +224,8 @@ static void scan_photoshop(abt_probe* out, const uint8_t* d, size_t n, const uin
     pv.source = ABT_PVS_PS_EPS_1036;
     pv.offset = (uint64_t)(start - d);
     pv.length = (uint64_t)(stop - start);
-    /* Decode temporarily just to learn the thumbnail size (and that it exists). */
-    size_t blen = 0;
-    uint8_t* buf = psres_block(d, n, &pv, &blen);
-    if (!buf) return;
-    const uint8_t *res, *jpg;
-    size_t rlen, jlen;
-    if (psres_find(buf, blen, 1036, &res, &rlen) && thumb1036(res, rlen, &pv.width, &pv.height, &jpg, &jlen))
+    if (psres_stream_1036(start, (size_t)(stop - start), &pv.width, &pv.height, 0, NULL, NULL))
         abt_probe_add_preview(out, &pv);
-    free(buf);
 }
 
 /* ------------------------------------------------------------------ DSC header */
@@ -345,7 +380,7 @@ abt_status abt_probe_eps(const uint8_t* d, size_t n, abt_probe* out) {
 
     size_t pscan = ps_len < PREVIEW_SCAN ? ps_len : PREVIEW_SCAN;
     scan_epsi(out, d, ps, pscan);
-    scan_photoshop(out, d, n, ps, pscan);
+    scan_photoshop(out, d, ps, pscan);
 
     size_t head = ps_len < XMP_HEAD_SCAN ? ps_len : XMP_HEAD_SCAN;
     int found = abt_xmp_find_thumbnails(d, n, ps_off, head, out);
@@ -368,9 +403,7 @@ abt_status abt_probe_eps(const uint8_t* d, size_t n, abt_probe* out) {
 
 /* Pixel convention: EPSI data is "image data as for the PostScript image operator", i.e. sample 0
    is black and the maximum (1, 3, 15, 255) is white (DeviceGray default Decode [0 1]).
-   Source: Adobe TN 5002 (EPSF 3.0) / TN 5001 DSC 3.0 %%BeginPreview. The PDF could not be
-   fetched when this was written, so this follows the PostScript image-operator rule the spec
-   references; it matches ps2epsi output. Rows are padded to a byte boundary. */
+   Source: Adobe TN 5002 (EPSF 3.0) / TN 5001 DSC 3.0 %%BeginPreview. Rows are padded to a byte boundary. */
 abt_status abt_epsi_decode(const uint8_t* d, size_t n, const abt_preview* pv, abt_image* out) {
     memset(out, 0, sizeof(*out));
     if (!pv || pv->offset > n || pv->length > n - pv->offset) return ABT_E_FORMAT;
@@ -385,7 +418,7 @@ abt_status abt_epsi_decode(const uint8_t* d, size_t n, const abt_preview* pv, ab
     const uint8_t* end = p + pv->length;
     /* at least a quarter of the claimed rows must be there (a tiny preview cannot claim 16 Mpx) */
     if ((uint64_t)(pv->length / 2) < (uint64_t)rowb * (uint64_t)((h + 3) / 4)) return ABT_E_TRUNCATED;
-    abt_status st = abt_image_alloc(out, w, h);
+    abt_status st = abt_image_alloc_uninit(out, w, h);
     if (st != ABT_OK) return st;
     abt_image_fill(out, 255, 255, 255, 255);
     uint8_t* row = (uint8_t*)malloc(rowb);

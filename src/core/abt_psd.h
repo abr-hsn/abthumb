@@ -27,6 +27,7 @@ void abt_pixbuf_free(abt_pixbuf* pb);
 void abt_psd_unpackbits(const uint8_t* src, size_t n, uint8_t* dst, size_t want);
 int abt_psd_inflate(const uint8_t* src, size_t n, uint8_t* dst, size_t want);
 void abt_psd_unpredict(uint8_t* buf, size_t rows, int w, int depth);
+void abt_psd_unpredict_row(uint8_t* row, int w, int depth, uint8_t* tmp);
 void abt_psd_row_to8(const uint8_t* src, int w, int depth, int srgb, uint8_t* dst, int step);
 int abt_psd_layer_info(const uint8_t* d, size_t n, const abt_probe* pr, size_t* off, size_t* len);
 
@@ -43,6 +44,7 @@ typedef struct abt_psd_opts {
     int dst_w, dst_h;            /* exact output size, <= document size (use abt_fit with allow_up=0) */
     int rows_per_out;            /* 0 = exact area average; N = sample N rows per output row (D-013) */
     volatile const int* cancel;  /* optional: nonzero aborts with ABT_E_CANCELLED */
+    int abort_if_approx;         /* nonzero: abort before decoding pixels if visible effects/adjustments exist */
 } abt_psd_opts;
 
 /* Decodes the merged composite (image data section). All depths (1/8/16/32), all colour modes,

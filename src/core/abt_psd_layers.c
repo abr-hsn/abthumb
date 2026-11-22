@@ -19,14 +19,23 @@
    shape layers use whatever pixels they carry (smart objects carry their rasterised pixels). */
 #include "abt_psd.h"
 #include "abt_reader.h"
+#include "abt_srgb.h"
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+
+#if defined(_M_X64) || defined(__x86_64__) || defined(__SSE2__)
+#define ABT_SSE2 1
+#include <emmintrin.h>
+#else
+#define ABT_SSE2 0
+#endif
 
 #define MAX_LAYERS 8192
 #define MAX_DEPTH 16
 #define ZIP_LIMIT ((size_t)128 << 20) /* per channel */
 #define MAX_EDGES 50000
+#define PSD_MAX_PSB 300000u
 
 enum { SLOT_A = 4, SLOT_MASK = 5, NSLOT = 6 };
 
@@ -39,6 +48,7 @@ typedef struct layer {
     char key[4];
     int divider;            /* lsct type: 0 normal, 1 open, 2 closed, 3 bounding */
     int has_mask;
+    int unrendered;         /* has adjustment layer or layer effect not rendered by compositor */
     int32_t mtop, mleft, mbottom, mright;
     uint8_t mdef;
     size_t soco_off, soco_len, vmsk_off, vmsk_len; /* solid colour fill descriptor, vector mask path data */
@@ -63,7 +73,26 @@ typedef struct ctx {
     abt_status st;
     int ticks;
     int approx; /* visible adjustment layers or layer effects present (not rendered) */
+    /* Reusable per-layer scratch buffers */
+    uint8_t* sc_c8;
+    size_t sc_c8_cap;
+    uint8_t* sc_a8;
+    size_t sc_a8_cap;
+    uint8_t* sc_row;
+    size_t sc_row_cap;
+    uint8_t* sc_out;
+    size_t sc_out_cap;
 } ctx;
+
+static uint8_t* ensure_buf(uint8_t** p, size_t* cap, size_t need) {
+    if (need <= *cap && *p) return *p;
+    size_t ncap = need < 4096 ? 4096 : need;
+    uint8_t* nb = (uint8_t*)realloc(*p, ncap);
+    if (!nb) return NULL;
+    *p = nb;
+    *cap = ncap;
+    return nb;
+}
 
 /* ------------------------------------------------------------------ parsing */
 
@@ -85,8 +114,8 @@ static void parse_extra(ctx* c, abt_rd* x, size_t extra_end, layer* L) {
     /* layer mask data */
     uint32_t ml = abt_rd_u32be(x);
     if (x->err) return;
+    if (ml > extra_end - x->pos) return;
     size_t mend = x->pos + ml;
-    if (mend > extra_end) return;
     if (ml >= 18) {
         L->mtop = (int32_t)abt_rd_u32be(x);
         L->mleft = (int32_t)abt_rd_u32be(x);
@@ -122,7 +151,7 @@ static void parse_extra(ctx* c, abt_rd* x, size_t extra_end, layer* L) {
             L->fill = data[0];
         else if (memcmp(key, "SoCo", 4) == 0) { L->soco_off = (size_t)(data - c->d); L->soco_len = (size_t)len; }
         else if (memcmp(key, "vmsk", 4) == 0 || memcmp(key, "vsms", 4) == 0) { L->vmsk_off = (size_t)(data - c->d); L->vmsk_len = (size_t)len; }
-        else if (!(L->flags & 2) && is_unrendered_key(key)) c->approx = 1;
+        else if (is_unrendered_key(key)) L->unrendered = 1;
         abt_rd_skip(x, len);
         /* tolerate even / 4-byte padding of the block length */
         for (int pad = 0; pad < 4 && abt_rd_left(x) >= 12; ++pad) {
@@ -131,7 +160,6 @@ static void parse_extra(ctx* c, abt_rd* x, size_t extra_end, layer* L) {
         }
     }
 }
-
 
 static abt_status parse_layers(ctx* c, const abt_probe* pr) {
     size_t off, len;
@@ -225,6 +253,7 @@ typedef struct csrc {
     int cs, cur_row;
     uint64_t cur_off;
     uint8_t* zip;
+    uint8_t* unpred;
     uint8_t* scratch;
     int valid;
 } csrc;
@@ -235,9 +264,9 @@ static uint32_t rle_cnt(const csrc* s, int y) {
     return s->psb ? abt_load_u32be(s->d + e) : abt_load_u16be(s->d + e);
 }
 
-static void csrc_free(csrc* s) { free(s->zip); free(s->scratch); memset(s, 0, sizeof(*s)); }
+static void csrc_free(csrc* s) { free(s->zip); free(s->unpred); free(s->scratch); memset(s, 0, sizeof(*s)); }
 
-static int csrc_init(csrc* s, const ctx* c, const lchan* ch, int w, int h) {
+static int csrc_init(csrc* s, const ctx* c, const lchan* ch, int w, int h, int max_rows) {
     memset(s, 0, sizeof(*s));
     /* Each cs[k] owns its scratch/zip and the caller frees every source: the leak report below is a false positive. */
     if (ch->len < 2 || w < 1 || h < 1) return 0; /* NOLINT(clang-analyzer-unix.Malloc) */
@@ -258,14 +287,19 @@ static int csrc_init(csrc* s, const ctx* c, const lchan* ch, int w, int h) {
         s->cnt_off = s->base;
         s->data_off = s->base + (size_t)h * (size_t)s->cs;
     } else if (s->comp >= 2) {
-        size_t total = s->rb * (size_t)h;
+        int rows_need = (max_rows > 0 && max_rows < h) ? max_rows : h;
+        uint64_t total64 = (uint64_t)s->rb * (uint64_t)rows_need;
         size_t clen = s->end > s->base ? s->end - s->base : 0;
         /* deflate expands at most ~1032:1 */
-        if (total > ZIP_LIMIT || total > (uint64_t)clen * 1032 + ((uint64_t)1 << 20)) { csrc_free(s); return 0; }
+        if (total64 > ZIP_LIMIT || total64 > (uint64_t)clen * 1032u + ((uint64_t)1 << 20)) { csrc_free(s); return 0; }
+        size_t total = (size_t)total64;
         s->zip = (uint8_t*)malloc(total);
         if (!s->zip) { csrc_free(s); return 0; }
         abt_psd_inflate(c->d + s->base, clen, s->zip, total);
-        if (s->comp == 3) abt_psd_unpredict(s->zip, (size_t)h, w, s->depth);
+        if (s->comp == 3) {
+            s->unpred = (uint8_t*)calloc(((size_t)rows_need + 7u) / 8u + 1u, 1);
+            if (!s->unpred) { csrc_free(s); return 0; }
+        }
     }
     s->valid = 1;
     return 1;
@@ -274,7 +308,7 @@ static int csrc_init(csrc* s, const ctx* c, const lchan* ch, int w, int h) {
 static const uint8_t* csrc_row(csrc* s, int y) {
     if (s->comp == 0) {
         size_t off = s->base + (size_t)y * s->rb;
-        if (off + s->rb <= s->end) return s->d + off;
+        if (off <= s->end && s->rb <= s->end - off) return s->d + off;
         size_t have = off < s->end ? s->end - off : 0;
         if (have > s->rb) have = s->rb;
         memset(s->scratch, 0, s->rb);
@@ -285,13 +319,27 @@ static const uint8_t* csrc_row(csrc* s, int y) {
         if (y < s->cur_row) { s->cur_row = 0; s->cur_off = 0; }
         while (s->cur_row < y) { s->cur_off += rle_cnt(s, s->cur_row); s->cur_row++; }
         uint32_t cnt = rle_cnt(s, y);
+        uint64_t avail_from_data = s->data_off <= s->end ? (uint64_t)(s->end - s->data_off) : 0u;
+        if (s->cur_off >= avail_from_data || !cnt) {
+            memset(s->scratch, 0, s->rb);
+            return s->scratch;
+        }
         size_t off = s->data_off + (size_t)s->cur_off;
-        size_t avail = off < s->end ? s->end - off : 0;
+        size_t avail = s->end - off;
         if (cnt > avail) cnt = (uint32_t)avail;
         abt_psd_unpackbits(s->d + off, cnt, s->scratch, s->rb);
         return s->scratch;
     }
-    return s->zip + (size_t)y * s->rb;
+    if (!s->zip) {
+        memset(s->scratch, 0, s->rb);
+        return s->scratch;
+    }
+    uint8_t* row = s->zip + (size_t)y * s->rb;
+    if (s->comp == 3 && s->unpred && !(s->unpred[(size_t)y >> 3] & (1u << (y & 7)))) {
+        s->unpred[(size_t)y >> 3] |= (uint8_t)(1u << (y & 7));
+        abt_psd_unpredict_row(row, s->w, s->depth, s->scratch);
+    }
+    return row;
 }
 
 /* ------------------------------------------------------------------ geometry and layer rendering */
@@ -348,31 +396,36 @@ static float* make_mask_plane(ctx* c, const layer* L, int rx0, int ry0, int rx1,
     size_t pw = (size_t)(rx1 - rx0), ph = (size_t)(ry1 - ry0);
     float* pl = (float*)malloc(pw * ph * sizeof(float));
     if (!pl) { c->st = ABT_E_NOMEM; return NULL; }
-    float def = L->mdef / 255.0f;
+    float def = L->mdef * (1.0f / 255.0f);
     for (size_t i = 0; i < pw * ph; ++i) pl[i] = def;
     geom g; /* make_geom rejects empty or oversized mask rectangles */
     if (!make_geom(c, L->mleft, L->mtop, L->mright, L->mbottom, rx0, ry0, rx1, ry1, &g)) return pl;
     int mw = L->mright - L->mleft, mh = L->mbottom - L->mtop;
     csrc s;
-    if (!csrc_init(&s, c, &L->ch[SLOT_MASK], mw, mh)) return pl;
+    if (!csrc_init(&s, c, &L->ch[SLOT_MASK], mw, mh, g.sb)) return pl;
     int vw = g.vx1 - g.vx0, vh = g.vy1 - g.vy0, cw = g.sr - g.sl, chh = g.sb - g.st;
-    abt_rs* rs = abt_rs_create(cw, chh, vw, vh, 1, c->rows_per_out);
-    uint8_t* row = (uint8_t*)malloc((size_t)mw + 8);
-    uint8_t* out = (uint8_t*)malloc((size_t)vw * (size_t)vh);
+    uint8_t* row = ensure_buf(&c->sc_c8, &c->sc_c8_cap, (size_t)cw + 8);
+    uint8_t* out = ensure_buf(&c->sc_out, &c->sc_out_cap, (size_t)vw * (size_t)vh);
+    abt_rs* rs = (row && out) ? abt_rs_create_into(cw, chh, vw, vh, 1, c->rows_per_out, out, (size_t)vw) : NULL;
     if (rs && row && out) {
         int bps = c->depth / 8;
         for (int y = abt_rs_next_needed(rs, 0); y < chh; y = abt_rs_next_needed(rs, y + 1)) {
             if (cancelled(c)) break;
-            const uint8_t* src = csrc_row(&s, g.st + y);
-            abt_psd_row_to8(src + (size_t)g.sl * (size_t)bps, cw, c->depth, 0, row, 1);
-            abt_rs_push(rs, y, row);
+            const uint8_t* src = csrc_row(&s, g.st + y) + (size_t)g.sl * (size_t)bps;
+            if (c->depth == 8) {
+                abt_rs_push(rs, y, src);
+            } else {
+                abt_psd_row_to8(src, cw, c->depth, 0, row, 1);
+                abt_rs_push(rs, y, row);
+            }
         }
-        abt_rs_finish(rs, out, (size_t)vw);
+        abt_rs_finish(rs, NULL, 0);
         for (int y = 0; y < vh; ++y)
             for (int x = 0; x < vw; ++x)
-                pl[(size_t)(g.vy0 - ry0 + y) * pw + (size_t)(g.vx0 - rx0 + x)] = out[(size_t)y * (size_t)vw + (size_t)x] / 255.0f;
+                pl[(size_t)(g.vy0 - ry0 + y) * pw + (size_t)(g.vx0 - rx0 + x)] =
+                    out[(size_t)y * (size_t)vw + (size_t)x] * (1.0f / 255.0f);
     }
-    abt_rs_destroy(rs); free(row); free(out); csrc_free(&s);
+    abt_rs_destroy(rs); csrc_free(&s);
     return pl;
 }
 
@@ -401,53 +454,100 @@ static fbuf* render_layer(ctx* c, const layer* L) {
     csrc cs[4], as;
     int have[4] = {0, 0, 0, 0}, ha;
     int any = 0;
-    for (int k = 0; k < nc; ++k) { have[k] = csrc_init(&cs[k], c, &L->ch[k], w, h); any |= have[k]; }
-    ha = csrc_init(&as, c, &L->ch[SLOT_A], w, h);
+    for (int k = 0; k < nc; ++k) { have[k] = csrc_init(&cs[k], c, &L->ch[k], w, h, g.sb); any |= have[k]; }
+    ha = csrc_init(&as, c, &L->ch[SLOT_A], w, h, g.sb);
     fbuf* f = NULL;
     int vw = g.vx1 - g.vx0, vh = g.vy1 - g.vy0, cw = g.sr - g.sl, chh = g.sb - g.st;
     abt_rs* rs = NULL;
-    uint8_t *c8 = NULL, *a8 = NULL, *row = NULL, *out = NULL;
     if (!any) goto done;
-    rs = abt_rs_create(cw, chh, vw, vh, comps, c->rows_per_out);
-    c8 = (uint8_t*)malloc((size_t)cw + 8);
-    a8 = (uint8_t*)malloc((size_t)cw + 8);
-    row = (uint8_t*)malloc((size_t)cw * (size_t)comps + 8);
-    out = (uint8_t*)malloc((size_t)vw * (size_t)vh * (size_t)comps);
-    if (!rs || !c8 || !a8 || !row || !out) { c->st = ABT_E_NOMEM; goto done; }
-    {
+
+    if (!ha) {
+        /* Opaque layer fast path: push planar colour channels directly, skip a8 + premultiply! */
+        uint8_t* c8 = ensure_buf(&c->sc_c8, &c->sc_c8_cap, (size_t)cw * (size_t)nc + 16);
+        uint8_t* out = ensure_buf(&c->sc_out, &c->sc_out_cap, (size_t)vw * (size_t)vh * (size_t)nc);
+        rs = (c8 && out) ? abt_rs_create_into(cw, chh, vw, vh, nc, c->rows_per_out, out, (size_t)vw * (size_t)nc) : NULL;
+        if (!rs || !c8 || !out) { c->st = ABT_E_NOMEM; goto done; }
+        int bps = c->depth / 8;
+        int fill_missing = (c->cs == ABT_CM_CMYK) ? 255 : 0;
+        for (int k = 0; k < nc; ++k)
+            if (!have[k]) memset(c8 + (size_t)k * (size_t)cw, fill_missing, (size_t)cw);
+        for (int y = abt_rs_next_needed(rs, 0); y < chh; y = abt_rs_next_needed(rs, y + 1)) {
+            if (cancelled(c)) goto done;
+            int sy = g.st + y;
+            const uint8_t* planes[4] = {0};
+            for (int k = 0; k < nc; ++k) {
+                uint8_t* dstk = c8 + (size_t)k * (size_t)cw;
+                if (!have[k]) {
+                    planes[k] = dstk;
+                } else {
+                    const uint8_t* src = csrc_row(&cs[k], sy) + (size_t)g.sl * (size_t)bps;
+                    if (c->depth == 8) planes[k] = src;
+                    else { abt_psd_row_to8(src, cw, c->depth, c->srgb, dstk, 1); planes[k] = dstk; }
+                }
+            }
+            abt_rs_push_planar(rs, y, planes, nc);
+        }
+        abt_rs_finish(rs, NULL, 0);
+        f = fbuf_new(c, g.vx0, g.vy0, vw, vh);
+        if (f) {
+            size_t npx = (size_t)vw * (size_t)vh;
+            for (size_t i = 0; i < npx; ++i) {
+                float* fp = f->p + i * (size_t)comps;
+                const uint8_t* op = out + i * (size_t)nc;
+                for (int k = 0; k < nc; ++k) fp[k] = op[k] * (1.0f / 255.0f);
+                fp[nc] = 1.0f;
+            }
+        }
+    } else {
+        uint8_t* c8 = ensure_buf(&c->sc_c8, &c->sc_c8_cap, (size_t)cw + 8);
+        uint8_t* a8 = ensure_buf(&c->sc_a8, &c->sc_a8_cap, (size_t)cw + 8);
+        uint8_t* row = ensure_buf(&c->sc_row, &c->sc_row_cap, (size_t)cw * (size_t)comps + 8);
+        uint8_t* out = ensure_buf(&c->sc_out, &c->sc_out_cap, (size_t)vw * (size_t)vh * (size_t)comps);
+        rs = (c8 && a8 && row && out)
+                 ? abt_rs_create_into(cw, chh, vw, vh, comps, c->rows_per_out, out, (size_t)vw * (size_t)comps)
+                 : NULL;
+        if (!rs || !c8 || !a8 || !row || !out) { c->st = ABT_E_NOMEM; goto done; }
         int bps = c->depth / 8;
         int fill_missing = (c->cs == ABT_CM_CMYK) ? 255 : 0;
         for (int y = abt_rs_next_needed(rs, 0); y < chh; y = abt_rs_next_needed(rs, y + 1)) {
             if (cancelled(c)) goto done;
             int sy = g.st + y;
-            if (ha) {
-                abt_psd_row_to8(csrc_row(&as, sy) + (size_t)g.sl * (size_t)bps, cw, c->depth, 0, a8, 1);
-            } else memset(a8, 255, (size_t)cw);
+            const uint8_t* asrc = csrc_row(&as, sy) + (size_t)g.sl * (size_t)bps;
+            const uint8_t* ap;
+            if (c->depth == 8) ap = asrc;
+            else { abt_psd_row_to8(asrc, cw, c->depth, 0, a8, 1); ap = a8; }
             for (int k = 0; k < nc; ++k) {
-                if (have[k]) abt_psd_row_to8(csrc_row(&cs[k], sy) + (size_t)g.sl * (size_t)bps, cw, c->depth, c->srgb, c8, 1);
-                else memset(c8, fill_missing, (size_t)cw);
+                const uint8_t* cp;
+                if (have[k]) {
+                    const uint8_t* src = csrc_row(&cs[k], sy) + (size_t)g.sl * (size_t)bps;
+                    if (c->depth == 8) cp = src;
+                    else { abt_psd_row_to8(src, cw, c->depth, c->srgb, c8, 1); cp = c8; }
+                } else {
+                    memset(c8, fill_missing, (size_t)cw);
+                    cp = c8;
+                }
                 uint8_t* dp = row + k;
                 for (int x = 0; x < cw; ++x, dp += comps) {
-                    unsigned a = a8[x];
-                    *dp = a == 255 ? c8[x] : (uint8_t)((c8[x] * a + 127u) / 255u);
+                    unsigned a = ap[x];
+                    *dp = a == 255 ? cp[x] : (uint8_t)((cp[x] * a + 127u) / 255u);
                 }
             }
-            for (int x = 0; x < cw; ++x) row[(size_t)x * (size_t)comps + (size_t)nc] = a8[x];
+            for (int x = 0; x < cw; ++x) row[(size_t)x * (size_t)comps + (size_t)nc] = ap[x];
             abt_rs_push(rs, y, row);
         }
-        abt_rs_finish(rs, out, (size_t)vw * (size_t)comps);
-    }
-    f = fbuf_new(c, g.vx0, g.vy0, vw, vh);
-    if (f) {
-        size_t cnt = (size_t)vw * (size_t)vh * (size_t)comps;
-        for (size_t i = 0; i < cnt; ++i) f->p[i] = out[i] * (1.0f / 255.0f);
-        if (L->has_mask && L->ch[SLOT_MASK].len >= 2) {
-            float* pl = make_mask_plane(c, L, g.vx0, g.vy0, g.vx1, g.vy1);
-            if (pl) { apply_plane(c, f, pl, g.vx0, g.vy0, vw); free(pl); }
+        abt_rs_finish(rs, NULL, 0);
+        f = fbuf_new(c, g.vx0, g.vy0, vw, vh);
+        if (f) {
+            size_t cnt = (size_t)vw * (size_t)vh * (size_t)comps;
+            for (size_t i = 0; i < cnt; ++i) f->p[i] = out[i] * (1.0f / 255.0f);
         }
     }
+    if (f && L->has_mask && L->ch[SLOT_MASK].len >= 2) {
+        float* pl = make_mask_plane(c, L, g.vx0, g.vy0, g.vx1, g.vy1);
+        if (pl) { apply_plane(c, f, pl, g.vx0, g.vy0, vw); free(pl); }
+    }
 done:
-    abt_rs_destroy(rs); free(c8); free(a8); free(row); free(out);
+    abt_rs_destroy(rs);
     for (int k = 0; k < nc; ++k) if (have[k]) csrc_free(&cs[k]);
     if (ha) csrc_free(&as);
     if (c->st != ABT_OK) { fbuf_free(f); return NULL; }
@@ -474,7 +574,7 @@ static int blend_mode(const char* k) {
     return BM_NORM;
 }
 
-static float clamp01(float v) { return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v); }
+static inline float clamp01(float v) { return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v); }
 
 static float dodge(float cb, float cs) { return cb <= 0.0f ? 0.0f : (cs >= 1.0f ? 1.0f : fminf(1.0f, cb / (1.0f - cs))); }
 static float burn(float cb, float cs) { return cb >= 1.0f ? 1.0f : (cs <= 0.0f ? 0.0f : 1.0f - fminf(1.0f, (1.0f - cb) / cs)); }
@@ -543,19 +643,17 @@ static void blend_nonsep(int m, const float* cb, const float* cs, float* o) {
 
 /* Lab documents: non-normal modes are evaluated in sRGB (Photoshop's Lab blending is not defined per channel). */
 static void lab_f2rgb(const float* lab, float* rgb) {
-    double L = lab[0] * 100.0, a = lab[1] * 255.0 - 128.0, b = lab[2] * 255.0 - 128.0;
-    double fy = (L + 16.0) / 116.0, fx = fy + a / 500.0, fz = fy - b / 200.0;
-    const double eps = 216.0 / 24389.0, kap = 24389.0 / 27.0;
-    double x3 = fx * fx * fx, z3 = fz * fz * fz;
-    double X = (x3 > eps ? x3 : (116.0 * fx - 16.0) / kap) * 0.96422;
-    double Y = L > kap * eps ? fy * fy * fy : L / kap;
-    double Z = (z3 > eps ? z3 : (116.0 * fz - 16.0) / kap) * 0.82521;
-    double lin[3] = {3.1338561 * X - 1.6168667 * Y - 0.4906146 * Z, -0.9787684 * X + 1.9161415 * Y + 0.0334540 * Z,
-                     0.0719453 * X - 0.2289914 * Y + 1.4052427 * Z};
-    for (int i = 0; i < 3; ++i) {
-        double v = lin[i] < 0 ? 0 : (lin[i] > 1 ? 1 : lin[i]);
-        rgb[i] = (float)(v <= 0.0031308 ? v * 12.92 : 1.055 * pow(v, 1.0 / 2.4) - 0.055);
-    }
+    float L = lab[0] * 100.0f, a = lab[1] * 255.0f - 128.0f, b = lab[2] * 255.0f - 128.0f;
+    float fy = (L + 16.0f) * (1.0f / 116.0f), fx = fy + a * (1.0f / 500.0f), fz = fy - b * (1.0f / 200.0f);
+    const float eps = 216.0f / 24389.0f, kap = 24389.0f / 27.0f;
+    float x3 = fx * fx * fx, z3 = fz * fz * fz;
+    float X = (x3 > eps ? x3 : (116.0f * fx - 16.0f) * (1.0f / kap)) * 0.96422f;
+    float Y = L > kap * eps ? fy * fy * fy : L * (1.0f / kap);
+    float Z = (z3 > eps ? z3 : (116.0f * fz - 16.0f) * (1.0f / kap)) * 0.82521f;
+    float lin[3] = {3.1338561f * X - 1.6168667f * Y - 0.4906146f * Z,
+                    -0.9787684f * X + 1.9161415f * Y + 0.0334540f * Z,
+                    0.0719453f * X - 0.2289914f * Y + 1.4052427f * Z};
+    for (int i = 0; i < 3; ++i) rgb[i] = abt_linear_to_srgb_f(lin[i]);
 }
 static void lab_frgb(const float* rgb, float* lab) {
     double lin[3];
@@ -591,6 +689,7 @@ static void blend_pixel_color(const ctx* c, int m, const float* cb, const float*
     } else if (m == BM_DKCL || m == BM_LGCL) {
         int pick_s;
         if (nc == 3) { float lb = lum3(cb), ls = lum3(cs); pick_s = m == BM_DKCL ? ls < lb : ls > lb; }
+        else if (nc == 1) { pick_s = m == BM_DKCL ? cs[0] < cb[0] : cs[0] > cb[0]; }
         else pick_s = 1;
         for (int k = 0; k < nc; ++k) out[k] = pick_s ? cs[k] : cb[k];
     } else {
@@ -601,10 +700,80 @@ static void blend_pixel_color(const ctx* c, int m, const float* cb, const float*
 
 /* Blends S onto B. clip: S is a clipped layer inside an isolated clipping group; B's alpha is kept. */
 static void blend_into(const ctx* c, fbuf* B, const fbuf* S, float opacity, int mode, int clip) {
+    if (opacity <= 0.0f) return;
     int nc = c->nch, comps = nc + 1;
     int ix0 = B->x0 > S->x0 ? B->x0 : S->x0, iy0 = B->y0 > S->y0 ? B->y0 : S->y0;
     int ix1 = (B->x0 + B->w < S->x0 + S->w) ? B->x0 + B->w : S->x0 + S->w;
     int iy1 = (B->y0 + B->h < S->y0 + S->h) ? B->y0 + B->h : S->y0 + S->h;
+    if (ix1 <= ix0 || iy1 <= iy0) return;
+
+    if (!clip && mode == BM_NORM) {
+#if ABT_SSE2
+        if (nc == 3) {
+            const __m128 vop = _mm_set1_ps(opacity);
+            const __m128 vone = _mm_set1_ps(1.0f);
+            for (int y = iy0; y < iy1; ++y) {
+                const float* s = S->p + ((size_t)(y - S->y0) * (size_t)S->w + (size_t)(ix0 - S->x0)) * 4;
+                float* b = B->p + ((size_t)(y - B->y0) * (size_t)B->w + (size_t)(ix0 - B->x0)) * 4;
+                for (int x = ix0; x < ix1; ++x, s += 4, b += 4) {
+                    if (s[3] <= 0.0f) continue;
+                    __m128 vs = _mm_loadu_ps(s);
+                    __m128 vb = _mm_loadu_ps(b);
+                    __m128 vsp = _mm_mul_ps(vs, vop);
+                    __m128 va = _mm_shuffle_ps(vsp, vsp, _MM_SHUFFLE(3, 3, 3, 3));
+                    __m128 vout = _mm_add_ps(_mm_mul_ps(_mm_sub_ps(vone, va), vb), vsp);
+                    _mm_storeu_ps(b, vout);
+                }
+            }
+            return;
+        }
+#endif
+        for (int y = iy0; y < iy1; ++y) {
+            const float* s = S->p + ((size_t)(y - S->y0) * (size_t)S->w + (size_t)(ix0 - S->x0)) * (size_t)comps;
+            float* b = B->p + ((size_t)(y - B->y0) * (size_t)B->w + (size_t)(ix0 - B->x0)) * (size_t)comps;
+            for (int x = ix0; x < ix1; ++x, s += comps, b += comps) {
+                float as = s[nc];
+                if (as <= 0.0f) continue;
+                float aS = as * opacity, inv = 1.0f - aS;
+                for (int k = 0; k < nc; ++k) b[k] = inv * b[k] + s[k] * opacity;
+                b[nc] = inv * b[nc] + aS;
+            }
+        }
+        return;
+    }
+
+    if (clip && mode == BM_NORM) {
+        for (int y = iy0; y < iy1; ++y) {
+            const float* s = S->p + ((size_t)(y - S->y0) * (size_t)S->w + (size_t)(ix0 - S->x0)) * (size_t)comps;
+            float* b = B->p + ((size_t)(y - B->y0) * (size_t)B->w + (size_t)(ix0 - B->x0)) * (size_t)comps;
+            for (int x = ix0; x < ix1; ++x, s += comps, b += comps) {
+                float as = s[nc], ab = b[nc];
+                if (as <= 0.0f || ab <= 0.0f) continue;
+                float inv = 1.0f - as * opacity;
+                float scale = opacity * ab;
+                for (int k = 0; k < nc; ++k) b[k] = inv * b[k] + s[k] * scale;
+            }
+        }
+        return;
+    }
+
+    if (clip) {
+        for (int y = iy0; y < iy1; ++y) {
+            const float* s = S->p + ((size_t)(y - S->y0) * (size_t)S->w + (size_t)(ix0 - S->x0)) * (size_t)comps;
+            float* b = B->p + ((size_t)(y - B->y0) * (size_t)B->w + (size_t)(ix0 - B->x0)) * (size_t)comps;
+            for (int x = ix0; x < ix1; ++x, s += comps, b += comps) {
+                float as = s[nc], ab = b[nc];
+                if (as <= 0.0f || ab <= 0.0f) continue;
+                float aS = as * opacity;
+                float cs[4] = {0}, cb[4] = {0}, bl[4] = {0};
+                for (int k = 0; k < nc; ++k) { cs[k] = clamp01(s[k] / as); cb[k] = clamp01(b[k] / ab); }
+                blend_pixel_color(c, mode, cb, cs, bl);
+                for (int k = 0; k < nc; ++k) b[k] = ((1.0f - aS) * cb[k] + aS * bl[k]) * ab;
+            }
+        }
+        return;
+    }
+
     for (int y = iy0; y < iy1; ++y) {
         const float* s = S->p + ((size_t)(y - S->y0) * (size_t)S->w + (size_t)(ix0 - S->x0)) * (size_t)comps;
         float* b = B->p + ((size_t)(y - B->y0) * (size_t)B->w + (size_t)(ix0 - B->x0)) * (size_t)comps;
@@ -612,19 +781,7 @@ static void blend_into(const ctx* c, fbuf* B, const fbuf* S, float opacity, int 
             float as = s[nc];
             if (as <= 0.0f) continue;
             float aS = as * opacity, ab = b[nc];
-            float cs[4], cb[4], bl[4];
-            if (clip) {
-                if (ab <= 0.0f) continue;
-                for (int k = 0; k < nc; ++k) { cs[k] = clamp01(s[k] / as); cb[k] = clamp01(b[k] / ab); }
-                blend_pixel_color(c, mode, cb, cs, bl);
-                for (int k = 0; k < nc; ++k) b[k] = ((1.0f - aS) * cb[k] + aS * bl[k]) * ab;
-                continue;
-            }
-            if (mode == BM_NORM) {
-                for (int k = 0; k < nc; ++k) b[k] = (1.0f - aS) * b[k] + s[k] * opacity;
-                b[nc] = ab + aS - ab * aS;
-                continue;
-            }
+            float cs[4] = {0}, cb[4] = {0}, bl[4] = {0};
             for (int k = 0; k < nc; ++k) cs[k] = clamp01(s[k] / as);
             if (ab > 0.0f) {
                 for (int k = 0; k < nc; ++k) cb[k] = clamp01(b[k] / ab);
@@ -720,20 +877,24 @@ static edge* vmsk_edges(const ctx* c, const layer* L, size_t* ne, int* invert, i
     size_t cnt = 0, cap = 0;
     float W = (float)c->dw, H = (float)c->dh;
     size_t pos = 8;
-    unsigned left = 0, total = 0;
-    int closed = 0;
-    pt kn[3 * 1024];
+    pt* kn = NULL;
+    unsigned kn_cap = 0;
     while (pos + 26 <= n) {
         unsigned sel = abt_load_u16be(d + pos);
         if (sel == 0 || sel == 3) {
-            total = abt_load_u16be(d + pos + 2);
-            left = total > 1024 ? 1024 : total;
-            if (total > 1024) { pos += 26; continue; }
-            closed = sel == 0;
+            unsigned total = abt_load_u16be(d + pos + 2);
+            if (total > 1024) { free(kn); free(edges); *bad = 1; return NULL; }
+            if (total > kn_cap) {
+                pt* nkn = (pt*)realloc(kn, (size_t)total * 3u * sizeof(pt));
+                if (!nkn) { free(kn); free(edges); *bad = 1; return NULL; }
+                kn = nkn;
+                kn_cap = total;
+            }
+            int closed = sel == 0;
             pos += 26;
             /* read the knot records */
             unsigned got = 0;
-            while (got < left && pos + 26 <= n) {
+            while (got < total && pos + 26 <= n) {
                 unsigned s2 = abt_load_u16be(d + pos);
                 if (s2 < 1 || s2 > 5 || s2 == 3) break;
                 for (int q = 0; q < 3; ++q) {
@@ -759,7 +920,7 @@ static edge* vmsk_edges(const ctx* c, const layer* L, size_t* ne, int* invert, i
                         float t = (float)s / (float)steps, u = 1.0f - t;
                         float b0 = u * u * u, b1 = 3 * u * u * t, b2 = 3 * u * t * t, b3 = t * t * t;
                         pt cur = {b0 * p0.x + b1 * p1.x + b2 * p2.x + b3 * p3.x, b0 * p0.y + b1 * p1.y + b2 * p2.y + b3 * p3.y};
-                        if (!add_edge(&edges, &cnt, &cap, prev, cur)) { free(edges); *bad = 1; return NULL; }
+                        if (!add_edge(&edges, &cnt, &cap, prev, cur)) { free(kn); free(edges); *bad = 1; return NULL; }
                         prev = cur;
                     }
                 }
@@ -768,12 +929,19 @@ static edge* vmsk_edges(const ctx* c, const layer* L, size_t* ne, int* invert, i
             pos += 26; /* fill rule / clipboard / initial fill records */
         }
     }
+    free(kn);
     *ne = cnt;
     return edges;
 }
 
-/* Non-zero winding fill with 4 vertical sub-scanlines and exact horizontal coverage, into cov[w*h] over rows [y0,y1). */
-typedef struct xcross { float x, dir; } xcross;
+/* Non-zero winding fill with 4 vertical sub-scanlines, ymin-sorted active edge list, and exact horizontal coverage. */
+typedef struct aedge { float y0, y1, x0, dxdy; int dir; } aedge;
+typedef struct xcross { float x; int dir; } xcross;
+
+static int cmp_aedge(const void* a, const void* b) {
+    float ya = ((const aedge*)a)->y0, yb = ((const aedge*)b)->y0;
+    return (ya > yb) - (ya < yb);
+}
 
 static int cmp_xcross(const void* a, const void* b) {
     float x = ((const xcross*)a)->x, y = ((const xcross*)b)->x;
@@ -783,22 +951,42 @@ static int cmp_xcross(const void* a, const void* b) {
 /* Sets c->st on cancel or out of memory. */
 static void raster_edges(ctx* c, const edge* e, size_t ne, int w, int h, float* cov) {
     enum { SS = 4 };
+    aedge* ae = (aedge*)malloc(ne * sizeof(aedge));
+    size_t* active = (size_t*)malloc(ne * sizeof(size_t));
     xcross* xs = (xcross*)malloc(ne * sizeof(xcross));
-    if (!xs) { c->st = ABT_E_NOMEM; return; }
+    if (!ae || !active || !xs) { free(ae); free(active); free(xs); c->st = ABT_E_NOMEM; return; }
+    size_t nae = 0;
+    for (size_t i = 0; i < ne; ++i) {
+        float y0 = e[i].y0, y1 = e[i].y1, x0 = e[i].x0, x1 = e[i].x1;
+        int dir = 1;
+        if (y0 > y1) { float t = y0; y0 = y1; y1 = t; t = x0; x0 = x1; x1 = t; dir = -1; }
+        if (y1 <= 0.0f || y0 >= (float)h || y1 <= y0) continue;
+        ae[nae].y0 = y0;
+        ae[nae].y1 = y1;
+        ae[nae].x0 = x0;
+        ae[nae].dxdy = (x1 - x0) / (y1 - y0);
+        ae[nae].dir = dir;
+        ++nae;
+    }
+    if (nae > 1) qsort(ae, nae, sizeof(aedge), cmp_aedge);
+    size_t na = 0, next_e = 0;
     for (int row = 0; row < h; ++row) {
         if (cancelled(c)) break;
+        float row_top = (float)row, row_bot = (float)(row + 1);
+        while (next_e < nae && ae[next_e].y0 < row_bot) {
+            if (ae[next_e].y1 > row_top) active[na++] = next_e;
+            ++next_e;
+        }
+        if (na == 0) continue;
         float* line = cov + (size_t)row * (size_t)w;
         for (int s = 0; s < SS; ++s) {
-            float y = (float)row + ((float)s + 0.5f) / (float)SS;
+            float y = row_top + ((float)s + 0.5f) * (1.0f / (float)SS);
             size_t nx = 0;
-            for (size_t i = 0; i < ne; ++i) {
-                float ya = e[i].y0, yb = e[i].y1;
-                int dir = 1;
-                if (ya > yb) { float t = ya; ya = yb; yb = t; dir = -1; }
-                if (y < ya || y >= yb) continue;
-                float x = e[i].x0 + (y - e[i].y0) * (e[i].x1 - e[i].x0) / (e[i].y1 - e[i].y0);
-                xs[nx].x = x;
-                xs[nx].dir = (float)dir;
+            for (size_t ai = 0; ai < na; ++ai) {
+                const aedge* ed = &ae[active[ai]];
+                if (y < ed->y0 || y >= ed->y1) continue;
+                xs[nx].x = ed->x0 + (y - ed->y0) * ed->dxdy;
+                xs[nx].dir = ed->dir;
                 ++nx;
             }
             if (nx < 2) continue;
@@ -812,7 +1000,7 @@ static void raster_edges(ctx* c, const edge* e, size_t ne, int w, int h, float* 
                 }
             int wind = 0;
             for (size_t i = 0; i + 1 < nx; ++i) {
-                wind += (int)xs[i].dir;
+                wind += xs[i].dir;
                 if (!wind) continue;
                 float xa = xs[i].x, xb = xs[i + 1].x;
                 if (xb <= 0.0f || xa >= (float)w) continue;
@@ -826,7 +1014,15 @@ static void raster_edges(ctx* c, const edge* e, size_t ne, int w, int h, float* 
                 }
             }
         }
+        /* Retire edges that finish on or before row_bot */
+        size_t keep = 0;
+        for (size_t ai = 0; ai < na; ++ai) {
+            if (ae[active[ai]].y1 > row_bot) active[keep++] = active[ai];
+        }
+        na = keep;
     }
+    free(ae);
+    free(active);
     free(xs);
 }
 
@@ -887,7 +1083,7 @@ static fbuf* render_shape(ctx* c, const layer* L) {
 
 static void comp_range(ctx* c, fbuf* B, int lo, int hi, int depth);
 
-static float layer_opacity(const layer* L) { return (L->opacity / 255.0f) * (L->fill / 255.0f); }
+static float layer_opacity(const layer* L) { return (L->opacity * (1.0f / 255.0f)) * (L->fill * (1.0f / 255.0f)); }
 static int is_group_div(const layer* L) { return L->divider != 0; }
 
 /* True if some visible non-divider layer in (lo, hi) can draw something. */
@@ -895,6 +1091,8 @@ static int range_has_content(const ctx* c, int lo, int hi) {
     for (int k = lo; k < hi; ++k) {
         const layer* L = &c->L[k];
         if (is_group_div(L) || (L->flags & 2)) continue;
+        if (L->unrendered) return 1; /* ensure approx flag is propagated for visible adjustments */
+        if (L->opacity == 0 || L->fill == 0) continue;
         if (L->soco_len) return 1;
         for (int s = 0; s < SLOT_A; ++s) if (L->ch[s].len >= 2) return 1;
     }
@@ -903,8 +1101,10 @@ static int range_has_content(const ctx* c, int lo, int hi) {
 
 static void do_group(ctx* c, fbuf* B, int open_i, int hdr_i, int depth) {
     const layer* H = &c->L[hdr_i];
-    if (!range_has_content(c, open_i + 1, hdr_i)) return;
+    if (H->unrendered) c->approx = 1;
     float op = layer_opacity(H);
+    if (op <= 0.0f) return;
+    if (!range_has_content(c, open_i + 1, hdr_i)) return;
     int pass = memcmp(H->key, "pass", 4) == 0;
     int masked = H->has_mask && H->ch[SLOT_MASK].len >= 2;
     if (pass && op >= 0.999f && !masked) { comp_range(c, B, open_i + 1, hdr_i, depth + 1); return; }
@@ -937,9 +1137,11 @@ static void comp_range(ctx* c, fbuf* B, int lo, int hi, int depth) {
         while (k < hi && c->L[k].clip == 1 && !is_group_div(&c->L[k])) ++k;
         int hidden = (L->flags & 2) != 0;
         if (hidden) { i = k; continue; }
+        if (L->unrendered) c->approx = 1;
+        float op = layer_opacity(L);
+        if (op <= 0.0f) { i = k; continue; }
         fbuf* S = render_layer(c, L);
         if (S) {
-            float op = layer_opacity(L);
             int mode = blend_mode(L->key);
             if (k == i + 1) {
                 blend_into(c, B, S, op, mode, 0);
@@ -947,8 +1149,11 @@ static void comp_range(ctx* c, fbuf* B, int lo, int hi, int depth) {
                 for (int m = i + 1; m < k && c->st == ABT_OK; ++m) {
                     const layer* CL = &c->L[m];
                     if (CL->flags & 2) continue;
+                    if (CL->unrendered) c->approx = 1;
+                    float cop = layer_opacity(CL);
+                    if (cop <= 0.0f) continue;
                     fbuf* T = render_layer(c, CL);
-                    if (T) { blend_into(c, S, T, layer_opacity(CL), blend_mode(CL->key), 1); fbuf_free(T); }
+                    if (T) { blend_into(c, S, T, cop, blend_mode(CL->key), 1); fbuf_free(T); }
                 }
                 if (c->st == ABT_OK) blend_into(c, B, S, op, mode, 0);
             }
@@ -960,19 +1165,49 @@ static void comp_range(ctx* c, fbuf* B, int lo, int hi, int depth) {
 
 /* ------------------------------------------------------------------ entry point */
 
+static int has_visible_unrendered(const ctx* c, int lo, int hi, int depth) {
+    if (depth > MAX_DEPTH) return 0;
+    int i = lo;
+    while (i < hi) {
+        const layer* L = &c->L[i];
+        if (L->divider == 3 && c->match[i] > i && c->match[i] < hi) {
+            int j = c->match[i];
+            if (!(c->L[j].flags & 2)) {
+                if (c->L[j].unrendered) return 1;
+                if (layer_opacity(&c->L[j]) > 0.0f && has_visible_unrendered(c, i + 1, j, depth + 1)) return 1;
+            }
+            i = j + 1;
+            continue;
+        }
+        if (is_group_div(L)) { ++i; continue; }
+        int k = i + 1;
+        while (k < hi && c->L[k].clip == 1 && !is_group_div(&c->L[k])) ++k;
+        if (L->flags & 2) { i = k; continue; }
+        if (L->unrendered) return 1;
+        if (layer_opacity(L) > 0.0f) {
+            for (int m = i + 1; m < k; ++m)
+                if (!(c->L[m].flags & 2) && c->L[m].unrendered) return 1;
+        }
+        i = k;
+    }
+    return 0;
+}
+
 abt_status abt_psd_composite_layers(const uint8_t* d, size_t n, const abt_probe* pr, const abt_psd_opts* o,
                                     abt_pixbuf* out) {
     if (!d || !pr || !o || !out) return ABT_E_FORMAT;
     memset(out, 0, sizeof(*out));
     if (n < 26 || memcmp(d, "8BPS", 4) != 0) return ABT_E_FORMAT;
+    uint16_t ver = abt_load_u16be(d + 4);
+    if (ver != 1 && ver != 2) return ABT_E_FORMAT;
     ctx c;
     memset(&c, 0, sizeof(c));
     c.d = d; c.n = n;
-    c.psb = abt_load_u16be(d + 4) == 2;
+    c.psb = ver == 2;
     c.depth = abt_load_u16be(d + 22);
     c.mode = abt_load_u16be(d + 24);
-    c.doc_w = (int)abt_load_u32be(d + 18);
-    c.doc_h = (int)abt_load_u32be(d + 14);
+    uint32_t doc_w = abt_load_u32be(d + 18);
+    uint32_t doc_h = abt_load_u32be(d + 14);
     if (c.depth != 8 && c.depth != 16 && c.depth != 32) return ABT_E_UNSUPPORTED;
     switch (c.mode) {
     case 1: case 8: c.nch = 1; c.cs = ABT_CM_GRAY; c.srgb = 1; break;
@@ -981,8 +1216,13 @@ abt_status abt_psd_composite_layers(const uint8_t* d, size_t n, const abt_probe*
     case 9: c.nch = 3; c.cs = ABT_CM_LAB; break;
     default: return ABT_E_UNSUPPORTED;
     }
-    if (c.doc_w < 1 || c.doc_h < 1 || o->dst_w < 1 || o->dst_h < 1 || o->dst_w > c.doc_w || o->dst_h > c.doc_h) return ABT_E_LIMIT;
-    if ((size_t)o->dst_w * (size_t)o->dst_h * (size_t)(c.nch + 1) * sizeof(float) > ((size_t)768 << 20)) return ABT_E_LIMIT;
+    if (doc_w < 1 || doc_h < 1 || doc_w > PSD_MAX_PSB || doc_h > PSD_MAX_PSB) return ABT_E_LIMIT;
+    if (o->dst_w < 1 || o->dst_h < 1 || o->dst_w > ABT_MAX_DIM || o->dst_h > ABT_MAX_DIM ||
+        (uint32_t)o->dst_w > doc_w || (uint32_t)o->dst_h > doc_h)
+        return ABT_E_LIMIT;
+    if ((uint64_t)o->dst_w * (uint64_t)o->dst_h * (uint64_t)(c.nch + 1) * sizeof(float) > ((uint64_t)768 << 20))
+        return ABT_E_LIMIT;
+    c.doc_w = (int)doc_w; c.doc_h = (int)doc_h;
     c.dw = o->dst_w; c.dh = o->dst_h;
     c.sx = (double)c.dw / c.doc_w; c.sy = (double)c.dh / c.doc_h;
     c.rows_per_out = o->rows_per_out;
@@ -991,6 +1231,12 @@ abt_status abt_psd_composite_layers(const uint8_t* d, size_t n, const abt_probe*
 
     abt_status st = parse_layers(&c, pr);
     if (st != ABT_OK) { free(c.L); free(c.match); return st; }
+    if (o->abort_if_approx && has_visible_unrendered(&c, 0, c.count, 0)) {
+        out->approx = 1;
+        free(c.L);
+        free(c.match);
+        return ABT_OK;
+    }
     fbuf* B = fbuf_new(&c, 0, 0, c.dw, c.dh);
     if (!B) { st = c.st; free(c.L); free(c.match); return st; }
     comp_range(&c, B, 0, c.count, 0);
@@ -1020,6 +1266,7 @@ abt_status abt_psd_composite_layers(const uint8_t* d, size_t n, const abt_probe*
         }
     }
     fbuf_free(B);
+    free(c.sc_c8); free(c.sc_a8); free(c.sc_row); free(c.sc_out);
     free(c.L);
     free(c.match);
     return st;

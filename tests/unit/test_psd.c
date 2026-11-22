@@ -778,10 +778,127 @@ static void test_truncated_raw_claim(void) {
     abt_pixbuf_free(&pb);
 }
 
+static void put_layer_rec(buf* b, int32_t t, int32_t l, int32_t bo, int32_t r, const int16_t* ids,
+                          const uint32_t* lens, unsigned nch, const char* key4, uint8_t op, uint8_t clip, uint8_t flags,
+                          const uint8_t* mask_hdr, size_t mask_len, const uint8_t* extra_tags, size_t extra_len) {
+    b32(b, (unsigned)t); b32(b, (unsigned)l); b32(b, (unsigned)bo); b32(b, (unsigned)r);
+    b16(b, nch);
+    for (unsigned i = 0; i < nch; ++i) { b16(b, (unsigned)(uint16_t)ids[i]); b32(b, lens[i]); }
+    bput(b, "8BIM", 4);
+    bput(b, key4, 4);
+    uint8_t meta[4] = {op, clip, flags, 0};
+    bput(b, meta, 4);
+    uint32_t el = 4u + (uint32_t)mask_len + 4u + 4u + (uint32_t)extra_len;
+    b32(b, el);
+    b32(b, (unsigned)mask_len);
+    if (mask_len) bput(b, mask_hdr, mask_len);
+    b32(b, 0); /* blending ranges */
+    b32(b, 0); /* empty pascal name padded to 4 */
+    if (extra_len) bput(b, extra_tags, extra_len);
+}
+
+static void test_synthetic_layers(void) {
+    /* 1) Synthetic 2x1 RGB8 PSD: base layer (200,100,50) + clipped Multiply layer (128,128,128) at 100%
+          + hidden group with an unrendered 'curv' key (must NOT trigger approx) */
+    buf li = {0};
+    b16(&li, 4); /* 4 layers */
+    int16_t ids3[3] = {0, 1, 2};
+    uint32_t len2[3] = {4, 4, 4}; /* 2 bytes comp=0 + 2 pixels */
+    /* Layer 0: base (2x1) */
+    put_layer_rec(&li, 0, 0, 1, 2, ids3, len2, 3, "norm", 255, 0, 0, NULL, 0, NULL, 0);
+    /* Layer 1: clipped multiply (2x1) with user mask (left=0, right=1 -> only pixel 0 masked in, default 0) */
+    int16_t ids4[4] = {0, 1, 2, -2};
+    uint32_t len4[4] = {4, 4, 4, 3}; /* mask 1x1 = 2+1 bytes */
+    uint8_t mhdr[20] = {0,0,0,0, 0,0,0,0, 0,0,0,1, 0,0,0,1, 0 /* mdef=0 */, 0 /* enabled */, 0, 0};
+    put_layer_rec(&li, 0, 0, 1, 2, ids4, len4, 4, "mul ", 255, 1, 0, mhdr, 20, NULL, 0);
+    /* Layer 2: hidden group bounding divider (divider=3) + adjustment 'curv' */
+    uint8_t div3[16] = {'8','B','I','M','l','s','c','t', 0,0,0,4, 0,0,0,3};
+    put_layer_rec(&li, 0, 0, 0, 0, NULL, NULL, 0, "norm", 255, 0, 0, NULL, 0, div3, sizeof(div3));
+    /* Layer 3: hidden group header (divider=1, flags=2 hidden) with unrendered 'curv' */
+    uint8_t div1_curv[28] = {'8','B','I','M','l','s','c','t', 0,0,0,4, 0,0,0,1,
+                             '8','B','I','M','c','u','r','v', 0,0,0,0};
+    put_layer_rec(&li, 0, 0, 0, 0, NULL, NULL, 0, "pass", 255, 0, 2, NULL, 0, div1_curv, sizeof(div1_curv));
+    /* Channel data: Layer 0 R=200, G=100, B=50 */
+    uint8_t c0r[4] = {0,0, 200,200}, c0g[4] = {0,0, 100,100}, c0b[4] = {0,0, 50,50};
+    bput(&li, c0r, 4); bput(&li, c0g, 4); bput(&li, c0b, 4);
+    /* Layer 1 R=128, G=128, B=128, Mask(1x1)=255 */
+    uint8_t c1[4] = {0,0, 128,128}, cm[3] = {0,0, 255};
+    bput(&li, c1, 4); bput(&li, c1, 4); bput(&li, c1, 4); bput(&li, cm, 3);
+    if (li.n & 1) { uint8_t z = 0; bput(&li, &z, 1); }
+
+    buf f = {0};
+    bput(&f, "8BPS", 4); b16(&f, 1);
+    uint8_t z6[6] = {0}; bput(&f, z6, 6);
+    b16(&f, 3); b32(&f, 1); b32(&f, 2); b16(&f, 8); b16(&f, 3);
+    b32(&f, 0); /* color mode */
+    b32(&f, 0); /* resources */
+    b32(&f, (unsigned)(4 + li.n + 4)); /* layer & mask info */
+    b32(&f, (unsigned)li.n);
+    bput(&f, li.p, li.n);
+    b32(&f, 0); /* global layer mask */
+    b16(&f, 0); { uint8_t z[6] = {0}; bput(&f, z, 6); }
+
+    abt_probe pr;
+    ABT_CHECK(probe_buf(f.p, f.n, &pr) == ABT_OK);
+    ABT_CHECK((pr.info.flags & ABT_INFO_LAYERS) != 0);
+    abt_psd_opts o = {2, 1, 0, NULL};
+    abt_pixbuf pb = {0};
+    ABT_CHECK(abt_psd_composite_layers(f.p, f.n, &pr, &o, &pb) == ABT_OK);
+    if (pb.px) {
+        /* pixel 0: multiplied by 128/255 (~100, 50, 25); pixel 1: unmasked (200, 100, 50) */
+        ABT_CHECK_MSG(abs((int)pb.px[0] - 100) <= 1 && abs((int)pb.px[1] - 50) <= 1 && abs((int)pb.px[2] - 25) <= 1,
+                      "layer px0: %u %u %u", pb.px[0], pb.px[1], pb.px[2]);
+        ABT_CHECK_MSG(pb.px[3] == 200 && pb.px[4] == 100 && pb.px[5] == 50,
+                      "layer px1: %u %u %u", pb.px[3], pb.px[4], pb.px[5]);
+        ABT_CHECK_MSG(pb.approx == 0, "hidden group curv must not set approx");
+        abt_pixbuf_free(&pb);
+    }
+    free(li.p); free(f.p);
+
+    /* 2) 4-byte padded global tagged block before Lr16 (regression for find_layer_block padding) */
+    buf g = {0};
+    bput(&g, "8BPS", 4); b16(&g, 1);
+    bput(&g, z6, 6);
+    b16(&g, 4); b32(&g, 1); b32(&g, 1); b16(&g, 16); b16(&g, 3); /* 4ch RGBA16 */
+    b32(&g, 0); b32(&g, 0);
+    /* Layer & mask info: empty Layer Info (0), empty Global Mask (0), dummy 2-byte block padded to 4, then Lr16 with count=-1 */
+    buf lr16 = {0};
+    b16(&lr16, (unsigned)(uint16_t)(int16_t)-1);
+    uint32_t len16[3] = {4, 4, 4}; /* 2 bytes comp + 1 u16 sample */
+    put_layer_rec(&lr16, 0, 0, 1, 1, ids3, len16, 3, "norm", 255, 0, 0, NULL, 0, NULL, 0);
+    uint8_t s16[4] = {0,0, 0x80,0x00};
+    bput(&lr16, s16, 4); bput(&lr16, s16, 4); bput(&lr16, s16, 4);
+    if (lr16.n & 1) { uint8_t z = 0; bput(&lr16, &z, 1); }
+
+    buf tail = {0};
+    /* 4-byte padded block with length=2 + 2 pad bytes */
+    bput(&tail, "8BIMtest", 8); b32(&tail, 2); b16(&tail, 0x1234); b16(&tail, 0);
+    /* Lr16 block */
+    bput(&tail, "8BIMLr16", 8); b32(&tail, (unsigned)lr16.n); bput(&tail, lr16.p, lr16.n);
+
+    b32(&g, (unsigned)(4 + 4 + tail.n));
+    b32(&g, 0); /* empty Layer Info */
+    b32(&g, 0); /* empty Global Layer Mask */
+    bput(&g, tail.p, tail.n);
+    b16(&g, 0); { uint8_t z[8] = {0}; bput(&g, z, 8); }
+
+    ABT_CHECK(probe_buf(g.p, g.n, &pr) == ABT_OK);
+    ABT_CHECK_MSG((pr.info.flags & ABT_INFO_LAYERS) && (pr.info.flags & ABT_INFO_HAS_ALPHA),
+                  "4-byte padded Lr16 flags=%x", pr.info.flags);
+    abt_psd_opts o1 = {1, 1, 0, NULL};
+    ABT_CHECK(abt_psd_composite_layers(g.p, g.n, &pr, &o1, &pb) == ABT_OK);
+    if (pb.px) {
+        ABT_CHECK(pb.px[0] == 128 && pb.px[1] == 128 && pb.px[2] == 128);
+        abt_pixbuf_free(&pb);
+    }
+    free(lr16.p); free(tail.p); free(g.p);
+}
+
 void suite_psd(void) {
     test_truncated_raw_claim();
     test_synthetic();
     test_synthetic_resources();
+    test_synthetic_layers();
     test_pixbuf();
     test_probe_corpus();
     test_decode_corpus();
