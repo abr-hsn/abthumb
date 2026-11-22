@@ -6,6 +6,7 @@ namespace abt {
 
 // Process-wide WIC factory (created on first use, thread-safe). Caller must have COM initialized.
 HRESULT wic_factory(IWICImagingFactory** out);
+void wic_shutdown();
 
 // Writes a BGRA buffer as PNG. premultiplied: pixels are premultiplied alpha.
 HRESULT save_png_bgra(const wchar_t* path, const uint8_t* px, int w, int h, int stride, bool premultiplied);

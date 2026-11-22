@@ -24,6 +24,7 @@ enum : uint32_t {
     ABT_RF_MAX_QUALITY = 1u << 2,   // worker: exact downscale (no row subsampling)
     ABT_RF_NO_CACHE = 1u << 3,      // agent: bypass our cache (bench/tests)
     ABT_RF_PREFETCH = 1u << 4,      // agent: PREVIEW only; queue the render, reply at once without pixels
+    ABT_RF_CACHE_ONLY = 1u << 5,    // agent: return cached entry only; miss immediately without rendering
 };
 
 // Page value for the whole-document view used by thumbnails (D-029). Illustrator: the full canvas
@@ -46,6 +47,7 @@ enum : uint32_t {
     ABT_SRC_RENDERED = 1u << 2,
     ABT_SRC_UPGRADE_PENDING = 1u << 3,  // a sharper version is being rendered in the background
     ABT_SRC_SCALED = 1u << 4,
+    ABT_SRC_HAS_ALPHA = 1u << 5,        // returned image has alpha < 255 (avoids downstream pixel scans)
 };
 
 struct abt_req {

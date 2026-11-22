@@ -32,6 +32,7 @@ double qpc_ms(uint64_t from, uint64_t to);
 void log_init(const wchar_t* component);  // component name used in the log file name
 bool log_enabled();
 void logf(const char* fmt, ...);          // UTF-8, printf-style, adds timestamp/pid/tid
+void log_shutdown();
 
 // ---- paths
 // %LOCALAPPDATA%\abthumb[\sub]; creates the directory. Returns false on failure.

@@ -41,12 +41,14 @@ int wmain(int argc, wchar_t** argv) {
         PWSTR low = nullptr;
         if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppDataLow, KF_FLAG_DEFAULT, nullptr, &low))) {
             wchar_t tmp[MAX_PATH];
-            _snwprintf_s(tmp, MAX_PATH, _TRUNCATE, L"%s\\abthumb\\tmp", low);
+            int n = _snwprintf_s(tmp, MAX_PATH, _TRUNCATE, L"%s\\abthumb\\tmp", low);
             CoTaskMemFree(low);
-            int rc = SHCreateDirectoryExW(nullptr, tmp, nullptr);
-            if (rc == ERROR_SUCCESS || rc == ERROR_ALREADY_EXISTS) {
-                SetEnvironmentVariableW(L"TEMP", tmp);
-                SetEnvironmentVariableW(L"TMP", tmp);
+            if (n > 0) {
+                int rc = SHCreateDirectoryExW(nullptr, tmp, nullptr);
+                if (rc == ERROR_SUCCESS || rc == ERROR_ALREADY_EXISTS) {
+                    SetEnvironmentVariableW(L"TEMP", tmp);
+                    SetEnvironmentVariableW(L"TMP", tmp);
+                }
             }
         }
     }
@@ -57,20 +59,27 @@ int wmain(int argc, wchar_t** argv) {
     HANDLE in = GetStdHandle(STD_INPUT_HANDLE);
     HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
     wchar_t* path = (wchar_t*)abt::mem_alloc((ABT_MAX_PATH_CHARS + 1) * sizeof(wchar_t));
-    if (!path) return 2;
+    if (!path) {
+        abt::log_shutdown();
+        CoUninitialize();
+        return 2;
+    }
 
     for (;;) {
         abt_req req;
         if (!abt::read_all(in, &req, sizeof(req))) break;
-        if (req.magic != ABT_MAGIC || req.version != ABT_PROTO_VERSION || req.path_chars > ABT_MAX_PATH_CHARS) break;
-        if (req.path_chars && !abt::read_all(in, path, req.path_chars * sizeof(wchar_t))) break;
+        if (req.magic != ABT_MAGIC || req.version != ABT_PROTO_VERSION || req.path_chars > ABT_MAX_PATH_CHARS ||
+            req.total_len != sizeof(abt_req) + (uint64_t)req.path_chars * sizeof(wchar_t) ||
+            (req.msg != ABT_MSG_RENDER && req.msg != ABT_MSG_QUIT))
+            break;
+        if (req.path_chars && !abt::read_all(in, path, (size_t)req.path_chars * sizeof(wchar_t))) break;
         path[req.path_chars] = 0;
         if (req.msg == ABT_MSG_QUIT) break;
 
         abt::RenderRequest rq = {};
         rq.path = path;
-        rq.cx = (int)req.cx;
-        rq.cy = (int)req.cy;
+        rq.cx = req.cx > ABT_MAX_REPLY_DIM ? (int)ABT_MAX_REPLY_DIM : (int)req.cx;
+        rq.cy = req.cy > ABT_MAX_REPLY_DIM ? (int)ABT_MAX_REPLY_DIM : (int)req.cy;
         rq.page = (int)req.page;
         rq.mode = req.mode;
         rq.flags = req.flags;
@@ -85,24 +94,30 @@ int wmain(int argc, wchar_t** argv) {
         resp.source = rr.source;
         resp.elapsed_us = rr.elapsed_us;
         lstrcpynA(resp.reason, rr.reason, sizeof(resp.reason));
-        if (SUCCEEDED(rr.hr) && rr.img.px) {
-            const uint64_t bytes = (uint64_t)rr.img.w * rr.img.h * 4;
-            if (bytes > ABT_MAX_PIXEL_BYTES) {
+        if (SUCCEEDED(rr.hr) && rr.img.px && rr.img.w > 0 && rr.img.h > 0) {
+            const uint64_t bytes = (uint64_t)rr.img.w * (uint64_t)rr.img.h * 4u;
+            if (bytes > ABT_MAX_PIXEL_BYTES || (uint32_t)rr.img.w > ABT_MAX_REPLY_DIM ||
+                (uint32_t)rr.img.h > ABT_MAX_REPLY_DIM) {
                 resp.hr = E_OUTOFMEMORY;
                 lstrcpynA(resp.reason, "image too large to send", sizeof(resp.reason));
             } else {
                 resp.width = (uint32_t)rr.img.w;
                 resp.height = (uint32_t)rr.img.h;
                 resp.pixel_len = (uint32_t)bytes;
+                if (rr.img.has_alpha) resp.source |= ABT_SRC_HAS_ALPHA;
             }
         }
         resp.total_len = sizeof(resp) + resp.pixel_len;
         bool ok = abt::write_all(out, &resp, sizeof(resp)) &&
                   (!resp.pixel_len || abt::write_all(out, rr.img.px, resp.pixel_len));
+        const bool faulted = rr.faulted;
         abt::render_result_free(&rr);
-        if (!ok) break;
+        // Never reuse a worker after an SEH unwind (leaked PDFium/WIC/ICM state).
+        if (!ok || faulted) break;
     }
+    abt::mem_free(path);
     abt::render_shutdown();
+    abt::log_shutdown();
     CoUninitialize();
     return 0;
 }

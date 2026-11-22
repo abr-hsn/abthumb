@@ -6,13 +6,19 @@ namespace abt {
 
 static SRWLOCK g_log_lock = SRWLOCK_INIT;
 static HANDLE g_log_file = INVALID_HANDLE_VALUE;
-static int g_log_state = -1;  // -1 unknown, 0 off, 1 on
+static volatile LONG g_log_state = -1;  // -1 unknown, 0 off, 1 on
+static volatile LONG64 g_qpc_freq = 0;
 static wchar_t g_component[32] = L"abthumb";
 
 double qpc_ms(uint64_t from, uint64_t to) {
-    static LARGE_INTEGER freq;
-    if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
-    return (double)(int64_t)(to - from) * 1000.0 / (double)freq.QuadPart;
+    LONG64 freq = InterlockedCompareExchange64(&g_qpc_freq, 0, 0);
+    if (!freq) {
+        LARGE_INTEGER li;
+        QueryPerformanceFrequency(&li);
+        freq = li.QuadPart > 0 ? li.QuadPart : 1;
+        InterlockedExchange64(&g_qpc_freq, freq);
+    }
+    return (double)(int64_t)(to - from) * 1000.0 / (double)freq;
 }
 
 void log_init(const wchar_t* component) {
@@ -27,8 +33,21 @@ static bool log_decide() {
 }
 
 bool log_enabled() {
-    if (g_log_state < 0) g_log_state = log_decide() ? 1 : 0;
-    return g_log_state == 1;
+    LONG st = InterlockedCompareExchange(&g_log_state, -1, -1);
+    if (st < 0) {
+        st = log_decide() ? 1 : 0;
+        InterlockedExchange(&g_log_state, st);
+    }
+    return st == 1;
+}
+
+void log_shutdown() {
+    AcquireSRWLockExclusive(&g_log_lock);
+    if (g_log_file != INVALID_HANDLE_VALUE) {
+        CloseHandle(g_log_file);
+        g_log_file = INVALID_HANDLE_VALUE;
+    }
+    ReleaseSRWLockExclusive(&g_log_lock);
 }
 
 void logf(const char* fmt, ...) {
@@ -41,7 +60,7 @@ void logf(const char* fmt, ...) {
     if (n < 0) n = 0;
     va_list ap;
     va_start(ap, fmt);
-    int m = _vsnprintf_s(buf + n, sizeof(buf) - n - 2, _TRUNCATE, fmt, ap);
+    int m = _vsnprintf_s(buf + n, sizeof(buf) - (size_t)n - 2, _TRUNCATE, fmt, ap);
     va_end(ap);
     if (m < 0) m = (int)strlen(buf + n);
     n += m;

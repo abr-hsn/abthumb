@@ -81,11 +81,15 @@ HRESULT shell_register(const wchar_t* dll_path, const RegisterOptions& opt) {
         wchar_t exe[MAX_PATH + 2];
         lstrcpynW(exe, dll_path, MAX_PATH);
         wchar_t* slash = wcsrchr(exe, L'\\');
-        if (slash) _snwprintf_s(slash + 1, (size_t)(_countof(exe) - (size_t)(slash + 1 - exe)), _TRUNCATE, L"%s",
-                                L"abthumb-preview.exe");
         wchar_t quoted[MAX_PATH + 4];
-        _snwprintf_s(quoted, _countof(quoted), _TRUNCATE, L"\"%s\"", exe);
-        e |= set_sz(root, key, nullptr, quoted);
+        if (!slash ||
+            _snwprintf_s(slash + 1, (size_t)(_countof(exe) - (size_t)(slash + 1 - exe)), _TRUNCATE, L"%s",
+                         L"abthumb-preview.exe") < 0 ||
+            _snwprintf_s(quoted, _countof(quoted), _TRUNCATE, L"\"%s\"", exe) < 0) {
+            e |= ERROR_INVALID_PARAMETER;
+        } else {
+            e |= set_sz(root, key, nullptr, quoted);
+        }
     }
     e |= set_sz(root, kPreviewList, ABT_CLSID_PREVIEW_STR, L"abthumb Preview Handler");
 
@@ -160,6 +164,7 @@ HRESULT shell_unregister(bool machine) {
 }
 
 void shell_describe(char* buf, size_t cap) {
+    if (!buf || cap == 0) return;
     size_t used = 0;
     buf[0] = 0;
     for (int i = 0; i < kExtensionCount; ++i) {
