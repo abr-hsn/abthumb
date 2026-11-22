@@ -25,6 +25,7 @@ struct Job {
 struct Slot {
     bool background;
     bool prespawn;  // pre-warm this worker asynchronously on startup
+    bool low_il;    // true if current worker was spawned with g_worker_token
     HANDLE proc, in_w, out_r;
     DWORD pid;
     volatile LONG64 deadline;  // GetTickCount64 value, 0 = idle, -1 = killed by the watchdog
@@ -291,10 +292,13 @@ static bool slot_spawn(Slot* s) {
     _snwprintf_s(cmd, _countof(cmd), _TRUNCATE, L"\"%s\"%s", g_worker_exe, s->background ? L" --background" : L"");
     PROCESS_INFORMATION pi = {};
     const DWORD cflags = CREATE_SUSPENDED | CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT;
+    bool used_low_il = false;
     if (ok && g_worker_token && !InterlockedCompareExchange(&g_token_failed, 0, 0)) {
         ok = CreateProcessAsUserW(g_worker_token, g_worker_exe, cmd, nullptr, nullptr, TRUE, cflags, nullptr, nullptr,
                                   &si.StartupInfo, &pi) != 0;
-        if (!ok) {
+        if (ok) {
+            used_low_il = true;
+        } else {
             DWORD err = GetLastError();
             logf("low-integrity worker spawn failed (%lu); falling back to normal worker", err);
             // Only permanently disable low-IL sandbox on persistent privilege/policy errors, not transient OOM.
@@ -326,8 +330,9 @@ static bool slot_spawn(Slot* s) {
     AcquireSRWLockExclusive(&s->proc_lock);
     s->proc = pi.hProcess;
     s->pid = pi.dwProcessId;
+    s->low_il = used_low_il;
     ReleaseSRWLockExclusive(&s->proc_lock);
-    logf("worker %lu started (%s)", s->pid, s->background ? "background" : "foreground");
+    logf("worker %lu started (%s%s)", s->pid, s->background ? "background" : "foreground", used_low_il ? ", low-IL" : "");
     return true;
 }
 
@@ -368,71 +373,92 @@ static bool transient_error(HRESULT hr) {
     }
 }
 
+static bool is_loader_failure(DWORD code) {
+    return code == 0xC0000142u /* STATUS_DLL_INIT_FAILED */ || code == 0xC0000135u /* STATUS_DLL_NOT_FOUND */ ||
+           code == 0xC0000022u /* STATUS_ACCESS_DENIED */ || code == 0xC000007Bu /* STATUS_INVALID_IMAGE_FORMAT */ ||
+           code == 0xC000012Fu /* STATUS_INVALID_IMAGE_NOT_MZ */ || code == 0xC0000143u /* STATUS_MISSING_SYSTEMFILE */;
+}
+
 static void run_job(Slot* s, Job* j) {
     JobResult& r = j->res;
-    memset(&r, 0, sizeof(r));
-    r.hr = E_FAIL;
-    if (!s->proc && !slot_spawn(s)) {
-        lstrcpynA(r.reason, "cannot start render worker", sizeof(r.reason));
-        r.transient = true;
-        return;
-    }
-    size_t plen = (size_t)lstrlenW(j->path);
-    abt_req req;
-    init_req(&req, ABT_MSG_RENDER, (uint32_t)plen);
-    req.cx = req.cy = (uint32_t)j->tier;  // always render the cacheable tier
-    req.page = j->page;
-    req.mode = j->mode;
-    req.flags = j->flags;
-    DWORD timeout = lane_timeout_ms(j->lane);
-    req.deadline_ms = timeout > 1000 ? timeout - 500 : timeout;  // let the worker stop cleanly first
-    InterlockedExchange64(&s->deadline, (LONG64)(GetTickCount64() + timeout));
-    if (InterlockedIncrement(&g_busy_slots) == 1 && g_wd_wake) SetEvent(g_wd_wake);
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        memset(&r, 0, sizeof(r));
+        r.hr = E_FAIL;
+        if (!s->proc && !slot_spawn(s)) {
+            lstrcpynA(r.reason, "cannot start render worker", sizeof(r.reason));
+            r.transient = true;
+            return;
+        }
+        size_t plen = (size_t)lstrlenW(j->path);
+        abt_req req;
+        init_req(&req, ABT_MSG_RENDER, (uint32_t)plen);
+        req.cx = req.cy = (uint32_t)j->tier;  // always render the cacheable tier
+        req.page = j->page;
+        req.mode = j->mode;
+        req.flags = j->flags;
+        DWORD timeout = lane_timeout_ms(j->lane);
+        req.deadline_ms = timeout > 1000 ? timeout - 500 : timeout;  // let the worker stop cleanly first
+        InterlockedExchange64(&s->deadline, (LONG64)(GetTickCount64() + timeout));
+        if (InterlockedIncrement(&g_busy_slots) == 1 && g_wd_wake) SetEvent(g_wd_wake);
 
-    abt_resp resp = {};
-    bool ok = write_all(s->in_w, &req, sizeof(req)) && write_all(s->in_w, j->path, plen * sizeof(wchar_t)) &&
-              read_all(s->out_r, &resp, sizeof(resp)) && resp.magic == ABT_MAGIC &&
-              resp.width <= ABT_MAX_REPLY_DIM && resp.height <= ABT_MAX_REPLY_DIM &&
-              resp.pixel_len <= ABT_MAX_PIXEL_BYTES &&
-              (!resp.pixel_len || resp.pixel_len == (uint64_t)resp.width * resp.height * 4u);
-    if (ok && resp.pixel_len) {
-        // Honor ABT_SRC_HAS_ALPHA from worker to avoid redundant full-image alpha scan.
-        int has_alpha = (resp.source & ABT_SRC_HAS_ALPHA) ? 1 : 0;
-        r.pix = pixbuf_alloc((int)resp.width, (int)resp.height, has_alpha);
-        if (!r.pix) ok = false;
-        else if (!read_all(s->out_r, r.pix->px, resp.pixel_len)) { pixbuf_release(r.pix); r.pix = nullptr; ok = false; }
-    }
-    LONG64 dl = InterlockedExchange64(&s->deadline, 0);
-    InterlockedDecrement(&g_busy_slots);
-    // A worker the watchdog killed is never reused, even if its reply had already arrived.
-    if (dl == -1 && ok) { ok = false; pixbuf_release(r.pix); r.pix = nullptr; }
-    if (!ok) {
-        bool killed = dl == -1;  // watchdog marks with -1 after terminating
-        DWORD code = 0;
-        if (s->proc) GetExitCodeProcess(s->proc, &code);
-        logf("worker %lu %s on %ls (exit 0x%lx)", s->pid, killed ? "killed (deadline)" : "died", j->path, code);
-        if (killed) InterlockedIncrement64(&g_kills); else InterlockedIncrement64(&g_crashes);
-        if (s->proc) TerminateProcess(s->proc, 1);
-        slot_close(s);
-        // A deadline kill may only mean a busy machine or a slow disk: only a file that times out
-        // twice (in this agent's lifetime) is remembered as failing. A crash is the file's fault.
-        r.transient = killed && kill_count_bump(j->key) < 2;
-        r.hr = killed ? HRESULT_FROM_WIN32(ERROR_TIMEOUT) : HRESULT_FROM_WIN32(ERROR_FILE_CORRUPT);
-        lstrcpynA(r.reason, killed ? "render timed out" : "render worker crashed", sizeof(r.reason));
+        abt_resp resp = {};
+        bool ok = write_all(s->in_w, &req, sizeof(req)) && write_all(s->in_w, j->path, plen * sizeof(wchar_t)) &&
+                  read_all(s->out_r, &resp, sizeof(resp)) && resp.magic == ABT_MAGIC &&
+                  resp.width <= ABT_MAX_REPLY_DIM && resp.height <= ABT_MAX_REPLY_DIM &&
+                  resp.pixel_len <= ABT_MAX_PIXEL_BYTES &&
+                  (!resp.pixel_len || resp.pixel_len == (uint64_t)resp.width * resp.height * 4u);
+        if (ok && resp.pixel_len) {
+            // Honor ABT_SRC_HAS_ALPHA from worker to avoid redundant full-image alpha scan.
+            int has_alpha = (resp.source & ABT_SRC_HAS_ALPHA) ? 1 : 0;
+            r.pix = pixbuf_alloc((int)resp.width, (int)resp.height, has_alpha);
+            if (!r.pix) ok = false;
+            else if (!read_all(s->out_r, r.pix->px, resp.pixel_len)) { pixbuf_release(r.pix); r.pix = nullptr; ok = false; }
+        }
+        LONG64 dl = InterlockedExchange64(&s->deadline, 0);
+        InterlockedDecrement(&g_busy_slots);
+        // A worker the watchdog killed is never reused, even if its reply had already arrived.
+        if (dl == -1 && ok) { ok = false; pixbuf_release(r.pix); r.pix = nullptr; }
+        if (!ok) {
+            bool killed = dl == -1;  // watchdog marks with -1 after terminating
+            DWORD code = 0;
+            if (s->proc) GetExitCodeProcess(s->proc, &code);
+            const bool loader_fail = !killed && is_loader_failure(code);
+            const bool retry_normal = loader_fail && s->low_il && attempt == 0;
+            logf("worker %lu %s on %ls (exit 0x%lx)%s", s->pid, killed ? "killed (deadline)" : "died", j->path, code,
+                 retry_normal ? "; falling back to normal worker" : "");
+            if (killed) InterlockedIncrement64(&g_kills);
+            else if (!retry_normal) InterlockedIncrement64(&g_crashes);
+            if (s->proc) TerminateProcess(s->proc, 1);
+            slot_close(s);
+            if (retry_normal) {
+                InterlockedExchange(&g_token_failed, 1);
+                continue;
+            }
+            // Loader/DLL-init failures are never the file's fault: never negative-cache them.
+            // A deadline kill may only mean a busy machine or a slow disk: only a file that times out
+            // twice (in this agent's lifetime) is remembered as failing. A crash is the file's fault.
+            r.transient = loader_fail || (killed && kill_count_bump(j->key) < 2);
+            r.hr = killed ? HRESULT_FROM_WIN32(ERROR_TIMEOUT)
+                          : (loader_fail ? HRESULT_FROM_WIN32(ERROR_GEN_FAILURE) : HRESULT_FROM_WIN32(ERROR_FILE_CORRUPT));
+            lstrcpynA(r.reason,
+                      killed ? "render timed out" : (loader_fail ? "render worker failed to initialise" : "render worker crashed"),
+                      sizeof(r.reason));
+            return;
+        }
+        InterlockedIncrement64(&s->jobs_done);
+        // The worker parses untrusted files, so its reply is untrusted too.
+        r.hr = resp.hr;
+        if (SUCCEEDED(r.hr) && !r.pix && j->mode != ABT_MODE_PROBE) r.hr = E_FAIL;
+        if (transient_error(r.hr)) r.transient = true;
+        r.info = resp.info;
+        r.info.creator[sizeof(r.info.creator) - 1] = 0;
+        r.info.version[sizeof(r.info.version) - 1] = 0;
+        r.source = resp.source;
+        r.elapsed_us = resp.elapsed_us;
+        memcpy(r.reason, resp.reason, sizeof(r.reason));
+        r.reason[sizeof(r.reason) - 1] = 0;
         return;
     }
-    InterlockedIncrement64(&s->jobs_done);
-    // The worker parses untrusted files, so its reply is untrusted too.
-    r.hr = resp.hr;
-    if (SUCCEEDED(r.hr) && !r.pix && j->mode != ABT_MODE_PROBE) r.hr = E_FAIL;
-    if (transient_error(r.hr)) r.transient = true;
-    r.info = resp.info;
-    r.info.creator[sizeof(r.info.creator) - 1] = 0;
-    r.info.version[sizeof(r.info.version) - 1] = 0;
-    r.source = resp.source;
-    r.elapsed_us = resp.elapsed_us;
-    memcpy(r.reason, resp.reason, sizeof(r.reason));
-    r.reason[sizeof(r.reason) - 1] = 0;
 }
 
 static void store_result(Job* j) {

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(abthumb VERSION 0.1.4 LANGUAGES C CXX)
+project(abthumb VERSION 0.1.5 LANGUAGES C CXX)
 
 option(ABT_FUZZ "Build libFuzzer + ASan targets" OFF)
 

@@ -89,7 +89,6 @@ Type: dirifempty; Name: "{app}"
 [Code]
 const
   MOVEFILE_DELAY_UNTIL_REBOOT = 4;
-  FILE_ATTRIBUTE_REPARSE_POINT = $0400;
 
 function MoveFileEx(lpExistingFileName, lpNewFileName: string; dwFlags: Cardinal): Boolean;
   external 'MoveFileExW@kernel32.dll stdcall';
