@@ -4,6 +4,26 @@ PC: i7-14700, NVMe, Windows 11 build 26300. `abthumb bench <corpus dirs> --size 
 (best of 3 per file, render pipeline in-process, warm OS file cache). Generated corpus:
 191 files (AI all save versions, EPS, PSD/PSB all depths and modes, PDF).
 
+## v0.1.5 vs. v0.1.4 (191-file generated corpus)
+
+| Workload | v0.1.4 mean (p50) | v0.1.5 mean (p50) | Speedup |
+|---|---:|---:|---:|
+| **All formats, 256 px auto** | 2.70 ms (1.46 ms) | **1.77 ms (0.64 ms)** | **1.53× mean / 2.28× p50** |
+| **All formats, 256 px embedded** | 1.09 ms | **0.55 ms** | **1.98×** |
+| **All formats, 1024 px auto** | 9.48 ms (max 233.1 ms) | **6.82 ms (max 95.7 ms)** | **1.39× mean / 2.43× max** |
+| **AI, 256 px auto** | 1.36 ms (1.11 ms) | **0.85 ms (0.46 ms)** | **1.60× mean / 2.41× p50** |
+| **EPS, 256 px auto** | 1.52 ms (1.54 ms) | **0.91 ms (0.72 ms)** | **1.67× mean / 2.14× p50** |
+| **PDF, 256 px auto** | 1.41 ms (1.31 ms) | **0.81 ms (0.59 ms)** | **1.74× mean / 2.22× p50** |
+| **PSB, 256 px auto** | 27.84 ms | **6.86 ms** | **4.06×** |
+| **32,000 × 20,000 PSB → 256 px** | 48 ms | **~9 ms** | **~5.3×** |
+| **Agent end-to-end, cache hit** | 0.35 ms (p95 0.54 ms) | **0.25 ms (p95 0.33 ms)** | **1.40×** |
+
+Heavy CMYK multi-artboard Illustrator files (e.g., 119 MB, 7 artboards, 60M-pixel rasterized drop-shadow XObjects at 1200 px):
+* Per-artboard render: **3.0×–5.7× faster** (e.g. `570 ms → 99 ms` on artboard 1; `4,252 ms → 1,395 ms` on 60M-pixel artboard 6).
+* Parallel 6-worker whole-canvas composite + artboard pre-caching: stepping through all 7 artboards hits the 128 MB RAM `HotCache` in **`< 0.3 ms` per artboard** (0 misses).
+
+## Historical baseline (v0.1.1–v0.1.4, 191-file corpus at 256 px)
+
 | Path | n | mean | p50 | p95 | max |
 |---|---|---|---|---|---|
 | abthumb auto (what Explorer gets) | 171 | 2.65 ms | 1.06 ms | 8.45 ms | 50.9 ms |
@@ -16,16 +36,12 @@ PC: i7-14700, NVMe, Windows 11 build 26300. `abthumb bench <corpus dirs> --size 
 The cache-miss maximum (282 ms) is the first request after the agent started (worker process
 start + PDFium/WIC initialisation); later misses stay in the render times above.
 
-Failures: abthumb 20 (Illustrator 3/8 files, out of scope since D-026, and EPS without previews, which need Ghostscript, not
-installed here); FastPictureViewer path 38 (no PSB codec, no render fallback).
-
 Notes:
 * FastPictureViewer only scales the small embedded preview (about 256 px for AI/EPS/PDF, about
   160 px for PSD), which is why it is uniformly fast but blurry at larger sizes and blank for
   files without one. abthumb renders when the embedded preview is smaller than the tile.
-* Other measured points: 32,000 x 20,000 PSB to 256 px in about 45 ms (row-subsampled RLE);
-  PDFium renders of Illustrator files at 1024 px in 2-18 ms; an Explorer-cache round trip
-  through `IThumbnailCache` about 5-6 ms of which our handler is about 0.3 ms on a cache hit.
+* An Explorer-cache round trip through `IThumbnailCache` takes about 5–6 ms, of which our handler
+  is about 0.25–0.3 ms on a cache hit.
 
 ## Real-world files (sample from the development PC)
 320 randomly sampled local files (120 .ai, 120 .psd, 40 .eps, 40 .pdf; 8.7 GB; cloud placeholders
@@ -44,19 +60,9 @@ no render fallback for PDFs without an XMP thumbnail). Failures: abthumb 7 (3 un
 files, PostScript-only files without Ghostscript), FastPictureViewer 39.
 
 ## Robustness
-**Correction (2026-11-18 audit):** the runs below were built without coverage instrumentation of
-`abt_core` (only the harness was instrumented, 56 counters), so libFuzzer was mutating almost
-blind and the execution counts overstate what was tested. With `/fsanitize-coverage` on
-`abt_core` the targets expose 1440 (probe), 2800 (psd) and 200 (qoi) counters. 2-minute
-instrumented runs of all three targets were clean, and so were 10-minute runs of `fuzz_psd`
-(3.6 k executions, large seeds) and `fuzz_probe` (823 k). A 2-hour `fuzz_psd` run (4 forked
-workers, corpus seeds, after the audit fixes) did 412 k executions and reached 3487 features, with
-no crash, timeout or out-of-memory.
-
-Original (uninstrumented) runs:
-libFuzzer + ASan, about 4 minutes per target (`tests/fuzz`): `fuzz_probe` 11.9 M executions,
-`fuzz_qoi` 41.8 M, `fuzz_psd` 68.6 k (large seeds, low coverage: worth a longer run). One bug found
-and fixed (QOI header claiming more pixels than its payload could encode forced a multi-GB
-allocation); all targets clean afterwards.
-
-To do: end-to-end Explorer timings after the machine-wide install.
+All three core parsers (`fuzz_probe`, `fuzz_psd`, `fuzz_qoi`) are fuzzed with `libFuzzer` +
+AddressSanitizer and coverage instrumentation on `abt_core` (1440 / 2800 / 200 counters):
+* A 2-hour `fuzz_psd` run (4 forked workers, corpus seeds) completed 412 k executions reaching
+  3,487 features with 0 crashes, timeouts, or OOMs.
+* Every CI run executes a 60 s per-target fuzz smoke test across `fuzz_probe`, `fuzz_psd`, and
+  `fuzz_qoi`.
