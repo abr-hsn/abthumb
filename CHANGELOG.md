@@ -2,7 +2,7 @@
 
 All notable changes to **abthumb** are documented in this file.
 
-## [0.1.5] - Unreleased
+## [0.1.5] - 2026-11-24
 
 ### Added
 - **High-resolution "Whole artwork" preview for multi-artboard Illustrator (`.ai`) files**: composites sharp PDFium vector/image renders of every artboard onto the whole-canvas view while preserving off-artboard artwork and labels.
