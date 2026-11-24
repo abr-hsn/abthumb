@@ -57,20 +57,6 @@ size_t abt_qoi_encode(const uint8_t* px, int w, int h, uint8_t** out);
 /* Decodes into a newly allocated image (BGRA as stored). */
 abt_status abt_qoi_decode(const uint8_t* data, size_t n, abt_image* out);
 
-/* Whole-canvas artboard placement: locates where a rendered artboard `page_img` (representing an
-   artboard of `page_pt_w x page_pt_h` points on a canvas of `canvas_pt_w x canvas_pt_h` points)
-   sits inside the low-res whole-canvas XMP thumbnail `thumb`, refines alignment against the
-   upscaled `canvas`, and blits the sharp artboard content onto `canvas` while avoiding overlap
-   with already-placed rectangles `placed[0 .. *n_placed - 1]`. Returns 1 if placed. */
-typedef struct abt_canvas_rect {
-    int x0, y0, x1, y1;
-} abt_canvas_rect;
-
-int abt_canvas_place_artboard(abt_image* canvas, const abt_image* thumb,
-                              float canvas_pt_w, float canvas_pt_h,
-                              const abt_image* page_img, float page_pt_w, float page_pt_h,
-                              abt_canvas_rect* placed, int* n_placed, int max_placed);
-
 #ifdef __cplusplus
 }
 #endif

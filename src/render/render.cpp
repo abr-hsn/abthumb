@@ -269,6 +269,22 @@ static HRESULT decode_preview(const MappedFile& mf, const abt_preview& pv, int b
 
 static void set_reason(RenderResult* rr, const char* s) { lstrcpynA(rr->reason, s, sizeof(rr->reason)); }
 
+// The whole-canvas thumbnail of a multi-artboard Illustrator file: Illustrator's own document
+// thumbnail, enlarged when the request is bigger than it (soft, but it is the only image that holds
+// art outside the artboards).
+static int ai_best_xmp_preview(const abt_probe& pr, int edge) {
+    int best_ge = -1, best_any = -1;
+    uint32_t ge_len = 0xFFFFFFFFu, any_len = 0;
+    for (int i = 0; i < pr.n_previews; ++i) {
+        const abt_preview& pv = pr.previews[i];
+        if (pv.source != ABT_PVS_XMP) continue;
+        uint32_t l = pv.width > pv.height ? pv.width : pv.height;
+        if (l >= (uint32_t)edge && l < ge_len) { ge_len = l; best_ge = i; }
+        if (best_any < 0 || l > any_len) { any_len = l; best_any = i; }
+    }
+    return best_ge >= 0 ? best_ge : best_any;
+}
+
 // Illustrator: is the whole canvas (all art, on and off the artboards) just artboard 1? Only then
 // can PDF page 1 stand in for it; Illustrator's PDF pages hold each artboard's art clipped to that
 // artboard and nothing outside them (D-029). The header's art bounds are in Illustrator's ruler space,
@@ -280,7 +296,29 @@ static bool ai_canvas_is_page1(const abt_probe& pr, int pages, float w0, float h
     const float* b = pr.bbox;
     if (b[0] == 0 && b[1] == 0 && b[2] == 0 && b[3] == 0) return true;  // bounds unknown: single artboard
     float tol = 4.0f + 0.02f * (w0 > h0 ? w0 : h0);
-    return b[2] - b[0] <= w0 + tol && b[3] - b[1] <= h0 + tol;
+    float bw = b[2] - b[0], bh = b[3] - b[1];
+    if (bw <= w0 + tol && bh <= h0 + tol) return true;
+    // %%HiResBoundingBox includes unclipped geometry behind clipping masks, which can inflate an
+    // axis past artboard 1 even when all visible artwork sits inside it. If the XMP thumbnail matches
+    // artboard 1's aspect ratio (within 8%) while strongly disagreeing with %%HiResBoundingBox
+    // (>= 20%), and at least one axis fits within artboard 1, the visible canvas is just artboard 1.
+    if (w0 > 0 && h0 > 0 && bw > 0 && bh > 0 && (bw <= w0 + tol || bh <= h0 + tol)) {
+        int best = ai_best_xmp_preview(pr, 1 << 30);
+        if (best >= 0) {
+            const abt_preview& pv = pr.previews[best];
+            if (pv.width > 0 && pv.height > 0) {
+                double ar_thumb = (double)pv.width / (double)pv.height;
+                double ar_page = (double)w0 / (double)h0;
+                double ar_bbox = (double)bw / (double)bh;
+                double dp = ar_thumb > ar_page ? ar_thumb - ar_page : ar_page - ar_thumb;
+                double db = ar_thumb > ar_bbox ? ar_thumb - ar_bbox : ar_bbox - ar_thumb;
+                double page_diff = dp / (ar_thumb > ar_page ? ar_thumb : ar_page);
+                double bbox_diff = db / (ar_thumb > ar_bbox ? ar_thumb : ar_bbox);
+                if (page_diff <= 0.08 && bbox_diff >= 0.20) return true;
+            }
+        }
+    }
+    return false;
 }
 
 // Fast XMP layout check for AI files (avoids opening PDFium on the 256 px XMP fast path).
@@ -302,22 +340,6 @@ static bool ai_layout_from_xmp(const abt_probe& pr, int* pages, float* w0, float
     return true;
 }
 
-// The whole-canvas thumbnail of a multi-artboard Illustrator file: Illustrator's own document
-// thumbnail, enlarged when the request is bigger than it (soft, but it is the only image that holds
-// art outside the artboards).
-static int ai_best_xmp_preview(const abt_probe& pr, int edge) {
-    int best_ge = -1, best_any = -1;
-    uint32_t ge_len = 0xFFFFFFFFu, any_len = 0;
-    for (int i = 0; i < pr.n_previews; ++i) {
-        const abt_preview& pv = pr.previews[i];
-        if (pv.source != ABT_PVS_XMP) continue;
-        uint32_t l = pv.width > pv.height ? pv.width : pv.height;
-        if (l >= (uint32_t)edge && l < ge_len) { ge_len = l; best_ge = i; }
-        if (best_any < 0 || l > any_len) { any_len = l; best_any = i; }
-    }
-    return best_ge >= 0 ? best_ge : best_any;
-}
-
 static bool ai_canvas_thumbnail(const MappedFile& mf, const abt_probe& pr, int bw, int bh, RenderResult* rr) {
     int edge = bw > bh ? bw : bh;
     int best = ai_best_xmp_preview(pr, edge);
@@ -330,100 +352,6 @@ static bool ai_canvas_thumbnail(const MappedFile& mf, const abt_probe& pr, int b
     rr->hr = S_OK;
     rr->source = ABT_SRC_EMBEDDED | (small ? ABT_SRC_SCALED : 0);
     set_reason(rr, "Illustrator document thumbnail (whole canvas)");
-    return true;
-}
-
-// High-resolution whole-artwork render for multi-artboard Illustrator files (edge > 256):
-// composites crisp PDFium vector/image renders of each artboard onto the upscaled XMP document
-// thumbnail (so off-artboard dimension labels and artwork are preserved while every artboard is
-// crystal clear).
-static bool ai_render_whole_canvas(const RenderRequest& rq, const MappedFile& mf, const abt_probe& pr,
-                                   int bw, int bh, uint64_t deadline_qpc, PdfDoc* doc, RenderResult* rr) {
-    if (!doc) return false;
-    int best = ai_best_xmp_preview(pr, bw > bh ? bw : bh);
-    if (best < 0) return false;
-    float canvas_pt_w = pr.info.canvas_pt_w;
-    float canvas_pt_h = pr.info.canvas_pt_h;
-    if (!(canvas_pt_w > 0.0f && canvas_pt_h > 0.0f)) return false;
-
-    abt_image thumb = {};
-    if (FAILED(decode_preview(mf, pr.previews[best], 4096, 4096, &thumb))) return false;
-    abt_image canvas_img = {};
-    int cw = 0, ch = 0;
-    fit_box(thumb.w, thumb.h, bw, bh, true, &cw, &ch);
-    if (abt_resize(thumb.px, thumb.w, thumb.h, (size_t)thumb.w * 4u, cw, ch, &canvas_img) != ABT_OK) {
-        abt_image_free(&thumb);
-        return false;
-    }
-    canvas_img.has_alpha = 0;
-
-    enum { kMaxCanvasPages = 32 };
-    int npages = (int)rr->info.page_count;
-    if (npages < 1) {
-        int lp = 0; float w0 = 0, h0 = 0;
-        if (pdf_doc_layout(doc, &lp, &w0, &h0)) npages = lp;
-    }
-    if (npages > kMaxCanvasPages) npages = kMaxCanvasPages;
-
-    float pw[kMaxCanvasPages] = {};
-    float ph[kMaxCanvasPages] = {};
-    int order[kMaxCanvasPages] = {};
-    int valid_pages = 0;
-    for (int p = 0; p < npages; ++p) {
-        if (pdf_doc_page_size(doc, p, &pw[p], &ph[p])) {
-            order[valid_pages++] = p;
-        }
-    }
-    // Place larger artboards first so smaller strips cannot match sub-regions of larger artboards.
-    for (int i = 1; i < valid_pages; ++i) {
-        int cur = order[i];
-        float cur_a = pw[cur] * ph[cur];
-        int j = i - 1;
-        while (j >= 0 && pw[order[j]] * ph[order[j]] < cur_a) {
-            order[j + 1] = order[j];
-            --j;
-        }
-        order[j + 1] = cur;
-    }
-
-    abt_canvas_rect placed[kMaxCanvasPages] = {};
-    int n_placed = 0;
-    bool no_pdf = false;
-    for (int i = 0; i < valid_pages; ++i) {
-        if (deadline_qpc && qpc() > deadline_qpc) break;
-        int p = order[i];
-        int ab_w = (int)((double)cw * (double)pw[p] / (double)canvas_pt_w + 0.5);
-        int ab_h = (int)((double)ch * (double)ph[p] / (double)canvas_pt_h + 0.5);
-        int ab_edge = ab_w > ab_h ? ab_w : ab_h;
-        if (ab_edge < 8) continue;
-
-        RenderRequest prq = rq;
-        prq.page = p;
-        prq.cx = ab_w;
-        prq.cy = ab_h;
-        abt_image page_img = {};
-        abt_file_info pinfo = rr->info;
-        pinfo.flags &= ~(uint32_t)ABT_INFO_PAGE_EMPTY;
-        bool page_no_pdf = false;
-        HRESULT hr = pdf_doc_render(doc, prq, ABT_FAM_AI_PDF, deadline_qpc, &page_img, &pinfo, &page_no_pdf, nullptr);
-        if (page_no_pdf) { no_pdf = true; abt_image_free(&page_img); break; }
-        if (SUCCEEDED(hr) && !(pinfo.flags & ABT_INFO_PAGE_EMPTY) && page_img.px) {
-            abt_canvas_place_artboard(&canvas_img, &thumb, canvas_pt_w, canvas_pt_h, &page_img, pw[p], ph[p],
-                                      placed, &n_placed, kMaxCanvasPages);
-        }
-        abt_image_free(&page_img);
-    }
-    abt_image_free(&thumb);
-
-    if (no_pdf || n_placed == 0) {
-        abt_image_free(&canvas_img);
-        return false;
-    }
-    rr->img = canvas_img;
-    rr->hr = S_OK;
-    rr->source = ABT_SRC_RENDERED;
-    rr->info.flags |= ABT_INFO_HAS_PDF_CONTENT;
-    set_reason(rr, "Illustrator whole canvas (high-res artboards)");
     return true;
 }
 
@@ -557,15 +485,7 @@ static void render_inner(const RenderRequest& rq, CachedDoc* cd, RenderResult* r
     int best = abt_probe_best_preview(&pr, edge);
 
     if (ai_multi) {
-        if (canvas) {
-            // For high-res previews (edge > 256, e.g. Preview Pane Whole artwork view), render each
-            // artboard via PDFium and composite onto the whole canvas so text and artwork are crisp.
-            if (edge > 256 && rq.mode != ABT_MODE_FAST &&
-                ai_render_whole_canvas(rq, mf, pr, bw, bh, deadline_qpc, ensure_pdf(), rr)) {
-                return;
-            }
-            if (allow_embedded && ai_canvas_thumbnail(mf, pr, bw, bh, rr)) return;
-        }
+        if (canvas && allow_embedded && ai_canvas_thumbnail(mf, pr, bw, bh, rr)) return;
         // One artboard: that thumbnail shows more than the artboard, so it never stands in for it.
         allow_embedded = false;
         if (canvas) set_reason(rr, "no document thumbnail: artboard 1 only");

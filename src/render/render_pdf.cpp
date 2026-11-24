@@ -284,7 +284,7 @@ void pdf_close(PdfDoc* doc) {
     if (doc) FPDF_CloseDocument((FPDF_DOCUMENT)doc);
 }
 
-bool pdf_doc_page_size(PdfDoc* doc, int page_index, float* w, float* h) {
+static bool pdf_doc_page_size(PdfDoc* doc, int page_index, float* w, float* h) {
     *w = *h = 0;
     if (!doc || page_index < 0) return false;
     FPDF_DOCUMENT d = (FPDF_DOCUMENT)doc;

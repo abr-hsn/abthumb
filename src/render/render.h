@@ -65,7 +65,6 @@ struct PdfDoc;
 void pdf_patch_ai_cmyk_icc(uint8_t* data, size_t size);
 PdfDoc* pdf_open(const uint8_t* data, size_t size, abt_file_info* info, HRESULT* err_hr);
 bool pdf_doc_layout(PdfDoc* doc, int* pages, float* w0, float* h0);
-bool pdf_doc_page_size(PdfDoc* doc, int page_index, float* w, float* h);
 HRESULT pdf_doc_render(PdfDoc* doc, const RenderRequest& rq, abt_family fam, uint64_t deadline_qpc, abt_image* out,
                        abt_file_info* info, bool* no_pdf_content, double* out_ink);
 void pdf_close(PdfDoc* doc);

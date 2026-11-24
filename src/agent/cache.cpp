@@ -8,7 +8,7 @@
 
 namespace abt {
 
-static const uint32_t kRendererVersion = 4;  // 4: high-res whole-canvas AI composite & 1600 px RAM hot cache
+static const uint32_t kRendererVersion = 5;  // 5: clean whole-canvas XMP + clipped single-artboard fix & 1600 px RAM hot cache
 static const uint32_t kRecMagic = 0x52544241u;  // "ABTR"
 static const uint32_t kIdxMagic = 0x49544241u;  // "ABTI"
 static const uint64_t kSegMax = 64ull << 20;
