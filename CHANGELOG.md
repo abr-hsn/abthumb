@@ -2,6 +2,16 @@
 
 All notable changes to **abthumb** are documented in this file.
 
+## [0.1.6] - 2026-11-24
+
+### Fixed
+- **Whole-artwork Illustrator (`.ai`) preview reliability**: removed the XMP+artboard template-matching composite that distorted clipped banners, stamped misaligned patches onto partial-artboard print sheets, and left uneven sharp/blurry seams. Whole-artwork view now returns Illustrator's clean document thumbnail instantaneously while individual artboards continue to render crisp via PDFium with parallel prefetching and the 128 MB RAM `HotCache`.
+- **Single-artboard `.ai` files with clipping masks**: fixed `ai_canvas_is_page1` misclassifying single-artboard files whose unclipped `%%HiResBoundingBox` extended past Artboard 1 as multi-canvas; they now render crisp at full resolution directly as Artboard 1.
+- Bumped the cache renderer version (`4 → 5`) so any previously cached broken composites are automatically invalidated on upgrade.
+
+### Performance
+- Opening multi-artboard `.ai` files on the **Whole artwork** view is now near-instant (`< 15 ms` instead of up to 16 s on heavy multi-page documents).
+
 ## [0.1.5] - 2026-11-24
 
 ### Added

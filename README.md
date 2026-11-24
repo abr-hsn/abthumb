@@ -27,7 +27,7 @@ Windows File Explorer cannot natively preview Adobe Illustrator (`.ai`), Photosh
 ### Highlights
 
 * **Sharp at every tile & preview size.** Embedded previews are used only when they are already large enough for the requested tile; otherwise the file is truly rendered — PDFium for PDF and Illustrator 9–2026, a streaming composite decoder for every PSD/PSB color mode and bit depth (with ICC-managed CMYK), a layer compositor for PSD/PSB files saved without *"Maximize Compatibility"*, and bundled Ghostscript for preview-less EPS files.
-* **Interactive Multi-Artboard Preview Pane.** View a high-resolution **Whole artwork** overview (`All (N)`) of multi-artboard Illustrator files (including off-artboard art and labels), then step instantaneously through individual artboards or PDF pages using arrow keys, mouse wheel, or on-screen chevrons.
+* **Interactive Multi-Artboard Preview Pane.** View a **Whole artwork** overview (`All (N)`) of multi-artboard Illustrator files (including off-artboard art and labels), then step instantaneously through crisp, parallel-prefetched individual artboards or PDF pages using arrow keys, mouse wheel, or on-screen chevrons.
 * **Sub-millisecond cache & background pre-warming.** Typical 256 px thumbnails take **0.5–1.8 ms**; a 32,000 × 20,000 PSB takes **~9 ms**; cached thumbnails and prefetched artboards return from an in-memory RAM cache in **~0.25 ms**. When you open a folder, a background agent pre-warms remaining files into Explorer's thumbnail cache so scrolling stays smooth with no blank tiles.
 * **Crash-proof & sandboxed.** Explorer loads only a thin COM bridge (`abthumb.dll`) that never parses file bytes. All parsing and rendering happens in isolated, low-integrity, memory-capped worker processes with strict per-request deadlines — a corrupt or malicious file can never crash Windows Explorer.
 * **Network-share & cloud-storage friendly.** Works on mapped SMB shares and UNC paths without reading entire multi-megabyte files just to extract an embedded preview, and never triggers unwanted OneDrive / cloud-placeholder downloads.
@@ -39,7 +39,7 @@ Windows File Explorer cannot natively preview Adobe Illustrator (`.ai`), Photosh
 
 | Format | Extensions | Thumbnails | Preview Pane | Notes |
 |---|---|---|---|---|
-| **Adobe Illustrator** | `.ai`, `.ait` | Yes | Yes (Whole artwork + per-artboard) | Illustrator 9–2026 (PDF-compatible). High-res multi-artboard overview + parallel artboard rendering. *(Legacy PostScript-only AI 8 and older is not supported.)* |
+| **Adobe Illustrator** | `.ai`, `.ait` | Yes | Yes (Whole artwork + per-artboard) | Illustrator 9–2026 (PDF-compatible). Whole-artwork overview + crisp parallel-prefetched artboards. *(Legacy PostScript-only AI 8 and older is not supported.)* |
 | **Adobe Photoshop** | `.psd`, `.psdt`, `.pdd` | Yes | Yes | 8/16/32-bit RGB, CMYK (ICC-managed), Gray, Lab, Indexed, Bitmap. Composites layers when *"Maximize Compatibility"* is off. |
 | **Photoshop Large Document** | `.psb` | Yes | Yes | Streaming row-subsampled decoder handles 30,000+ px files in milliseconds. |
 | **Encapsulated PostScript** | `.eps`, `.epsf`, `.epsi` | Yes | Yes | Instant embedded TIFF/WMF/EPSI/Photoshop preview extraction; falls back to bundled Ghostscript when no preview is embedded. |
